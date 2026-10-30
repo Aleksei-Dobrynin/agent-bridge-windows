@@ -5,7 +5,8 @@
   "description": "LAN bridge: mirror and control local Claude Code sessions from a phone",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test --test-concurrency=1 \"test/*.test.js\""
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.10.0",

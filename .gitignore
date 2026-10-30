@@ -1,13 +1,21 @@
 # --- Секреты и личные данные (НИКОГДА не коммитить) ---
-bridge/config.json          # личные пути/прокси; создаётся из config.example.json
-bridge/certs/               # TLS-ключи моста и iroh-ключ
-bridge/pairings.json        # токены доверенных устройств
-bridge/internet.json        # состояние p2p-доступа
-bridge/certs/tunnel-allow.txt
+# Данные моста на Windows живут в %LOCALAPPDATA%\ClaudeBridge (вне репозитория);
+# правила ниже — страховка на случай ручного копирования файлов в клон.
+bridge/config.json
+bridge/certs/
+bridge/pairings.json
+bridge/internet.json
 *.pem
 *.key
+*.pfx
+*.p12
 *.keystore
 *.jks
+.env
+owner.token
+*.token
+bridge.pass
+bridge/sessions/
 
 # --- Node ---
 node_modules/
@@ -32,7 +40,10 @@ android/app/src/main/jniLibs/
 # --- Инструменты/отчёты/агенты ---
 .claude/
 .claude-ide/
+.serena/
 CLAUDE-SECURITY-*/
+# Отчёты аудита с описанием ещё не закрытых уязвимостей — не публиковать
+SECURITY_AUDIT_*.md
 
 # --- Прочее ---
 *.slojka

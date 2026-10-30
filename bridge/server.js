@@ -1,29 +1,42 @@
 #!/usr/bin/env node
 'use strict';
 
+const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const net = require('net');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const { execSync, spawn, spawnSync } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const { WebSocketServer } = require('ws');
 const { Bonjour } = require('bonjour-service');
-const qrcode = require('qrcode-terminal');
 
-const CONFIG_PATH = path.join(__dirname, 'config.json');
-// Первый запуск: личного config.json ещё нет — создаём его из примера.
-// config.json в .gitignore, так что личные пути/прокси не попадут в git.
-if (!fs.existsSync(CONFIG_PATH)) {
-  fs.copyFileSync(path.join(__dirname, 'config.example.json'), CONFIG_PATH);
-  console.log('  Создан config.json из config.example.json — отредактируйте его при необходимости');
+const { ensureDataDirs } = require('./lib/datadir');
+const P = require('./lib/paths');
+const T = require('./lib/tokens');
+const V = require('./lib/validate');
+const { originAllowed } = require('./lib/origin');
+const { loadOrCreateCert } = require('./lib/cert');
+const { installFileLog } = require('./lib/log');
+
+const TEST_MODE = !!process.env.CLAUDE_BRIDGE_TEST; // тесты: без mDNS, QR и файлового лога
+const DATA = ensureDataDirs();
+if (!TEST_MODE) installFileLog(DATA.logs);
+
+// Конфиг живёт в каталоге данных (D-9: без миграции старого bridge/config.json).
+// config.json.env целиком попадает в окружение сессий; каталог данных — в профиле
+// пользователя, закрытом ACL от других учётных записей (D-8).
+if (!fs.existsSync(DATA.config)) {
+  fs.copyFileSync(path.join(__dirname, 'config.example.json'), DATA.config);
+  console.log('  Создан ' + DATA.config + ' — отредактируйте его при необходимости');
 }
-const CONFIG = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-// config.json.env целиком попадает в окружение дочерних процессов сессий —
-// если туда положат секрет (напр. API-ключ), он не должен быть доступен другим
-// пользователям машины. Держим файл 0600.
-try { fs.chmodSync(CONFIG_PATH, 0o600); } catch {}
+const CONFIG = JSON.parse(fs.readFileSync(DATA.config, 'utf8'));
+if (process.env.CLAUDE_BRIDGE_PORT) CONFIG.port = parseInt(process.env.CLAUDE_BRIDGE_PORT, 10);
+// expandConfigPath -> null для относительных путей и «голой» буквы диска: такие отбрасываем
+CONFIG.projects = (Array.isArray(CONFIG.projects) ? CONFIG.projects : []).map(P.expandConfigPath).filter(Boolean);
+CONFIG.defaultCwd = P.expandConfigPath(CONFIG.defaultCwd || '') || os.homedir();
+
 const WEB_DIR = path.join(__dirname, 'web');
 const VENDOR = {
   '/vendor/xterm.js': require.resolve('@xterm/xterm/lib/xterm.js'),
@@ -35,7 +48,7 @@ const VENDOR = {
 const SEC_HEADERS = {
   'Content-Security-Policy':
     "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
-    "img-src 'self' data:; connect-src 'self' ws://127.0.0.1:* wss://127.0.0.1:*; " +
+    "img-src 'self' data:; connect-src 'self'; " +
     "object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
   'X-Frame-Options': 'DENY',
   'X-Content-Type-Options': 'nosniff',
@@ -53,61 +66,36 @@ const MIME = {
 
 // ---------------------------------------------------------------- tls + auth
 
-// Самоподписанный сертификат: генерируется один раз, телефон пиннит его отпечаток.
-const CERT_DIR = path.join(__dirname, 'certs');
-if (!fs.existsSync(path.join(CERT_DIR, 'cert.pem'))) {
-  fs.mkdirSync(CERT_DIR, { recursive: true, mode: 0o700 });
-  execSync(
-    `openssl req -x509 -newkey rsa:2048 -keyout "${CERT_DIR}/key.pem" ` +
-    `-out "${CERT_DIR}/cert.pem" -days 3650 -nodes -subj "/CN=claude-bridge" 2>/dev/null`
-  );
-}
-// Приватный TLS-ключ и каталог с ключами не должны быть доступны другим
-// пользователям машины (openssl под umask 022 создаёт key.pem как 0644):
-// жёстко чиним каталог 0700 и key.pem 0600 (cert.pem — публичный, можно 0644).
-try { fs.chmodSync(CERT_DIR, 0o700); } catch {}
-try { fs.chmodSync(path.join(CERT_DIR, 'key.pem'), 0o600); } catch {}
-const TLS = {
-  key: fs.readFileSync(path.join(CERT_DIR, 'key.pem')),
-  cert: fs.readFileSync(path.join(CERT_DIR, 'cert.pem')),
-};
-function pemToDer(pem) {
-  const b64 = pem.toString().replace(/-----[^-]+-----/g, '').replace(/\s+/g, '');
-  return Buffer.from(b64, 'base64');
-}
-const FINGERPRINT = crypto.createHash('sha256').update(pemToDer(TLS.cert)).digest('hex');
+// Самоподписанный сертификат (P-4, PowerShell): телефон пиннит его отпечаток.
+const CERT = loadOrCreateCert(DATA.certs);
+const TLS = CERT.tls;
+const FINGERPRINT = CERT.fingerprint;
 
-// Доверенные устройства. Код сопряжения новый на каждый запуск.
-const PAIR_FILE = path.join(__dirname, 'pairings.json');
+// Токен владельца (P-1): полные локальные права. Файл в профиле пользователя (D-8).
+let OWNER_TOKEN = T.loadOrCreateOwnerToken(DATA.ownerToken);
+const loginTokens = new T.OneTimeTokens(60000);
+
+// Доверенные устройства.
 let pairings = { devices: [] };
-try { pairings = JSON.parse(fs.readFileSync(PAIR_FILE, 'utf8')); } catch { /* первый запуск */ }
-// pairings.json содержит токены устройств открытым текстом — файл только для
-// владельца (0600). Чиним права и на уже существующем файле (мог быть 0644).
-try { if (fs.existsSync(PAIR_FILE)) fs.chmodSync(PAIR_FILE, 0o600); } catch {}
-// Код сопряжения живёт 10 минут (новый — при старте или по claude-mobile --qr).
-// Защита от перебора: 5 неверных попыток -> блокировка /pair на 15 минут.
+try { pairings = JSON.parse(fs.readFileSync(DATA.pairings, 'utf8')); } catch { /* первый запуск */ }
+if (!pairings || !Array.isArray(pairings.devices)) pairings = { devices: [] };
+// Код сопряжения живёт 10 минут. Защита от перебора: 5 неверных попыток с адреса ->
+// блокировка /pair на 15 минут; плюс общий предел попыток на текущий код (F11/F14).
 const PAIR_TTL_MS = 10 * 60 * 1000;
-let pairState = { code: '', expiresAt: 0 };
-// Блокировка перебора кода — ПОИСТОЧНИКУ (по IP), а не глобально: иначе 5
-// неверных попыток с одного адреса заблокировали бы сопряжение для всех.
 const pairGuard = new Map(); // ip -> { fails, blockedUntil }
-// Глобальный (по всем адресам) счётчик неверных попыток для ТЕКУЩЕГО кода.
-// Закрывает обход per-IP-throttle через много источников (в т.ч. 127.x у
-// процесса другого UID): даже с новых адресов перебор упирается в общий предел.
-// Сбрасывается только при генерации нового кода (F11/F14).
 let pairFailTotal = 0;
 const PAIR_FAIL_TOTAL_MAX = 50;
+// Код сопряжения НЕ выпускается при старте: только по запросу владельца (P-9).
+let pairState = { code: '', expiresAt: 0 };
 function regenPairCode() {
   pairFailTotal = 0;
   pairState = {
-    // 5 байт = 40 бит энтропии (было 24): вместе с общим лимитом попыток
-    // делает перебор за 10-минутное окно неосуществимым (F14)
+    // 5 байт = 40 бит энтропии: вместе с общим лимитом попыток перебор за окно неосуществим (F14)
     code: crypto.randomBytes(5).toString('hex').toUpperCase(),
     expiresAt: Date.now() + PAIR_TTL_MS,
   };
   return pairState;
 }
-regenPairCode();
 
 // Публичный id устройства — хэш токена: по нему можно ссылаться, не раскрывая токен
 function deviceIdOf(token) {
@@ -116,95 +104,39 @@ function deviceIdOf(token) {
 for (const d of pairings.devices) if (!d.id) d.id = deviceIdOf(d.token);
 
 function savePairings() {
-  // 0600: токены устройств не должны быть доступны другим пользователям машины
-  fs.writeFileSync(PAIR_FILE, JSON.stringify(pairings, null, 2), { mode: 0o600 });
-  try { fs.chmodSync(PAIR_FILE, 0o600); } catch {}
+  fs.writeFileSync(DATA.pairings, JSON.stringify(pairings, null, 2));
 }
 
-// UID процесса-владельца моста. «Локальным» доверяем только соединениям того
-// же пользователя, а не любому процессу на loopback (иначе другой UID / песочный
-// сервис мог бы без токена получить права 'local' и выполнить произвольную команду).
-const SELF_UID = typeof process.getuid === 'function' ? process.getuid() : -1;
-
-// "0100007F" (порядок байтов ядра, little-endian) -> "127.0.0.1"
-function procIpv4(hex) {
-  if (!/^[0-9A-Fa-f]{8}$/.test(hex)) return null;
-  return [hex.slice(6, 8), hex.slice(4, 6), hex.slice(2, 4), hex.slice(0, 2)]
-    .map((h) => parseInt(h, 16)).join('.');
-}
-// нормализуем адрес сокета к IPv4-виду (снимаем префикс v4-mapped ::ffff:)
-function norm4(ip) {
-  if (!ip) return null;
-  if (ip.startsWith('::ffff:')) ip = ip.slice(7);
-  return /^\d+\.\d+\.\d+\.\d+$/.test(ip) ? ip : null;
-}
-/**
- * UID процесса на другом конце loopback-соединения (Linux, /proc/net/tcp).
- * Сравниваем ПОЛНЫЙ 4-кортеж (оба IP и оба порта) и требуем состояние
- * ESTABLISHED (01). Матч только по портам был бы неоднозначен: процесс другого
- * UID мог бы открыть 127.0.0.1:E -> 127.0.0.2:8790 (сервер слушает 0.0.0.0) с
- * тем же эфемерным портом E, что и соединение владельца к 127.0.0.1:8790, и
- * подсунуть чужой UID из первой попавшейся строки. Полное сравнение адресов
- * изолирует именно наш сокет; ESTABLISHED отсекает TIME_WAIT-призраки.
- * Возвращает -1, если определить не удалось (isLocal тогда fail-closed).
- */
-function peerUid(socket) {
-  try {
-    const rip = norm4(socket.remoteAddress); // локальный адрес клиента = наш remote
-    const lip = norm4(socket.localAddress);  // адрес назначения клиента = наш local
-    const rport = socket.remotePort, lport = socket.localPort;
-    // только IPv4 (сервер слушает 0.0.0.0); для IPv6-bind нужен /proc/net/tcp6
-    if (!rip || !lip || !(rport > 0) || !(lport > 0)) return -1;
-    let data;
-    try { data = fs.readFileSync('/proc/net/tcp', 'utf8'); } catch { return -1; }
-    const lines = data.split('\n');
-    for (let i = 1; i < lines.length; i++) {
-      const p = lines[i].trim().split(/\s+/);
-      if (p.length < 8 || p[3] !== '01') continue; // только ESTABLISHED
-      const lc = p[1].split(':'), rc = p[2].split(':');
-      if (procIpv4(lc[0]) === rip && parseInt(lc[1], 16) === rport &&
-          procIpv4(rc[0]) === lip && parseInt(rc[1], 16) === lport) {
-        const uid = parseInt(p[7], 10);
-        if (Number.isInteger(uid)) return uid;
-      }
-    }
-  } catch {}
-  return -1;
-}
-
-function isLocal(req) {
-  const a = req.socket.remoteAddress;
-  const loopback = a === '127.0.0.1' || a === '::1' || a === '::ffff:127.0.0.1';
-  // трафик из интернет-туннеля тоже приходит с loopback, но на отдельный порт:
-  // локальное доверие — только для основного порта (claude-mobile, hooks)
-  if (!loopback || req.socket.localPort !== CONFIG.port) return false;
-  // UID не определить (не-POSIX / контейнер / hardened /proc) -> НЕ доверяем:
-  // fail-closed, лучше сломать локального клиента, чем пустить чужого
-  if (SELF_UID < 0) return false;
-  return peerUid(req.socket) === SELF_UID; // только процессы того же пользователя
-}
-function requestToken(req, url) {
-  const q = url.searchParams.get('token');
-  if (q) return q;
-  const m = (req.headers.cookie || '').match(/(?:^|;\s*)bridgeToken=([a-f0-9]+)/);
+function bearer(req) {
+  const h = req.headers.authorization;
+  const m = typeof h === 'string' && h.match(/^Bearer ([0-9a-f]{48,64})$/);
   return m ? m[1] : null;
 }
-// Сравнение секретов постоянного времени (защита от тайминг-атак по токену/коду).
-function safeEqStr(a, b) {
-  const ab = Buffer.from(String(a));
-  const bb = Buffer.from(String(b));
-  if (ab.length !== bb.length) return false;
-  return crypto.timingSafeEqual(ab, bb);
+function cookieTokenOf(req) {
+  const c = req.headers.cookie;
+  const m = typeof c === 'string' && c.match(/(?:^|;\s*)bridgeToken=([0-9a-f]+)/);
+  return m ? V.cookieToken(m[1]) : null;
+}
+function requestToken(req) {
+  return bearer(req) || cookieTokenOf(req);
 }
 /** Найти устройство по токену за постоянное время (без ранней утечки по '==='). */
 function deviceByToken(t) {
   if (!t) return null;
-  for (const d of pairings.devices) if (safeEqStr(d.token, t)) return d;
+  for (const d of pairings.devices) if (T.safeEq(d.token, t)) return d;
   return null;
 }
-function authed(req, url) {
-  if (isLocal(req)) return true; // сам ПК всегда доверен
-  return !!deviceByToken(requestToken(req, url));
+/** Владелец: токен владельца + loopback + основной порт (трафик туннеля — на другом порту). */
+function isOwner(req) {
+  const a = req.socket.remoteAddress;
+  const loopback = a === '127.0.0.1' || a === '::1' || a === '::ffff:127.0.0.1';
+  if (!loopback || req.socket.localPort !== CONFIG.port) return false;
+  return T.safeEq(requestToken(req) || '', OWNER_TOKEN);
+}
+/** Кто это: 'owner' | устройство | null. Origin проверяется отдельно. */
+function principal(req) {
+  if (isOwner(req)) return 'owner';
+  return deviceByToken(requestToken(req));
 }
 /** Отозвать устройство и немедленно разорвать его соединения. */
 function revokeDeviceById(id) {
@@ -216,12 +148,10 @@ function revokeDeviceById(id) {
   writeAllowFile(); // отозванный NodeId больше не в allowlist туннеля
   console.log(`\n  Устройство отозвано: ${name}`);
   for (const c of allClients) {
-    if (c.deviceId === id) { try { c.close(4401, 'revoked'); } catch { } }
+    if (c.deviceId === id) { try { c.close(4401, 'revoked'); } catch { /* закрыт */ } }
   }
-  // Живое iroh-соединение отозванного узла не рвётся автоматически (allowlist
-  // проверяется при установке): перезапускаем туннель, чтобы сбросить все p2p-
-  // соединения — легитимные устройства тут же переподключатся уже по новому
-  // allowlist. Плюс сайдкар перепроверяет allowlist на каждый новый поток.
+  // Живое iroh-соединение отозванного узла не рвётся само: перезапуск туннеля
+  // сбрасывает все p2p-соединения, легитимные устройства переподключатся.
   if (tunnel && inet.enabled) { stopTunnel(); startTunnel(); }
   return true;
 }
@@ -524,7 +454,7 @@ const TUNNEL_PORT = CONFIG.port + 2; // локальный порт для тр�
 // allowlist iroh-узлов: телефон регистрирует свой NodeId (по LAN, через
 // защищённый WS), сюда пишутся id всех сопряжённых устройств. Туннель
 // перечитывает файл на каждое соединение и пускает только известные узлы.
-const ALLOW_FILE = path.join(CERT_DIR, 'tunnel-allow.txt');
+const ALLOW_FILE = path.join(DATA.certs, 'tunnel-allow.txt');
 
 function writeAllowFile() {
   const ids = pairings.devices
@@ -566,7 +496,7 @@ function startTunnel() {
   const child = spawn(TUNNEL_BIN, [
     'listen',
     '--target', '127.0.0.1:' + TUNNEL_PORT,
-    '--secret-file', path.join(CERT_DIR, 'iroh.key'),
+    '--secret-file', path.join(DATA.certs, 'iroh.key'),
     '--allow-file', ALLOW_FILE,
   ], { stdio: ['ignore', 'pipe', 'pipe'] });
   tunnel = child;
@@ -623,7 +553,12 @@ function setInternet(enabled) {
 // ---------------------------------------------------------------- http
 
 function httpHandler(req, res) {
-  const url = new URL(req.url, 'http://x');
+  let url;
+  try { url = new URL(req.url, 'http://x'); } catch { res.writeHead(400); res.end(); return; }
+  // Второй слой против CSWSH/CSRF (H-1): браузер с чужой страницы шлёт свой Origin.
+  if (!originAllowed(req.headers.origin, CONFIG.port)) {
+    res.writeHead(403); res.end(); return;
+  }
 
   // Сопряжение нового устройства: одноразовый код -> постоянный токен
   if (req.method === 'POST' && url.pathname === '/pair') {
@@ -632,10 +567,17 @@ function httpHandler(req, res) {
     // блокировку перебора для всех) незачем
     if (req.socket.localPort !== CONFIG.port) { res.writeHead(404); res.end(); return; }
     let body = '';
+    req.setEncoding('utf8');
     req.on('data', (c) => { body += c; if (body.length > 4096) req.destroy(); });
     req.on('end', () => {
-      let p = {};
-      try { p = JSON.parse(body || '{}'); } catch {}
+      let raw = null;
+      try { raw = JSON.parse(body || 'null'); } catch { /* невалидный JSON */ }
+      const p = V.pairBody(raw); // M-2: null / не-строка в code больше не роняют мост
+      if (!p) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end('{"error":"неверный запрос"}');
+        return;
+      }
       const ip = req.socket.remoteAddress || 'unknown';
       // Бэкстоп роста карты: удаляем ТОЛЬКО адреса без активной блокировки —
       // иначе атакующий сбрасывал бы свою блокировку, раздув карту (F11).
@@ -661,7 +603,7 @@ function httpHandler(req, res) {
         res.end('{"error":"код истёк — выполните claude-mobile --qr на ПК"}');
         return;
       }
-      if (!safeEqStr((p.code || '').toUpperCase(), pairState.code)) {
+      if (!T.safeEq(p.code, pairState.code)) {
         g.fails++;
         pairFailTotal++; // общий счётчик для текущего кода (F11)
         if (g.fails >= 5) {
@@ -679,12 +621,9 @@ function httpHandler(req, res) {
       // было сопрячь несколько устройств (и повторно — после отзыва) за 10 минут.
       pairState.expiresAt = 0;
       const token = crypto.randomBytes(24).toString('hex');
-      // Имя устройства приходит от клиента: вырезаем управляющие символы
-      // (ANSI/escape), иначе они попали бы и в консоль оператора (подмена вывода,
-      // очистка экрана), и в UI телефона (F13). Одно значение — для хранения и лога.
-      const safeName = (String(p.name || '')
-        .replace(/[\x00-\x1f\x7f-\x9f]/g, '')
-        .slice(0, 64)) || 'устройство';
+      // Имя устройства уже очищено V.pairBody: управляющие, bidi и zero-width
+      // символы вырезаны, длина <= 64 (F13, M-6). Одно значение — для хранения и лога.
+      const safeName = p.name || 'устройство';
       pairings.devices.push({
         id: deviceIdOf(token),
         token,
@@ -704,7 +643,7 @@ function httpHandler(req, res) {
 
   // Распознавание надиктованного аудио (телефон шлёт m4a, отвечаем текстом)
   if (req.method === 'POST' && url.pathname === '/stt') {
-    if (!authed(req, url)) { res.writeHead(401); res.end(); return; }
+    if (!principal(req)) { res.writeHead(401); res.end(); return; }
     // Ограничение очереди: один воркер обрабатывает записи по одной — не даём
     // авторизованному клиенту забить память/очередь потоком загрузок.
     if (sttQueue.length >= (CONFIG.sttMaxQueue || 4)) {
@@ -754,37 +693,33 @@ function httpHandler(req, res) {
   }
 
   if (req.method === 'POST' && url.pathname === '/hook') {
-    if (!isLocal(req)) { res.writeHead(403); res.end(); return; }
+    // Авторизация — токен хука сессии (выдаётся агенту сессии через окружение).
+    const sid = V.sessionId(req.headers['x-bridge-session']);
+    const s = sid ? sessions.get(sid) : null;
+    const tok = bearer(req);
+    if (!s || !tok || !T.safeEq(tok, s.hookToken || '')) { res.writeHead(403); res.end(); return; }
     let body = '';
+    req.setEncoding('utf8');
     req.on('data', (c) => { body += c; if (body.length > 1e6) req.destroy(); });
     req.on('end', () => {
-      let payload = {};
-      try { payload = JSON.parse(body || '{}'); } catch { /* keep {} */ }
-      const sid = req.headers['x-bridge-session'] || payload.bridge_session || '';
-      const event = payload.hook_event_name || 'Notification';
-      const message = payload.message || payload.notification || (event === 'Stop' ? 'Claude завершил ответ' : 'Событие Claude Code');
-      const s = sessions.get(sid);
+      let payload = null;
+      try { payload = JSON.parse(body || 'null'); } catch { /* невалидный JSON */ }
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) { res.writeHead(400); res.end(); return; }
+      const event = V.str(payload.hook_event_name, 64) || 'Notification';
+      const message = V.str(payload.message, 2000) || V.str(payload.notification, 2000) ||
+        (event === 'Stop' ? 'Claude завершил ответ' : 'Событие Claude Code');
       // статус сессии для вкладок: работает / ждёт ответа / свободна.
       // PostToolUse — ответ на запрос разрешения дан (в т.ч. на ПК): Claude снова работает.
-      const status = {
-        UserPromptSubmit: 'working',
-        PostToolUse: 'working',
-        Notification: 'waiting',
-        Stop: 'idle',
-      }[event];
-      // отдельное событие для телефона: по 'working' он гасит устаревшие
-      // уведомления — в том числе для сессий, которых уже нет в списке
-      if (status && sid && (!s || s.status !== status)) {
+      const status = { UserPromptSubmit: 'working', PostToolUse: 'working', Notification: 'waiting', Stop: 'idle' }[event];
+      if (status && s.status !== status) {
         broadcast({ type: 'status', id: sid, status });
-      }
-      if (s && status && s.status !== status) {
         s.status = status;
         broadcastSessions();
       }
       // push-уведомления — только для событий, требующих внимания
       if (event === 'Notification' || event === 'Stop') {
-        if (s) s.lastNotify = { event, message, at: Date.now() };
-        broadcast({ type: 'notify', id: sid, event, message, title: s ? s.title : sid, at: Date.now() });
+        s.lastNotify = { event, message, at: Date.now() };
+        broadcast({ type: 'notify', id: sid, event, message, title: s.title, at: Date.now() });
       }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end('{"ok":true}');
@@ -793,24 +728,30 @@ function httpHandler(req, res) {
   }
 
   if (url.pathname === '/health') {
-    if (!authed(req, url)) { res.writeHead(401); res.end(); return; }
+    if (!principal(req)) { res.writeHead(401); res.end(); return; }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true, sessions: sessions.size, host: os.hostname() }));
     return;
   }
 
-  // static: vendor libs from node_modules, everything else from web/
-  if (!authed(req, url)) {
-    res.writeHead(401, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('401: устройство не сопряжено с мостом');
+  // Вход браузера владельца по одноразовому токену (L-9): cookie + redirect,
+  // постоянный токен не попадает в URL/историю браузера.
+  const ott = url.searchParams.get('ott');
+  if (ott !== null) {
+    if (!loginTokens.consume(ott)) { res.writeHead(401); res.end(); return; }
+    res.writeHead(302, {
+      Location: '/',
+      'Set-Cookie': `bridgeToken=${OWNER_TOKEN}; Path=/; HttpOnly; Secure; SameSite=Strict`,
+      ...SEC_HEADERS,
+    });
+    res.end();
     return;
   }
-  const extraHeaders = {};
-  // токен пришёл в query -> выдаём cookie, чтобы css/js/websocket прошли сами
-  const qtoken = url.searchParams.get('token');
-  if (qtoken) {
-    extraHeaders['Set-Cookie'] =
-      `bridgeToken=${qtoken}; Path=/; Max-Age=31536000; HttpOnly; Secure; SameSite=Strict`;
+  // static: vendor libs from node_modules, everything else from web/
+  if (!principal(req)) {
+    res.writeHead(401, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('401: нет доступа');
+    return;
   }
   let file;
   if (VENDOR[url.pathname]) {
@@ -829,24 +770,40 @@ function httpHandler(req, res) {
     res.writeHead(200, {
       'Content-Type': MIME[path.extname(file)] || 'application/octet-stream',
       ...SEC_HEADERS,
-      ...extraHeaders,
     });
     res.end(data);
   });
 }
 
 // Основной сервер (LAN + localhost) и отдельный локальный порт для
-// интернет-туннеля: isLocal() различает их по localPort.
+// интернет-туннеля: isOwner() различает их по localPort.
 const server = https.createServer(TLS, httpHandler);
 const tunnelServer = https.createServer(TLS, httpHandler);
 
 // ---------------------------------------------------------------- websocket
 
-const wss = new WebSocketServer({ noServer: true });
+// Авторизация и лимиты — ДО апгрейда (M-3, H-1): неавторизованный клиент не
+// получает WebSocket вовсе, а не открытое соединение с последующим close.
+const MAX_WS_CLIENTS = 64;
+const wss = new WebSocketServer({ noServer: true, maxPayload: 4 * 1024 * 1024 });
 function handleUpgrade(req, sock, head) {
-  const url = new URL(req.url, 'http://x');
-  if (url.pathname !== '/ws') { sock.destroy(); return; }
-  wss.handleUpgrade(req, sock, head, (ws) => wss.emit('connection', ws, req));
+  sock.on('error', () => { /* обрыв клиента не должен ронять мост */ });
+  const reject = (code) => {
+    // как abortHandshake в ws: сначала дописать ответ, потом закрыть сокет
+    try {
+      sock.once('finish', () => sock.destroy());
+      sock.end(`HTTP/1.1 ${code} ${http.STATUS_CODES[code] || 'Error'}\r\n` +
+        'Connection: close\r\nContent-Length: 0\r\n\r\n');
+    } catch { sock.destroy(); }
+  };
+  let url;
+  try { url = new URL(req.url, 'http://x'); } catch { return reject(400); }
+  if (url.pathname !== '/ws') return reject(404);
+  if (!originAllowed(req.headers.origin, CONFIG.port)) return reject(403);
+  const who = principal(req);
+  if (!who) return reject(401);
+  if (allClients.size >= MAX_WS_CLIENTS) return reject(503);
+  wss.handleUpgrade(req, sock, head, (ws) => wss.emit('connection', ws, req, who));
 }
 server.on('upgrade', handleUpgrade);
 tunnelServer.on('upgrade', handleUpgrade);
@@ -867,140 +824,175 @@ function devicesMsg(ws) {
   };
 }
 
-wss.on('connection', (ws, req) => {
-  const connUrl = new URL(req.url, 'http://x');
-  if (!authed(req, connUrl)) {
-    ws.close(4401, 'unauthorized');
-    return;
-  }
-  const dev = deviceByToken(requestToken(req, connUrl));
-  ws.deviceId = dev ? dev.id : (isLocal(req) ? 'local' : null);
+wss.on('connection', (ws, req, who) => {
+  ws.on('error', () => { /* необработанная ошибка ws (напр. maxPayload) не должна ронять мост */ });
+  // 'local' — имя роли владельца (в этом подплане остальные проверки не меняются)
+  ws.deviceId = who === 'owner' ? 'local' : who.id;
   allClients.add(ws);
   ws.attached = null;
   ws.send(JSON.stringify({ type: 'sessions', sessions: sessionList(), projects: CONFIG.projects || [] }));
 
   ws.on('message', (raw) => {
-    let m;
-    try { m = JSON.parse(raw); } catch { return; }
-    const s = m.id ? sessions.get(m.id) : null;
+    let parsed;
+    try { parsed = JSON.parse(raw); } catch { return; }
+    const m = V.wsMessage(parsed); // P-10: только объект со строковым type
+    if (!m) return;
+    const sid = V.sessionId(m.id);
+    const s = sid ? sessions.get(sid) : null;
 
-    switch (m.type) {
-      case 'create': {
-        if (sessions.size >= MAX_SESSIONS) {
-          ws.send(JSON.stringify({ type: 'error', message: 'Достигнут предел числа сессий' }));
+    try {
+      switch (m.type) {
+        case 'create': {
+          if (sessions.size >= MAX_SESSIONS) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Достигнут предел числа сессий' }));
+            break;
+          }
+          if (!rateAllowCreate(ws.deviceId)) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Слишком часто — подождите немного' }));
+            break;
+          }
+          const created = createSession({
+            cwd: V.str(m.cwd, 1024),
+            command: V.str(m.command, 1024),
+            args: Array.isArray(m.args) && m.args.length <= 64 &&
+              m.args.every((a) => typeof a === 'string' && a.length <= 4096) ? m.args : [],
+            title: V.cleanTitle(m.title),
+            local: ws.deviceId === 'local',
+          });
+          ws.send(JSON.stringify({ type: 'created', id: created.id }));
           break;
         }
-        if (!rateAllowCreate(ws.deviceId)) {
-          ws.send(JSON.stringify({ type: 'error', message: 'Слишком часто — подождите немного' }));
-          break;
-        }
-        const created = createSession({
-          cwd: m.cwd, command: m.command, args: m.args, title: m.title,
-          local: ws.deviceId === 'local',
-        });
-        ws.send(JSON.stringify({ type: 'created', id: created.id }));
-        break;
-      }
-      case 'attach': {
-        if (!s) return;
-        if (ws.attached) { const old = sessions.get(ws.attached); if (old) old.clients.delete(ws); }
-        ws.attached = s.id;
-        s.clients.add(ws);
-        if (m.cols && m.rows) ws.desired = { cols: m.cols, rows: m.rows };
-        // зритель размер не меняет — только единственный клиент
-        if (ws.desired && s.clients.size === 1) resizePty(s, ws.desired.cols, ws.desired.rows);
-        ws.send(JSON.stringify({
-          type: 'scrollback', id: s.id, data: s.buffer.join(''),
-          alive: s.alive, cols: s.cols, rows: s.rows,
-        }));
-        break;
-      }
-      case 'input':
-        if (s && s.alive) {
-          if (s.lastInput !== ws) {
-            s.lastInput = ws; // клиент начал печатать — PTY подстраивается под него
-            if (ws.desired) resizePty(s, ws.desired.cols, ws.desired.rows);
+        case 'attach': {
+          if (!s) return;
+          if (ws.attached) { const old = sessions.get(ws.attached); if (old) old.clients.delete(ws); }
+          ws.attached = s.id;
+          s.clients.add(ws);
+          {
+            const cols = V.int(m.cols, 1, 1000);
+            const rows = V.int(m.rows, 1, 1000);
+            if (cols && rows) ws.desired = { cols, rows };
           }
-          keeperSend(s, { t: 'in', d: m.data });
-        }
-        break;
-      case 'scroll':
-        // прокрутка — не набор текста: не трогаем «владельца размера» PTY
-        if (s && s.alive) keeperSend(s, { t: 'in', d: m.data });
-        break;
-      case 'resize':
-        if (!s) break;
-        if (m.cols > 0 && m.rows > 0) ws.desired = { cols: m.cols, rows: m.rows };
-        if (ws.desired && (s.clients.size === 1 || s.lastInput === ws)) {
-          resizePty(s, ws.desired.cols, ws.desired.rows);
-        }
-        break;
-      case 'kill':
-        if (s && s.alive) keeperSend(s, { t: 'kill' });
-        break;
-      case 'remove':
-        if (s && !s.alive) { sessions.delete(s.id); broadcastSessions(); }
-        break;
-      case 'list':
-        ws.send(JSON.stringify({ type: 'sessions', sessions: sessionList(), projects: CONFIG.projects || [] }));
-        break;
-      case 'devices':
-        // список устройств — только локальным клиентам (десктоп-браузер,
-        // claude-mobile); телефон управляет ПК через нативное меню, не этим
-        if (ws.deviceId === 'local') ws.send(JSON.stringify(devicesMsg(ws)));
-        break;
-      case 'internet':
-        // статус интернет-доступа: телефон запоминает ticket на будущее
-        ws.send(JSON.stringify(internetMsg()));
-        break;
-      case 'registerNode': {
-        // телефон сообщает свой постоянный iroh-NodeId (по LAN, через
-        // защищённый WS) — добавляем в allowlist туннеля этого устройства
-        const nid = (m.nodeId || '').trim().toLowerCase();
-        if (/^[0-9a-f]{64}$/.test(nid) && ws.deviceId && ws.deviceId !== 'local') {
-          const dev = pairings.devices.find((d) => d.id === ws.deviceId);
-          if (dev && dev.nodeId !== nid) {
-            dev.nodeId = nid;
-            savePairings();
-            writeAllowFile();
-            console.log(`  Зарегистрирован p2p-узел устройства «${dev.name}»`);
-          }
-        }
-        break;
-      }
-      case 'setInternet':
-        // включение/выключение — только с самого ПК (claude-mobile --device)
-        if (ws.deviceId === 'local') {
-          setInternet(m.enabled);
-          broadcastInternet();
-        }
-        break;
-      case 'pairinfo':
-        // данные сопряжения — только локальным клиентам (claude-mobile --qr);
-        // каждый запрос выдаёт свежий код на 10 минут
-        if (ws.deviceId === 'local') {
-          const p = regenPairCode();
+          // зритель размер не меняет — только единственный клиент
+          if (ws.desired && s.clients.size === 1) resizePty(s, ws.desired.cols, ws.desired.rows);
           ws.send(JSON.stringify({
-            type: 'pairinfo',
-            host: lanAddress(),
-            port: CONFIG.port,
-            code: p.code,
-            ttlMin: Math.round(PAIR_TTL_MS / 60000),
-            fp: FINGERPRINT,
-            internet: internetMsg(),
+            type: 'scrollback', id: s.id, data: s.buffer.join(''),
+            alive: s.alive, cols: s.cols, rows: s.rows,
           }));
+          break;
         }
-        break;
-      case 'revokeDevice':
-        // отзыв устройств — только с самого ПК (claude-mobile --device / десктоп),
-        // иначе сопряжённый телефон мог бы отозвать все остальные устройства.
-        // Список устройств тоже отдаём ТОЛЬКО локальному клиенту: удалённое
-        // устройство иначе прочитало бы id/имена/даты всех остальных (F12).
-        if (ws.deviceId === 'local') {
-          revokeDeviceById(m.id);
-          ws.send(JSON.stringify(devicesMsg(ws)));
+        case 'input':
+          if (s && s.alive) {
+            if (s.lastInput !== ws) {
+              s.lastInput = ws; // клиент начал печатать — PTY подстраивается под него
+              if (ws.desired) resizePty(s, ws.desired.cols, ws.desired.rows);
+            }
+            const d = V.str(m.data, 65536);
+            if (d !== null) keeperSend(s, { t: 'in', d });
+          }
+          break;
+        case 'scroll':
+          // прокрутка — не набор текста: не трогаем «владельца размера» PTY
+          if (s && s.alive) {
+            const d = V.str(m.data, 65536);
+            if (d !== null) keeperSend(s, { t: 'in', d });
+          }
+          break;
+        case 'resize': {
+          if (!s) break;
+          const cols = V.int(m.cols, 1, 1000);
+          const rows = V.int(m.rows, 1, 1000);
+          if (cols && rows) ws.desired = { cols, rows };
+          if (ws.desired && (s.clients.size === 1 || s.lastInput === ws)) {
+            resizePty(s, ws.desired.cols, ws.desired.rows);
+          }
+          break;
         }
-        break;
+        case 'kill':
+          if (s && s.alive) keeperSend(s, { t: 'kill' });
+          break;
+        case 'remove':
+          if (s && !s.alive) { sessions.delete(s.id); broadcastSessions(); }
+          break;
+        case 'list':
+          ws.send(JSON.stringify({ type: 'sessions', sessions: sessionList(), projects: CONFIG.projects || [] }));
+          break;
+        case 'devices':
+          // список устройств — только локальным клиентам (десктоп-браузер,
+          // claude-mobile); телефон управляет ПК через нативное меню, не этим
+          if (ws.deviceId === 'local') ws.send(JSON.stringify(devicesMsg(ws)));
+          break;
+        case 'internet':
+          // статус интернет-доступа: телефон запоминает ticket на будущее
+          ws.send(JSON.stringify(internetMsg()));
+          break;
+        case 'registerNode': {
+          // телефон сообщает свой постоянный iroh-NodeId (по LAN, через
+          // защищённый WS) — добавляем в allowlist туннеля этого устройства
+          const nid = V.nodeId(m.nodeId) || '';
+          if (nid && ws.deviceId && ws.deviceId !== 'local') {
+            const dev = pairings.devices.find((d) => d.id === ws.deviceId);
+            if (dev && dev.nodeId !== nid) {
+              dev.nodeId = nid;
+              savePairings();
+              writeAllowFile();
+              console.log(`  Зарегистрирован p2p-узел устройства «${dev.name}»`);
+            }
+          }
+          break;
+        }
+        case 'setInternet':
+          // включение/выключение — только с самого ПК (claude-mobile --device)
+          if (ws.deviceId === 'local') {
+            setInternet(m.enabled === true);
+            broadcastInternet();
+          }
+          break;
+        case 'pairinfo':
+          // данные сопряжения — только локальным клиентам (claude-mobile --qr);
+          // каждый запрос выдаёт свежий код на 10 минут
+          if (ws.deviceId === 'local') {
+            const p = regenPairCode();
+            ws.send(JSON.stringify({
+              type: 'pairinfo',
+              host: lanAddress(),
+              port: CONFIG.port,
+              code: p.code,
+              ttlMin: Math.round(PAIR_TTL_MS / 60000),
+              fp: FINGERPRINT,
+              internet: internetMsg(),
+            }));
+          }
+          break;
+        case 'revokeDevice':
+          // отзыв устройств — только с самого ПК (claude-mobile --device / десктоп),
+          // иначе сопряжённый телефон мог бы отозвать все остальные устройства.
+          // Список устройств тоже отдаём ТОЛЬКО локальному клиенту: удалённое
+          // устройство иначе прочитало бы id/имена/даты всех остальных (F12).
+          if (ws.deviceId === 'local') {
+            const devId = V.str(m.id, 64);
+            if (devId) revokeDeviceById(devId);
+            ws.send(JSON.stringify(devicesMsg(ws)));
+          }
+          break;
+        case 'issueLoginToken':
+          // одноразовый токен входа браузера владельца (L-9): /?ott=<token> -> cookie
+          if (ws.deviceId === 'local') {
+            ws.send(JSON.stringify({ type: 'loginToken', token: loginTokens.issue(), port: CONFIG.port }));
+          }
+          break;
+        case 'rotateOwnerToken':
+          // смена токена владельца: все соединения владельца разрываются
+          if (ws.deviceId === 'local') {
+            OWNER_TOKEN = T.rotateOwnerToken(DATA.ownerToken);
+            for (const c of allClients) {
+              if (c.deviceId === 'local') { try { c.close(4401, 'owner token rotated'); } catch { /* закрыт */ } }
+            }
+          }
+          break;
+      }
+    } catch (e) {
+      // ошибка обработки одного сообщения не должна ронять мост
+      console.error('[ws] ошибка обработки сообщения:', e && e.message);
     }
   });
 
@@ -1065,25 +1057,21 @@ tunnelServer.listen(TUNNEL_PORT, '127.0.0.1');
 if (inet.enabled) startTunnel();
 
 server.listen(CONFIG.port, CONFIG.host, () => {
-  const ip = lanAddress();
-
-  try {
-    const bonjour = new Bonjour();
-    bonjour.publish({
-      name: CONFIG.mdnsName || 'claude-bridge',
-      type: 'claude-bridge',
-      port: CONFIG.port,
-      txt: { path: '/', fp: FINGERPRINT },
-    });
-  } catch (e) {
-    console.error('mDNS publish failed (не критично):', e.message);
+  if (!TEST_MODE) {
+    try {
+      const bonjour = new Bonjour();
+      bonjour.publish({
+        name: CONFIG.mdnsName || 'claude-bridge',
+        type: 'claude-bridge',
+        port: CONFIG.port,
+        txt: { path: '/', fp: FINGERPRINT },
+      });
+    } catch (e) {
+      console.error('mDNS publish failed (не критично):', e.message);
+    }
   }
 
   restoreSessions();
-
-  const pairPayload = JSON.stringify({
-    cb: 1, host: ip, port: CONFIG.port, code: pairState.code, fp: FINGERPRINT,
-  });
 
   console.log('');
   console.log('  Claude Bridge запущен (HTTPS/WSS, порт ' + CONFIG.port + ')');
@@ -1091,12 +1079,8 @@ server.listen(CONFIG.port, CONFIG.host, () => {
     (pairings.devices.length ? ' — подключатся сами' : ''));
   console.log('  Доступ через интернет: ' +
     (inet.enabled ? 'включён (p2p iroh)' : 'выключен (включить: claude-mobile --device)'));
-  console.log('');
-  console.log('  Добавить новое устройство: отсканируйте QR в приложении');
-  console.log(`  или введите код вручную:  ${pairState.code}  (действует 10 минут,`);
-  console.log('  свежий код в любой момент: claude-mobile --qr)');
-  console.log('');
-  qrcode.generate(pairPayload, { small: true });
+  // Код сопряжения при старте не выпускается (P-9) — QR/код только по запросу владельца.
+  console.log('  Добавить устройство: claude-mobile --qr');
   console.log(`  Отпечаток сертификата: ${FINGERPRINT.slice(0, 16)}…`);
 });
 

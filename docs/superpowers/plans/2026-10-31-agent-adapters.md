@@ -29,6 +29,7 @@
 > | 5 | `claude-mobile` (задача 16): `--qr`, `--device`, `--open` уже требуют TTY и используют `lib/open-url.js` — не откатывать (D-18 п. 2). |
 > | 6 | Запуск агентов через `lib/which.js` (`.cmd` одной строкой, `/v:off`); адаптеры `claude`/`opencode` запускают реальный `.exe` (задача 1). Канал keeper — `lib/keeper-channel.js`. |
 > | 7 | Коммиты — после каждой задачи с зелёным `npm test`; трейлер `Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>`; без push. |
+> | 8 | Задача 11: `/hook` применяет событие адаптера **до** ответа хуку (`PermissionRequest` приходит через ~0,15 с после `PreToolUse` и без `tool_use_id`; порядок держится тем, что Claude Code ждёт окончания хука). Ответ «3» на ПК в 3-пунктовом диалоге (= No без auto mode) оставляет статус `working` до следующего события — принято (делегировано). |
 
 ## Карта файлов
 

@@ -57,6 +57,10 @@ class OneTimeTokens {
     this.map.set(t, this.now() + this.ttlMs);
     return t;
   }
+  /** Отозвать все выданные токены (напр. при ротации токена владельца). */
+  clear() {
+    this.map.clear();
+  }
   consume(t) {
     if (typeof t !== 'string') return false;
     this.purge();

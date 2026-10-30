@@ -84,3 +84,14 @@ test('origin allowlist', () => {
     assert.strictEqual(originAllowed(bad, 8790), false, bad);
   }
 });
+
+test('one-time tokens: clear() invalidates all outstanding tokens (M-2)', () => {
+  const o = new T.OneTimeTokens(60000);
+  const a = o.issue();
+  const b = o.issue();
+  o.clear();
+  assert.strictEqual(o.consume(a), false);
+  assert.strictEqual(o.consume(b), false);
+  const c = o.issue();
+  assert.strictEqual(o.consume(c), true, 'still usable after clear');
+});

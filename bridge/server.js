@@ -32,7 +32,24 @@ if (!fs.existsSync(DATA.config)) {
   console.log('  Создан ' + DATA.config + ' — отредактируйте его при необходимости');
 }
 const CONFIG = JSON.parse(fs.readFileSync(DATA.config, 'utf8'));
-if (process.env.CLAUDE_BRIDGE_PORT) CONFIG.port = parseInt(process.env.CLAUDE_BRIDGE_PORT, 10);
+// Переопределение порта моста — CLAUDE_BRIDGE_LISTEN_PORT. CLAUDE_BRIDGE_PORT мост
+// НЕ читает: это имя экспортируется агенту для хука (M-11).
+// Порт: целое 1..65533 (port+1 — маяк, port+2 — туннель); числовая строка приводится (M-7).
+function parsePort(v) {
+  const n = (typeof v === 'string' && /^\s*\d+\s*$/.test(v)) ? Number(v) : v;
+  return Number.isInteger(n) && n >= 1 && n <= 65533 ? n : null;
+}
+{
+  const fromEnv = process.env.CLAUDE_BRIDGE_LISTEN_PORT;
+  const raw = fromEnv !== undefined && fromEnv !== '' ? fromEnv : CONFIG.port;
+  const port = parsePort(raw);
+  if (port === null) {
+    console.error(`  Неверный порт моста: ${JSON.stringify(raw)} ` +
+      `(${fromEnv ? 'CLAUDE_BRIDGE_LISTEN_PORT' : 'port в ' + DATA.config}) — нужно целое 1..65533`);
+    process.exit(1);
+  }
+  CONFIG.port = port;
+}
 // expandConfigPath -> null для относительных путей и «голой» буквы диска: такие отбрасываем
 CONFIG.projects = (Array.isArray(CONFIG.projects) ? CONFIG.projects : []).map(P.expandConfigPath).filter(Boolean);
 CONFIG.defaultCwd = P.expandConfigPath(CONFIG.defaultCwd || '') || os.homedir();
@@ -74,6 +91,9 @@ const FINGERPRINT = CERT.fingerprint;
 // Токен владельца (P-1): полные локальные права. Файл в профиле пользователя (D-8).
 let OWNER_TOKEN = T.loadOrCreateOwnerToken(DATA.ownerToken);
 const loginTokens = new T.OneTimeTokens(60000);
+// Токен браузера владельца (M-1): только в памяти, в cookie после входа по ott.
+// Токен владельца в cookie не попадает; новый при каждом старте и при ротации.
+let BROWSER_TOKEN = T.newToken();
 
 // Доверенные устройства.
 let pairings = { devices: [] };
@@ -126,12 +146,19 @@ function deviceByToken(t) {
   for (const d of pairings.devices) if (T.safeEq(d.token, t)) return d;
   return null;
 }
-/** Владелец: токен владельца + loopback + основной порт (трафик туннеля — на другом порту). */
-function isOwner(req) {
+/** Соединение с самого ПК на основной порт (трафик туннеля приходит на другой порт). */
+function ownerSocket(req) {
   const a = req.socket.remoteAddress;
   const loopback = a === '127.0.0.1' || a === '::1' || a === '::ffff:127.0.0.1';
-  if (!loopback || req.socket.localPort !== CONFIG.port) return false;
-  return T.safeEq(requestToken(req) || '', OWNER_TOKEN);
+  return loopback && req.socket.localPort === CONFIG.port;
+}
+/** Владелец: loopback + основной порт + (Bearer-токен владельца | cookie с токеном браузера). */
+function isOwner(req) {
+  if (!ownerSocket(req)) return false;
+  const b = bearer(req);
+  if (b && T.safeEq(b, OWNER_TOKEN)) return true;
+  const c = cookieTokenOf(req);
+  return !!c && T.safeEq(c, BROWSER_TOKEN);
 }
 /** Кто это: 'owner' | устройство | null. Origin проверяется отдельно. */
 function principal(req) {
@@ -204,6 +231,7 @@ function makeSession(meta) {
     status: 'idle', // idle | working | waiting — по hooks
     cols: meta.cols,
     rows: meta.rows,
+    keeperPid: Number.isInteger(meta.keeperPid) && meta.keeperPid > 0 ? meta.keeperPid : null,
     lastInput: null, // клиент, печатавший последним — его размер и держим
   };
 }
@@ -220,7 +248,17 @@ function dropSession(session, exitCode) {
   broadcastSessions();
 }
 
-function connectKeeper(session, retries) {
+/** Жив ли процесс (signal 0 только проверяет). EPERM — процесс есть, но чужой. */
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+}
+
+const KEEPER_ALIVE_RETRY_MS = 30000;
+
+// retries — быстрые повторы (keeper ещё поднимается); затем, пока процесс хранителя
+// жив, — повторы с нарастающей паузой до KEEPER_ALIVE_RETRY_MS (M-6).
+function connectKeeper(session, retries, state = { deadline: 0, delay: 500 }) {
   K.connectAuthenticated(session.pipe, session.secret).then((ch) => {
     // сессию успели убрать, пока шло рукопожатие — канал не нужен
     if (sessions.get(session.id) !== session) { ch.socket.destroy(); return; }
@@ -263,15 +301,30 @@ function connectKeeper(session, retries) {
     });
   }).catch(() => {
     if (sessions.get(session.id) !== session) return; // сессия уже убрана
-    if (retries > 0) { setTimeout(() => connectKeeper(session, retries - 1), 300); return; }
-    // Хранитель недостижим: не поднялся или умер нечисто (краш, перезагрузка ПК)
+    if (retries > 0) { setTimeout(() => connectKeeper(session, retries - 1, state), 300); return; }
+    if (pidAlive(session.keeperPid)) {
+      if (!state.deadline) state.deadline = Date.now() + KEEPER_ALIVE_RETRY_MS;
+      if (Date.now() < state.deadline) {
+        const delay = state.delay;
+        state.delay = Math.min(delay * 2, 4000);
+        setTimeout(() => connectKeeper(session, 0, state), delay);
+        return;
+      }
+      // процесс жив, но не отвечает: meta НЕ трогаем (следующий старт моста попробует снова)
+      console.log(`  Сессия ${session.id}: хранитель (pid ${session.keeperPid}) жив, но не отвечает — сессия скрыта`);
+      dropSession(session, -1);
+      return;
+    }
+    // Хранитель мёртв: не поднялся или умер нечисто (краш, перезагрузка ПК)
     // и не убрал meta. Убираем сами — иначе мост при каждом старте будет
-    // «восстанавливать» зомби-сессию. Живой хранитель сюда не попадает.
+    // «восстанавливать» зомби-сессию.
     try { fs.unlinkSync(path.join(SESS_DIR, session.id + '.json')); } catch { /* уже удалён */ }
     console.log(`  Сессия ${session.id}: хранитель не отвечает — meta убран`);
     dropSession(session, -1);
   });
 }
+
+const BRIDGE_OWN_ENV = ['CLAUDE_BRIDGE_HOME', 'CLAUDE_BRIDGE_LISTEN_PORT', 'CLAUDE_BRIDGE_TEST'];
 
 function createSession({ cwd, command, args, title, local }) {
   const id = 's' + (++seq) + '-' + crypto.randomBytes(3).toString('hex');
@@ -308,8 +361,12 @@ function createSession({ cwd, command, args, title, local }) {
   // остаётся на диске. Окружение передаётся хранителю через сам процесс;
   // CLAUDE_BRIDGE_KEEPER_SECRET keeper удаляет до запуска агента.
   const extraEnv = (CONFIG.env && typeof CONFIG.env === 'object' && !Array.isArray(CONFIG.env)) ? CONFIG.env : {};
+  const baseEnv = { ...process.env };
+  // настройки самого моста агенту не передаются (M-11): иначе мост, запущенный
+  // из сессии, унаследовал бы чужой каталог данных/порт/тестовый режим
+  for (const k of BRIDGE_OWN_ENV) delete baseEnv[k];
   const childEnv = {
-    ...process.env, ...extraEnv,
+    ...baseEnv, ...extraEnv,
     CLAUDE_BRIDGE_SESSION: id,
     CLAUDE_BRIDGE_HOOK_TOKEN: hookToken,
     CLAUDE_BRIDGE_PORT: String(CONFIG.port),
@@ -320,11 +377,27 @@ function createSession({ cwd, command, args, title, local }) {
   const metaPath = path.join(SESS_DIR, id + '.json');
   fs.writeFileSync(metaPath, JSON.stringify(meta));
 
-  const child = spawn(process.execPath, [path.join(__dirname, 'keeper.js'), metaPath], {
-    detached: true, windowsHide: true, stdio: 'ignore', env: childEnv,
-  });
+  let child;
+  try {
+    child = spawn(process.execPath, [path.join(__dirname, 'keeper.js'), metaPath], {
+      detached: true, windowsHide: true, stdio: 'ignore', env: childEnv,
+    });
+  } catch (e) {
+    try { fs.unlinkSync(metaPath); } catch { /* */ }
+    throw e;
+  }
   child.on('error', (e) => console.error(`  Сессия ${id}: не удалось запустить хранитель:`, e.message));
   child.unref();
+  // M-6: pid хранителя — в meta: после перезапуска моста по нему видно, жив ли он.
+  // Перезапись сразу после spawn — до того, как keeper успеет прочитать meta;
+  // через временный файл + rename, чтобы keeper не увидел половину файла.
+  if (Number.isInteger(child.pid)) {
+    meta.keeperPid = child.pid;
+    try {
+      fs.writeFileSync(metaPath + '.tmp', JSON.stringify(meta));
+      fs.renameSync(metaPath + '.tmp', metaPath);
+    } catch { try { fs.unlinkSync(metaPath + '.tmp'); } catch { /* */ } }
+  }
 
   const session = makeSession(meta);
   sessions.set(id, session);
@@ -385,9 +458,16 @@ function sessionList() {
 let sttProc = null;
 let sttQueue = [];
 
+function failStt(proc, reason) {
+  if (sttProc !== proc) return; // уже обработано ('error' и 'exit' могут прийти оба)
+  sttProc = null;
+  for (const j of sttQueue) j.reject(new Error(reason));
+  sttQueue = [];
+}
+
 function ensureStt() {
   if (sttProc) return;
-  sttProc = spawn(CONFIG.sttPython || 'python3.11', [path.join(__dirname, 'stt.py')], {
+  const proc = spawn(CONFIG.sttPython || 'python3.11', [path.join(__dirname, 'stt.py')], {
     env: {
       ...process.env,
       STT_MODEL: CONFIG.sttModel || 'large-v3',
@@ -395,8 +475,15 @@ function ensureStt() {
     },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
+  sttProc = proc;
+  // I-1: без обработчика 'error' отсутствующий python (ENOENT) ронял весь мост
+  proc.on('error', (e) => {
+    console.error('[stt] не удалось запустить воркер (' + (CONFIG.sttPython || 'python3.11') + '):', e.message);
+    failStt(proc, 'STT-воркер не запустился');
+  });
+  proc.stdin.on('error', () => { /* воркер не запустился/умер — ответят 'error'/'exit' */ });
   let acc = '';
-  sttProc.stdout.on('data', (d) => {
+  proc.stdout.on('data', (d) => {
     acc += d.toString('utf8');
     let i;
     while ((i = acc.indexOf('\n')) >= 0) {
@@ -410,12 +497,8 @@ function ensureStt() {
       if (job) (m.error ? job.reject(new Error(m.error)) : job.resolve(m.text || ''));
     }
   });
-  sttProc.stderr.on('data', (d) => process.stderr.write('[stt] ' + d));
-  sttProc.on('exit', () => {
-    sttProc = null;
-    for (const j of sttQueue) j.reject(new Error('STT-воркер завершился'));
-    sttQueue = [];
-  });
+  proc.stderr.on('data', (d) => process.stderr.write('[stt] ' + d));
+  proc.on('exit', () => failStt(proc, 'STT-воркер завершился'));
 }
 
 function transcribe(file) {
@@ -431,7 +514,7 @@ function transcribe(file) {
 // принимает p2p-соединения и пробрасывает их на локальный порт туннеля.
 // Включается только явно: claude-mobile --device -> «i».
 
-const INET_FILE = path.join(__dirname, 'internet.json');
+const INET_FILE = DATA.internet;
 const TUNNEL_BIN = path.join(__dirname, 'bin', 'claude-tunnel');
 const TUNNEL_PORT = CONFIG.port + 2; // локальный порт для трафика из туннеля
 // allowlist iroh-узлов: телефон регистрирует свой NodeId (по LAN, через
@@ -483,6 +566,7 @@ function startTunnel() {
     '--allow-file', ALLOW_FILE,
   ], { stdio: ['ignore', 'pipe', 'pipe'] });
   tunnel = child;
+  child.on('error', (e) => console.error('  claude-tunnel не запустился:', e.message)); // затем 'exit'
   let acc = '';
   child.stdout.on('data', (d) => {
     acc += d.toString('utf8');
@@ -526,14 +610,32 @@ function stopTunnel() {
   broadcastInternet();
 }
 
+// Локальный порт туннеля слушается только при включённом интернет-доступе (I-2):
+// занятый port+2 или порт из исключённого диапазона Windows не должен ронять мост.
+let tunnelListening = false;
+function listenTunnelServer() {
+  if (tunnelListening) return;
+  tunnelListening = true;
+  tunnelServer.listen(TUNNEL_PORT, '127.0.0.1');
+}
+function closeTunnelServer() {
+  if (!tunnelListening) return;
+  tunnelListening = false;
+  try { tunnelServer.close(); } catch { /* уже закрыт */ }
+}
+
 function setInternet(enabled) {
   inet.enabled = !!enabled;
   fs.writeFileSync(INET_FILE, JSON.stringify(inet, null, 2));
   console.log('\n  Доступ через интернет: ' + (inet.enabled ? 'ВКЛЮЧЁН' : 'выключен'));
-  if (inet.enabled) startTunnel(); else stopTunnel();
+  if (inet.enabled) { listenTunnelServer(); startTunnel(); } else { stopTunnel(); closeTunnelServer(); }
 }
 
 // ---------------------------------------------------------------- http
+
+const HOOK_STATUS = new Map([
+  ['UserPromptSubmit', 'working'], ['PostToolUse', 'working'], ['Notification', 'waiting'], ['Stop', 'idle'],
+]);
 
 function httpHandler(req, res) {
   let url;
@@ -586,7 +688,7 @@ function httpHandler(req, res) {
         res.end('{"error":"код истёк — выполните claude-mobile --qr на ПК"}');
         return;
       }
-      if (!T.safeEq(p.code, pairState.code)) {
+      if (!pairState.code || !p.code || !T.safeEq(p.code, pairState.code)) {
         g.fails++;
         pairFailTotal++; // общий счётчик для текущего кода (F11)
         if (g.fails >= 5) {
@@ -693,7 +795,7 @@ function httpHandler(req, res) {
         (event === 'Stop' ? 'Claude завершил ответ' : 'Событие Claude Code');
       // статус сессии для вкладок: работает / ждёт ответа / свободна.
       // PostToolUse — ответ на запрос разрешения дан (в т.ч. на ПК): Claude снова работает.
-      const status = { UserPromptSubmit: 'working', PostToolUse: 'working', Notification: 'waiting', Stop: 'idle' }[event];
+      const status = HOOK_STATUS.get(event); // Map: ключи прототипа ('__proto__' и т.п.) не находятся (M-3)
       if (status && s.status !== status) {
         broadcast({ type: 'status', id: sid, status });
         s.status = status;
@@ -721,10 +823,14 @@ function httpHandler(req, res) {
   // постоянный токен не попадает в URL/историю браузера.
   const ott = url.searchParams.get('ott');
   if (ott !== null) {
+    // только браузер на самом ПК: GET, loopback, основной порт (не туннель); иначе 404,
+    // токен при этом НЕ расходуется
+    if (req.method !== 'GET' || !ownerSocket(req)) { res.writeHead(404); res.end(); return; }
     if (!loginTokens.consume(ott)) { res.writeHead(401); res.end(); return; }
     res.writeHead(302, {
       Location: '/',
-      'Set-Cookie': `bridgeToken=${OWNER_TOKEN}; Path=/; HttpOnly; Secure; SameSite=Strict`,
+      // токен браузера (M-1), не токен владельца: живёт до ротации/перезапуска моста
+      'Set-Cookie': `bridgeToken=${BROWSER_TOKEN}; Path=/; HttpOnly; Secure; SameSite=Strict`,
       ...SEC_HEADERS,
     });
     res.end();
@@ -762,12 +868,31 @@ function httpHandler(req, res) {
 // интернет-туннеля: isOwner() различает их по localPort.
 const server = https.createServer(TLS, httpHandler);
 const tunnelServer = https.createServer(TLS, httpHandler);
+// M-10: медленные/зависшие клиенты не держат ресурсы бесконечно
+for (const srv of [server, tunnelServer]) {
+  srv.headersTimeout = 10000;
+  srv.requestTimeout = 30000;
+  srv.maxConnections = 256;
+}
+server.on('error', (e) => {
+  console.error(`  Не удалось слушать порт ${CONFIG.host || '0.0.0.0'}:${CONFIG.port} (${e.code || e.message}) — ` +
+    'порт занят другим процессом (уже запущен мост?) или недоступен');
+  process.exit(1);
+});
+tunnelServer.on('error', (e) => {
+  console.error(`  Порт туннеля 127.0.0.1:${TUNNEL_PORT} недоступен (${e.code || e.message}) — ` +
+    'доступ через интернет отключён до перезапуска моста');
+  tunnelListening = false;
+  inet.enabled = false; // только в памяти: при следующем старте попробуем снова
+  stopTunnel();
+});
 
 // ---------------------------------------------------------------- websocket
 
 // Авторизация и лимиты — ДО апгрейда (M-3, H-1): неавторизованный клиент не
 // получает WebSocket вовсе, а не открытое соединение с последующим close.
 const MAX_WS_CLIENTS = 64;
+let pendingUpgrades = 0;
 const wss = new WebSocketServer({ noServer: true, maxPayload: 4 * 1024 * 1024 });
 function handleUpgrade(req, sock, head) {
   sock.on('error', () => { /* обрыв клиента не должен ронять мост */ });
@@ -785,8 +910,17 @@ function handleUpgrade(req, sock, head) {
   if (!originAllowed(req.headers.origin, CONFIG.port)) return reject(403);
   const who = principal(req);
   if (!who) return reject(401);
-  if (allClients.size >= MAX_WS_CLIENTS) return reject(503);
-  wss.handleUpgrade(req, sock, head, (ws) => wss.emit('connection', ws, req, who));
+  if (allClients.size + pendingUpgrades >= MAX_WS_CLIENTS) return reject(503);
+  // незавершённые апгрейды тоже занимают место (M-9)
+  pendingUpgrades++;
+  let counted = true;
+  const release = () => { if (counted) { counted = false; pendingUpgrades--; } };
+  sock.once('close', release);
+  wss.handleUpgrade(req, sock, head, (ws) => {
+    release();
+    sock.removeListener('close', release);
+    wss.emit('connection', ws, req, who);
+  });
 }
 server.on('upgrade', handleUpgrade);
 tunnelServer.on('upgrade', handleUpgrade);
@@ -834,14 +968,21 @@ wss.on('connection', (ws, req, who) => {
             ws.send(JSON.stringify({ type: 'error', message: 'Слишком часто — подождите немного' }));
             break;
           }
-          const created = createSession({
-            cwd: V.str(m.cwd, 1024),
-            command: V.str(m.command, 1024),
-            args: Array.isArray(m.args) && m.args.length <= 64 &&
-              m.args.every((a) => typeof a === 'string' && a.length <= 4096) ? m.args : [],
-            title: V.cleanTitle(m.title),
-            local: ws.deviceId === 'local',
-          });
+          let created;
+          try {
+            created = createSession({
+              cwd: V.str(m.cwd, 1024),
+              command: V.str(m.command, 1024),
+              args: Array.isArray(m.args) && m.args.length <= 64 &&
+                m.args.every((a) => typeof a === 'string' && a.length <= 4096) ? m.args : [],
+              title: V.cleanTitle(m.title),
+              local: ws.deviceId === 'local',
+            });
+          } catch (e) {
+            console.error('  Не удалось создать сессию:', e && e.message);
+            ws.send(JSON.stringify({ type: 'error', message: 'не удалось создать сессию' }));
+            break;
+          }
           ws.send(JSON.stringify({ type: 'created', id: created.id }));
           break;
         }
@@ -967,6 +1108,8 @@ wss.on('connection', (ws, req, who) => {
           // смена токена владельца: все соединения владельца разрываются
           if (ws.deviceId === 'local') {
             OWNER_TOKEN = T.rotateOwnerToken(DATA.ownerToken);
+            BROWSER_TOKEN = T.newToken(); // cookie браузеров недействительны
+            loginTokens.clear(); // выданные, но не использованные ott — тоже (M-2)
             for (const c of allClients) {
               if (c.deviceId === 'local') { try { c.close(4401, 'owner token rotated'); } catch { /* закрыт */ } }
             }
@@ -1036,8 +1179,7 @@ beacon.on('error', (e) => console.error('UDP beacon error (не критично
 beacon.bind(CONFIG.port + 1);
 
 // порт для трафика из интернет-туннеля — только loopback
-tunnelServer.listen(TUNNEL_PORT, '127.0.0.1');
-if (inet.enabled) startTunnel();
+if (inet.enabled) { listenTunnelServer(); startTunnel(); }
 
 server.listen(CONFIG.port, CONFIG.host, () => {
   if (!TEST_MODE) {

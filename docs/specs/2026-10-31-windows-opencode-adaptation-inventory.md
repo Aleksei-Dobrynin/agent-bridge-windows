@@ -227,6 +227,7 @@
 | P-7 серверная часть (LAN-only, маяк без hostname), D-17 | ✅ (QR-only в приложении — подплан 3) | `27ad0f9` |
 | P-9 TTY-подтверждения + `confirmed` | ✅ (поток подтверждения на телефоне D-13 — подплан 2) | `885a21a` |
 | P-4 автозапуск (`start-bridge.js`) | ✅ (задача Планировщика — `install.ps1`, подплан 4) | `814ca1c` |
+| D-18 mDNS без hostname/чужих адресов, `--open`/`--device` только TTY, перевыбор LAN | ✅ | `55cc3e2` |
 | D-3/D-4/D-5/D-10/D-12/D-13/D-14/D-15 | ⬜ подплан 2 `docs/superpowers/plans/2026-10-31-agent-adapters.md` | — |
 | P-7 клиентская часть, M-4, L-10, D-15.12 | ⬜ подплан 3 `docs/superpowers/plans/2026-10-31-clients.md` | — |
 | P-8 распространение, README, ARCHITECTURE.md под Windows | ⬜ подплан 4 (не написан) | — |

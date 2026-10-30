@@ -16,6 +16,9 @@ serde_json = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 data-encoding = "2"
+
+# libc нужен только для O_NOFOLLOW в unix-ветке load_or_create_secret (Linux/Android).
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [profile.release]

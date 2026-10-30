@@ -144,34 +144,88 @@ fn node_allowed(allow_file: &Option<PathBuf>, remote: &str) -> bool {
 // Secret key persistence
 // ---------------------------------------------------------------------------
 
+/// Открыть существующий файл секрета РОВНО ОДИН РАЗ, не следуя по симлинку.
+///
+/// Утечка секрета = кража p2p-личности. Подмену пути между проверкой и
+/// использованием исключаем — все операции (stat/chmod/чтение) идут по
+/// этому дескриптору, а не по имени (никакого TOCTOU).
+#[cfg(unix)]
+fn open_existing_secret(path: &Path) -> Result<std::fs::File> {
+    // O_NOFOLLOW: симлинк → ошибка (ELOOP). Слишком открытые права чиним через
+    // тот же fd (fchmod); если ужесточить не удалось — ОТКАЗЫВАЕМСЯ использовать
+    // ключ (fail-closed), а не читаем его как есть.
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("opening secret key file {} (symlink?)", path.display()))?;
+    let meta = f
+        .metadata()
+        .with_context(|| format!("stat secret key file {}", path.display()))?;
+    if meta.permissions().mode() & 0o077 != 0 {
+        eprintln!(
+            "warning: secret key file {} was group/other-accessible; tightening to 0600",
+            path.display()
+        );
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("tightening perms on secret key file {}", path.display()))?;
+    }
+    Ok(f)
+}
+
+/// Windows-вариант (P-4): FILE_FLAG_OPEN_REPARSE_POINT открывает САМ reparse
+/// point (симлинк/junction/mount point), а не цель. Затем по метаданным ЭТОГО
+/// хэндла проверяем, что это не reparse point и не симлинк — иначе отказ
+/// (fail-closed). chmod не делаем: доступ ограничивает ACL профиля пользователя.
+#[cfg(windows)]
+fn open_existing_secret(path: &Path) -> Result<std::fs::File> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    // Константы winbase.h/winnt.h; объявлены локально, чтобы не тянуть windows-sys.
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .with_context(|| format!("opening secret key file {}", path.display()))?;
+    let meta = f
+        .metadata()
+        .with_context(|| format!("stat secret key file {}", path.display()))?;
+    if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || meta.file_type().is_symlink() {
+        return Err(anyhow!(
+            "refusing secret key file {}: it is a symlink/reparse point",
+            path.display()
+        ));
+    }
+    if !meta.is_file() {
+        return Err(anyhow!(
+            "refusing secret key file {}: not a regular file",
+            path.display()
+        ));
+    }
+    Ok(f)
+}
+
+/// Создать НОВЫЙ файл секрета (O_EXCL-семантика: create_new — существующий
+/// путь, в т.ч. висячий симлинк, → ошибка).
+fn create_new_secret_file(path: &Path) -> Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    // Windows: без chmod — файл наследует ACL каталога профиля пользователя.
+    opts.open(path)
+        .with_context(|| format!("creating secret key file {}", path.display()))
+}
+
 fn load_or_create_secret(path: &Path) -> Result<SecretKey> {
     if path.exists() {
-        // Утечка секрета = кража p2p-личности. Открываем файл РОВНО ОДИН РАЗ с
-        // O_NOFOLLOW: симлинк → ошибка (ELOOP), а подмену пути между проверкой и
-        // использованием исключаем — все операции (stat/chmod/чтение) идут по
-        // этому fd, а не по имени (никакого TOCTOU). Слишком открытые права
-        // чиним через тот же fd (fchmod); если ужесточить не удалось —
-        // ОТКАЗЫВАЕМСЯ использовать ключ (fail-closed), а не читаем его как есть.
         use std::io::Read;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut f = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
-            .with_context(|| format!("opening secret key file {} (symlink?)", path.display()))?;
-        let meta = f
-            .metadata()
-            .with_context(|| format!("stat secret key file {}", path.display()))?;
-        if meta.permissions().mode() & 0o077 != 0 {
-            eprintln!(
-                "warning: secret key file {} was group/other-accessible; tightening to 0600",
-                path.display()
-            );
-            f.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .with_context(|| {
-                    format!("tightening perms on secret key file {}", path.display())
-                })?;
-        }
+        let mut f = open_existing_secret(path)?;
         let mut raw = Vec::new();
         f.read_to_end(&mut raw)
             .with_context(|| format!("reading secret key file {}", path.display()))?;
@@ -205,13 +259,7 @@ fn load_or_create_secret(path: &Path) -> Result<SecretKey> {
     let key = SecretKey::generate();
     let hex = data_encoding::HEXLOWER.encode(&key.to_bytes());
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-            .with_context(|| format!("creating secret key file {}", path.display()))?;
+        let mut f = create_new_secret_file(path)?;
         f.write_all(hex.as_bytes())?;
         f.write_all(b"\n")?;
     }

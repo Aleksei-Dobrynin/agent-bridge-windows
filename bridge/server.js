@@ -730,6 +730,11 @@ function httpHandler(req, res) {
       });
       savePairings();
       console.log(`\n  Сопряжено новое устройство: ${safeName}`);
+      // уже сопряжённые устройства узнают о новом (D-15 п. 6; запрет — D-13, подплан 2)
+      broadcast({
+        type: 'notify', id: '', event: 'DevicePaired', message: `Сопряжено новое устройство: ${safeName}`,
+        title: 'Claude Bridge', at: Date.now(),
+      });
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         token, fingerprint: FINGERPRINT, port: CONFIG.port, hostname: os.hostname(),
@@ -1092,16 +1097,20 @@ wss.on('connection', (ws, req, who) => {
           break;
         }
         case 'setInternet':
-          // включение/выключение — только с самого ПК (claude-mobile --device)
-          if (ws.deviceId === 'local') {
+          // включение/выключение — только с самого ПК (claude-mobile --device) и только
+          // после подтверждения человеком в консоли (P-9: confirmed). Флаг шлёт сам
+          // клиент, поэтому от агента с токеном владельца это не защищает — по D-13
+          // подтверждение переедет на сопряжённый телефон (подплан 2).
+          if (ws.deviceId === 'local' && m.confirmed === true) {
             setInternet(m.enabled === true);
             broadcastInternet();
           }
           break;
         case 'pairinfo':
-          // данные сопряжения — только локальным клиентам (claude-mobile --qr);
+          // данные сопряжения — только локальным клиентам (claude-mobile --qr) после
+          // подтверждения в консоли (P-9: confirmed; ограничение и D-13 — см. setInternet);
           // каждый запрос выдаёт свежий код на 10 минут
-          if (ws.deviceId === 'local') {
+          if (ws.deviceId === 'local' && m.confirmed === true) {
             const p = regenPairCode();
             ws.send(JSON.stringify({
               type: 'pairinfo',

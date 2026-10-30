@@ -91,7 +91,7 @@ test('POST /pair with null or non-string code does not crash the bridge (M-2)', 
 
 test('POST /pair with empty code is refused even while a code is active (M-5)', async () => {
   const c = await ownerWs();
-  c.send({ type: 'pairinfo' });
+  c.send({ type: 'pairinfo', confirmed: true }); // P-9: подтверждено в консоли
   assert.ok(await H.waitFor(() => c.msgs.some((m) => m.type === 'pairinfo')), 'pairinfo');
   c.ws.close();
   const res = await req({ path: '/pair', method: 'POST' }, '{"code":""}');

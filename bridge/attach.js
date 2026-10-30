@@ -10,14 +10,25 @@
 //   claude-mobile -a [id]    подключиться к сессии (без id — к последней живой)
 //   claude-mobile --device   доверенные устройства: просмотр и отзыв
 //   claude-mobile --qr       показать QR-код сопряжения (мост должен работать)
+//   claude-mobile --open     открыть веб-интерфейс моста в браузере
+//   claude-mobile --rotate-token  перевыпустить токен владельца
 //
 // Ctrl+\  — отсоединиться (сессия продолжает жить, телефон остаётся подключён)
+//
+// Подключение (P-1, M-8): wss://127.0.0.1:<port>/ws с токеном владельца
+// (owner.token в каталоге данных) и пиннингом сертификата моста (certs\bridge.cer).
+// Каталог данных — lib/datadir.js (CLAUDE_BRIDGE_HOME для тестов), порт — из
+// config.json там же; CLAUDE_BRIDGE_LISTEN_PORT переопределяет его, как и у моста.
+// CB_NO_BROWSER=1 — --open печатает ссылку вместо запуска браузера (тесты).
 
 const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
 const readline = require('readline');
 const WebSocket = require(path.join(__dirname, 'node_modules', 'ws'));
+const { ensureDataDirs } = require('./lib/datadir');
+const { pinnedTlsOptions } = require('./lib/cert');
 
-const BRIDGE = process.env.CLAUDE_BRIDGE_URL || 'wss://127.0.0.1:8790/ws';
 const args = process.argv.slice(2);
 
 const USAGE = `claude-mobile — Claude Code через мост (зеркало на телефон)
@@ -27,7 +38,9 @@ const USAGE = `claude-mobile — Claude Code через мост (зеркало
   claude-mobile -l          список сессий
   claude-mobile -a [id]     подключиться к сессии (без id — к последней живой)
   claude-mobile --device    доверенные устройства: просмотр и отзыв
-  claude-mobile --qr        QR-код сопряжения
+  claude-mobile --qr        QR-код сопряжения (подтверждение в консоли)
+  claude-mobile --open      открыть веб-интерфейс моста в браузере (одноразовая ссылка)
+  claude-mobile --rotate-token  перевыпустить токен владельца
   claude-mobile -h          эта справка
 
 Ctrl+\\ — отсоединиться: сессия продолжит жить, вернуться — claude-mobile -a.
@@ -42,6 +55,7 @@ const TYPOS = new Map([
   ['--a', '-a'], ['-attach', '-a'],
   ['-device', '--device'], ['-devices', '--device'],
   ['-qr', '--qr'], ['--h', '-h'], ['-help', '-h'],
+  ['-open', '--open'], ['-rotate-token', '--rotate-token'],
 ]);
 
 if (args[0] === '-h' || args[0] === '--help') {
@@ -54,9 +68,51 @@ if (TYPOS.has(args[0])) {
   process.exit(1);
 }
 
-// сертификат моста самоподписанный; для localhost это безопасно
-const ws = new WebSocket(BRIDGE, { rejectUnauthorized: false });
+function fail(msg) {
+  console.error(msg);
+  process.exit(1);
+}
+
+/** Порт моста: CLAUDE_BRIDGE_LISTEN_PORT или port из config.json (правила как в server.js). */
+function bridgePort(configFile) {
+  let raw = process.env.CLAUDE_BRIDGE_LISTEN_PORT;
+  if (raw === undefined || raw === '') {
+    let cfg;
+    try { cfg = JSON.parse(fs.readFileSync(configFile, 'utf8')); } catch (e) {
+      fail(e.code === 'ENOENT'
+        ? `Мост ещё не запускался на этом ПК (нет ${configFile}). Запустите bridge\\server.js.`
+        : `Не удалось прочитать ${configFile}: ${e.message}`);
+    }
+    raw = cfg && cfg.port !== undefined ? cfg.port : 8790;
+  }
+  const n = (typeof raw === 'string' && /^\s*\d+\s*$/.test(raw)) ? Number(raw) : raw;
+  if (!Number.isInteger(n) || n < 1 || n > 65533) fail(`Неверный порт моста: ${JSON.stringify(raw)}`);
+  return n;
+}
+
+function readOrFail(file, what) {
+  try { return fs.readFileSync(file); } catch (e) {
+    return fail(e.code === 'ENOENT'
+      ? `Нет ${what} (${file}) — мост ещё не запускался? Запустите bridge\\server.js.`
+      : `Не удалось прочитать ${what} (${file}): ${e.message}`);
+  }
+}
+
+const DATA = ensureDataDirs();
+const PORT = bridgePort(DATA.config);
+const BRIDGE = `wss://127.0.0.1:${PORT}/ws`;
+const CER = readOrFail(path.join(DATA.certs, 'bridge.cer'), 'сертификата моста');
+const OWNER = String(readOrFail(DATA.ownerToken, 'токена владельца')).trim();
+
+// Доверяем только сертификату нашего моста (пиннинг по отпечатку, M-8); WebSocket —
+// всегда новое TLS-соединение, keep-alive не обходит проверку.
+const ws = new WebSocket(BRIDGE, {
+  ...pinnedTlsOptions(new crypto.X509Certificate(CER).toString(),
+    crypto.createHash('sha256').update(CER).digest('hex')),
+  headers: { Authorization: 'Bearer ' + OWNER },
+});
 let sid = null;
+let rotating = false; // --rotate-token: закрытие с кодом 4401 — ожидаемое подтверждение
 let decided = false;
 let raw = false;
 
@@ -125,12 +181,70 @@ function enterRaw() {
     }
     send({ type: 'input', id: sid, data: d.toString('utf8') });
   });
-  process.on('SIGWINCH', () => {
+  // Windows: SIGWINCH нет, изменение размера консоли приходит событием 'resize'
+  process.stdout.on('resize', () => {
     send({ type: 'resize', id: sid, cols: process.stdout.columns, rows: process.stdout.rows });
   });
 }
 
-ws.on('error', (e) => die('Мост недоступен (' + e.message + '). Запущен ли bridge/server.js?', 1));
+/**
+ * P-9: подтверждение только живым человеком в интерактивной консоли — агент запускает
+ * команды без TTY. От агента, который сам откроет WS с токеном владельца, это НЕ защищает:
+ * по D-13 выпуск кода сопряжения и включение интернет-доступа будут подтверждаться на
+ * уже сопряжённом телефоне (поток подтверждения — подплан 2: протокол; подплан 3: Android).
+ */
+function confirmHuman(question, onYes, iface) {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    die('Эта операция требует подтверждения в интерактивной консоли.', 1);
+    return;
+  }
+  const q = iface || readline.createInterface({ input: process.stdin, output: process.stdout });
+  q.question(question + ' [y/N]: ', (ans) => {
+    if (!iface) q.close();
+    if (/^[yд]/i.test(ans.trim())) onYes(); else die('Отменено.');
+  });
+}
+
+/** Открыть ссылку входа в браузере по умолчанию (при CB_NO_BROWSER=1 — только напечатать). */
+function openLoginUrl(m) {
+  const port = Number.isInteger(m.port) && m.port > 0 && m.port < 65536 ? m.port : null;
+  const token = typeof m.token === 'string' && /^[0-9a-f]{64}$/.test(m.token) ? m.token : null;
+  if (!port || !token) { die('Мост вернул некорректный токен входа.', 1); return; }
+  const url = `https://127.0.0.1:${port}/?ott=${token}`;
+  if (process.env.CB_NO_BROWSER === '1') {
+    console.log(url);
+  } else {
+    // URL проверен выше (только [0-9a-z:/.?=]) — метасимволов cmd.exe в строке нет.
+    // Строка целиком + windowsVerbatimArguments: иначе Node экранирует пустой
+    // заголовок окна "" как \"\", и start принял бы его за имя программы.
+    require('child_process').spawn('cmd.exe', ['/d', '/s', '/c', `"start "" "${url}""`], {
+      detached: true, stdio: 'ignore', windowsHide: true, windowsVerbatimArguments: true,
+    }).unref();
+    console.log('Открываю веб-интерфейс моста (ссылка одноразовая, действует 60 с).');
+  }
+  setTimeout(() => process.exit(0), 300);
+}
+
+ws.on('unexpected-response', (req, res) => {
+  req.destroy();
+  if (res.statusCode === 401) {
+    die(`Мост отклонил токен владельца (${DATA.ownerToken}). Токен перевыпускали вручную? ` +
+      'Мост перечитывает файл только при перезапуске; штатная смена — claude-mobile --rotate-token.', 1);
+  } else {
+    die(`Мост ответил HTTP ${res.statusCode} вместо WebSocket.`, 1);
+  }
+});
+ws.on('error', (e) => die('Мост недоступен (' + e.message + '). Запущен ли bridge\\server.js?', 1));
+ws.on('close', (code) => {
+  if (rotating && code === 4401) {
+    console.log('Токен владельца перевыпущен; открытые вкладки браузера нужно открыть заново (claude-mobile --open).');
+    die('', 0);
+  } else if (code === 4401) {
+    die('\r\n[Токен владельца перевыпущен — мост закрыл соединение. Запустите claude-mobile заново.]', 1);
+  } else {
+    die('\r\n[Соединение с мостом закрыто' + (code && code !== 1005 ? ` (код ${code})` : '') + '.]', 1);
+  }
+});
 
 ws.on('message', (rawMsg) => {
   const m = JSON.parse(rawMsg);
@@ -141,8 +255,17 @@ ws.on('message', (rawMsg) => {
       if (args[0] === '--device' || args[0] === '--devices') {
         send({ type: 'internet' }); // придёт раньше devices — меню покажет статус
         send({ type: 'devices' });
+      } else if (args[0] === '--open') {
+        send({ type: 'issueLoginToken' });
+      } else if (args[0] === '--rotate-token') {
+        rotating = true;
+        send({ type: 'rotateOwnerToken' });
+        // подтверждение — закрытие соединения мостом с кодом 4401 (обработчик 'close')
+        setTimeout(() => die('Мост не подтвердил перевыпуск токена владельца.', 1), 5000);
       } else if (args[0] === '--qr') {
-        send({ type: 'pairinfo' });
+        // P-9 / D-13: пока — только интерактивная консоль (см. confirmHuman)
+        confirmHuman('Выпустить код сопряжения нового устройства?',
+          () => send({ type: 'pairinfo', confirmed: true }));
       } else if (args[0] === '-l' || args[0] === '--list') {
         if (!m.sessions.length) console.log('Сессий нет.');
         for (const s of m.sessions) {
@@ -189,6 +312,9 @@ ws.on('message', (rawMsg) => {
     case 'internet':
       inetState = m;
       break;
+    case 'loginToken':
+      openLoginUrl(m);
+      break;
     case 'pairinfo': {
       const qrcode = require(path.join(__dirname, 'node_modules', 'qrcode-terminal'));
       console.log('\nСопряжение нового устройства с Claude Bridge');
@@ -209,7 +335,7 @@ let inetState = null;
 
 function fmtInet(s) {
   if (!s) return 'статус неизвестен';
-  if (!s.available) return 'недоступен: не собран bridge/bin/claude-tunnel';
+  if (!s.available) return 'недоступен: не собран bridge\\bin\\claude-tunnel.exe';
   if (!s.enabled) return 'выключен';
   let line = 'ВКЛЮЧЁН' + (s.ticket ? '' : ' (p2p-endpoint запускается…)');
   if (s.peers && s.peers.length) {
@@ -235,9 +361,13 @@ function deviceTui(m) {
   rl.question('\nНомер — отозвать устройство, i — вкл/выкл интернет, Enter — выход: ', (ans) => {
     ans = ans.trim();
     if (/^[iи]$/i.test(ans)) {
-      send({ type: 'setInternet', enabled: !(inetState && inetState.enabled) });
-      // сервер разошлёт свежий internet-статус; перезапрашиваем меню
-      setTimeout(() => { send({ type: 'internet' }); send({ type: 'devices' }); }, 400);
+      const enable = !(inetState && inetState.enabled);
+      // P-9 / D-13: пока — только интерактивная консоль (см. confirmHuman)
+      confirmHuman(enable ? 'Включить доступ через интернет?' : 'Выключить доступ через интернет?', () => {
+        send({ type: 'setInternet', enabled: enable, confirmed: true });
+        // сервер разошлёт свежий internet-статус; перезапрашиваем меню
+        setTimeout(() => { send({ type: 'internet' }); send({ type: 'devices' }); }, 400);
+      }, rl);
       return;
     }
     const n = parseInt(ans, 10);

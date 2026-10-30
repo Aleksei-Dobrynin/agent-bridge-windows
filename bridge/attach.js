@@ -19,7 +19,8 @@
 // (owner.token в каталоге данных) и пиннингом сертификата моста (certs\bridge.cer).
 // Каталог данных — lib/datadir.js (CLAUDE_BRIDGE_HOME для тестов), порт — из
 // config.json там же; CLAUDE_BRIDGE_LISTEN_PORT переопределяет его, как и у моста.
-// CB_NO_BROWSER=1 — --open печатает ссылку вместо запуска браузера (тесты).
+// --open печатает одноразовую ссылку только в интерактивную консоль: без TTY (агент)
+// ссылка не выводится — иначе агент получил бы права владельца, не читая файлов (D-13, D-16.3).
 
 const path = require('path');
 const fs = require('fs');
@@ -28,6 +29,7 @@ const readline = require('readline');
 const WebSocket = require(path.join(__dirname, 'node_modules', 'ws'));
 const { ensureDataDirs } = require('./lib/datadir');
 const { pinnedTlsOptions } = require('./lib/cert');
+const { buildLoginUrl, openInBrowser } = require('./lib/open-url');
 
 const args = process.argv.slice(2);
 
@@ -65,6 +67,13 @@ if (args[0] === '-h' || args[0] === '--help') {
 if (TYPOS.has(args[0])) {
   console.error(`Неизвестный флаг «${args[0]}» — возможно, вы имели в виду «${TYPOS.get(args[0])}»?\n`);
   console.error(USAGE);
+  process.exit(1);
+}
+// Сопряжение и меню устройств (отзыв, интернет-доступ) — только для человека в
+// интерактивной консоли (P-9); проверяем до подключения к мосту.
+if ((args[0] === '--qr' || args[0] === '--device' || args[0] === '--devices') &&
+    !(process.stdin.isTTY && process.stdout.isTTY)) {
+  console.error('Эта операция требует подтверждения в интерактивной консоли.');
   process.exit(1);
 }
 
@@ -123,8 +132,10 @@ function die(msg, code) {
 }
 
 function cleanup() {
-  if (raw && process.stdin.isTTY) process.stdin.setRawMode(false);
+  if (raw && process.stdin.isTTY) { raw = false; try { process.stdin.setRawMode(false); } catch { /* консоль уже закрыта */ } }
 }
+// любой выход (в т.ч. process.exit из веток ниже) возвращает консоль из raw-режима
+process.on('exit', cleanup);
 
 function send(obj) { ws.send(JSON.stringify(obj)); }
 
@@ -205,23 +216,13 @@ function confirmHuman(question, onYes, iface) {
   });
 }
 
-/** Открыть ссылку входа в браузере по умолчанию (при CB_NO_BROWSER=1 — только напечатать). */
+/** --open: открыть ссылку входа в браузере; напечатать её — только в интерактивную консоль. */
 function openLoginUrl(m) {
-  const port = Number.isInteger(m.port) && m.port > 0 && m.port < 65536 ? m.port : null;
-  const token = typeof m.token === 'string' && /^[0-9a-f]{64}$/.test(m.token) ? m.token : null;
-  if (!port || !token) { die('Мост вернул некорректный токен входа.', 1); return; }
-  const url = `https://127.0.0.1:${port}/?ott=${token}`;
-  if (process.env.CB_NO_BROWSER === '1') {
-    console.log(url);
-  } else {
-    // URL проверен выше (только [0-9a-z:/.?=]) — метасимволов cmd.exe в строке нет.
-    // Строка целиком + windowsVerbatimArguments: иначе Node экранирует пустой
-    // заголовок окна "" как \"\", и start принял бы его за имя программы.
-    require('child_process').spawn('cmd.exe', ['/d', '/s', '/c', `"start "" "${url}""`], {
-      detached: true, stdio: 'ignore', windowsHide: true, windowsVerbatimArguments: true,
-    }).unref();
-    console.log('Открываю веб-интерфейс моста (ссылка одноразовая, действует 60 с).');
-  }
+  const url = buildLoginUrl(m);
+  if (!url) { die('Мост вернул некорректный токен входа.', 1); return; }
+  openInBrowser(url, { onError: (e) => console.error('Не удалось запустить браузер: ' + e.message) });
+  console.log('Открываю веб-интерфейс моста (ссылка одноразовая, действует 60 с).');
+  if (process.stdout.isTTY) console.log('Если браузер не открылся: ' + url);
   setTimeout(() => process.exit(0), 300);
 }
 
@@ -247,7 +248,9 @@ ws.on('close', (code) => {
 });
 
 ws.on('message', (rawMsg) => {
-  const m = JSON.parse(rawMsg);
+  let m;
+  try { m = JSON.parse(rawMsg); } catch { return; }
+  if (!m || typeof m !== 'object') return;
   switch (m.type) {
     case 'sessions': {
       if (decided) return;
@@ -315,6 +318,12 @@ ws.on('message', (rawMsg) => {
     case 'loginToken':
       openLoginUrl(m);
       break;
+    case 'error': {
+      // отказ моста (нет LAN-адреса для QR, предел сессий и т.п.)
+      const text = 'Мост: ' + (typeof m.message === 'string' ? m.message : 'ошибка');
+      if (!sid) die(text, 1); else process.stderr.write('\r\n[' + text + ']\r\n');
+      break;
+    }
     case 'pairinfo': {
       const qrcode = require(path.join(__dirname, 'node_modules', 'qrcode-terminal'));
       console.log('\nСопряжение нового устройства с Claude Bridge');

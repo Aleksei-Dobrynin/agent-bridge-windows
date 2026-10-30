@@ -68,8 +68,16 @@ function load(dir) {
   const f = files(dir);
   const pfx = fs.readFileSync(f.pfx);
   const passphrase = fs.readFileSync(f.pass, 'utf8').trim();
-  tls.createSecureContext({ pfx, passphrase }); // бросит, если PFX/пароль повреждены
+  const ctx = tls.createSecureContext({ pfx, passphrase }); // бросит, если PFX/пароль повреждены
   const der = fs.readFileSync(f.cer);
+  // .cer обязан быть тем же сертификатом, что внутри PFX: по .cer считается отпечаток для
+  // пиннинга (телефон, хук, claude-mobile), а мост отвечает сертификатом из PFX.
+  const probe = new tls.TLSSocket(null, { secureContext: ctx });
+  let served;
+  try { served = probe.getCertificate(); } finally { probe.destroy(); }
+  if (!served || !served.raw || !Buffer.from(served.raw).equals(der)) {
+    throw new Error('bridge.cer не совпадает с сертификатом в bridge.pfx');
+  }
   return {
     tls: { pfx, passphrase },
     fingerprint: crypto.createHash('sha256').update(der).digest('hex'),

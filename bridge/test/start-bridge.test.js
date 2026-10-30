@@ -20,7 +20,10 @@ test('start-bridge.js returns at once and the detached bridge serves', { timeout
   const home = H.tempHome('cb-start-');
   const port = H.pickPort(29790);
   let pid = null;
-  t.after(() => H.cleanup(home, pid ? [{ pid }] : []));
+  let dup = null;
+  // отсоединённый мост убить даже при упавшей проверке до того, как pid стал известен:
+  // ищем по порту (командная строка `node server.js` каталога данных не содержит)
+  t.after(() => H.cleanup(home, [{ pid: pid || listenerPid(port) }, dup && dup.proc]));
   const t0 = Date.now();
   const r = spawnSync(process.execPath, [START], {
     env: { ...process.env, CLAUDE_BRIDGE_HOME: home, CLAUDE_BRIDGE_LISTEN_PORT: String(port), CLAUDE_BRIDGE_TEST: '1' },
@@ -38,7 +41,7 @@ test('start-bridge.js returns at once and the detached bridge serves', { timeout
 
   // повторный запуск при работающем мосте — no-op: второй экземпляр выходит по
   // EADDRINUSE, не успев ничего запустить (маяк, туннель, хранители)
-  const dup = H.startBridge(home, port);
+  dup = H.startBridge(home, port);
   assert.strictEqual(await dup.exited, 1);
   assert.match(dup.stderr, /EADDRINUSE/);
   assert.doesNotMatch(dup.stderr, /UDP beacon/, 'duplicate did not get to the startup side effects');

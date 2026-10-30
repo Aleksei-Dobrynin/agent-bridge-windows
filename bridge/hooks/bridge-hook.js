@@ -6,6 +6,9 @@
 //   {"type":"command","command":"node","args":["<путь>\\bridge-hook.js"]}
 // Переменные окружения задаёт мост при запуске сессии (они доходят из PTY до хука):
 //   CLAUDE_BRIDGE_SESSION, CLAUDE_BRIDGE_HOOK_TOKEN, CLAUDE_BRIDGE_PORT, CLAUDE_BRIDGE_CERT_FP.
+// Любая непредвиденная ошибка — тихий выход с кодом 0 (Claude не должен видеть сбой хука).
+process.on('uncaughtException', () => process.exit(0));
+process.on('unhandledRejection', () => process.exit(0));
 const https = require('https');
 
 const sid = process.env.CLAUDE_BRIDGE_SESSION;

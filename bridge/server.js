@@ -7,9 +7,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const { spawn, spawnSync } = require('child_process');
+const { spawn } = require('child_process');
 const { WebSocketServer } = require('ws');
-const { Bonjour } = require('bonjour-service');
 
 const { ensureDataDirs } = require('./lib/datadir');
 const P = require('./lib/paths');
@@ -20,6 +19,7 @@ const { loadOrCreateCert } = require('./lib/cert');
 const { installFileLog } = require('./lib/log');
 const K = require('./lib/keeper-channel');
 const { pickLanAddress } = require('./lib/lan');
+const MDNS = require('./lib/mdns');
 
 const TEST_MODE = !!process.env.CLAUDE_BRIDGE_TEST; // тесты: без mDNS, QR и файлового лога
 const DATA = ensureDataDirs();
@@ -557,8 +557,10 @@ function internetMsg() {
 }
 function broadcastInternet() { broadcast(internetMsg()); }
 
+let tunnelStarting = false; // идёт гашение бесхозных туннелей перед запуском
+
 function startTunnel() {
-  if (tunnel || !inet.enabled) return;
+  if (tunnel || tunnelStarting || !inet.enabled) return;
   // Тесты: сайдкар не запускаем — он ушёл бы в интернет (iroh relay), а taskkill
   // ниже погасил бы туннель настоящего моста пользователя.
   if (TEST_MODE) return;
@@ -566,11 +568,29 @@ function startTunnel() {
     console.error('  Интернет-доступ включён, но bridge/bin/claude-tunnel.exe не собран');
     return;
   }
-  // бесхозные туннели прошлых запусков (у них тот же ключ/NodeId) — убрать;
-  // без шелла: путь установки не интерпретируется как команда
+  // Бесхозные туннели прошлых запусков (у них тот же ключ/NodeId) — убрать; без шелла
+  // (путь установки не интерпретируется как команда) и асинхронно: цикл событий моста
+  // не блокируется, новый туннель стартует после завершения taskkill.
+  tunnelStarting = true;
+  let done = false;
+  let killer = null;
+  const proceed = () => {
+    if (done) return;
+    done = true;
+    clearTimeout(guard);
+    tunnelStarting = false;
+    spawnTunnel();
+  };
+  const guard = setTimeout(() => { try { if (killer) killer.kill(); } catch { /* */ } proceed(); }, 10000);
   try {
-    spawnSync('taskkill', ['/IM', 'claude-tunnel.exe', '/F'], { stdio: 'ignore', windowsHide: true, timeout: 10000 });
-  } catch { /* нет прав/нет процессов */ }
+    killer = spawn('taskkill', ['/IM', 'claude-tunnel.exe', '/F'], { stdio: 'ignore', windowsHide: true });
+    killer.on('error', proceed);
+    killer.on('exit', proceed);
+  } catch { proceed(); }
+}
+
+function spawnTunnel() {
+  if (tunnel || !inet.enabled) return; // пока гасили старые, доступ могли выключить
   writeAllowFile(); // актуальный allowlist к моменту старта туннеля
   const child = spawn(TUNNEL_BIN, [
     'listen',
@@ -884,32 +904,42 @@ function httpHandler(req, res) {
 }
 
 // Интерфейс по умолчанию — адрес в LAN, а не 0.0.0.0 (P-7, L-11): мост не виден
-// из прочих сетей ПК (VPN, виртуальные адаптеры). "auto" определяется при старте.
-const LISTEN_HOST = (!CONFIG.host || CONFIG.host === 'auto') ? lanAddress() : CONFIG.host;
-// Владелец подключается к 127.0.0.1: если основной сервер слушает только LAN-адрес,
-// loopback обслуживает отдельный сервер на ТОМ ЖЕ номере порта (isOwner проверяет
-// localPort === CONFIG.port, поэтому он проходит как основной порт).
-const NEED_OWNER_LISTENER = LISTEN_HOST !== '0.0.0.0' && LISTEN_HOST !== '127.0.0.1';
+// из прочих сетей ПК (VPN, виртуальные адаптеры).
+//  - host "auto" (по умолчанию): loopback владельца слушается всегда; LAN-адрес
+//    выбирается lib/lan.js и перепроверяется каждые 15 с (ревью I-3: при автозапуске
+//    сеть может ещё не подняться, а адрес — смениться по DHCP / при смене Wi-Fi);
+//  - явный host: слушаем его, плюс loopback владельца, если это конкретный адрес.
+// Владелец подключается к 127.0.0.1; isOwner проверяет localPort === CONFIG.port, поэтому
+// loopback-сервер на том же номере порта проходит как основной порт.
+const AUTO_HOST = !CONFIG.host || CONFIG.host === 'auto';
+const LAN_REPICK_MS = (TEST_MODE && parseInt(process.env.CLAUDE_BRIDGE_TEST_REPICK_MS, 10) > 0)
+  ? parseInt(process.env.CLAUDE_BRIDGE_TEST_REPICK_MS, 10) : 15000;
+const FIXED_HOSTS = AUTO_HOST ? ['127.0.0.1']
+  : (CONFIG.host === '0.0.0.0' || CONFIG.host === '127.0.0.1') ? [CONFIG.host] : [CONFIG.host, '127.0.0.1'];
 
-// Основной сервер (LAN), loopback-сервер владельца и отдельный локальный порт
-// для интернет-туннеля: isOwner() различает их по localPort.
-const server = https.createServer(TLS, httpHandler);
-const ownerServer = https.createServer(TLS, httpHandler);
-const tunnelServer = https.createServer(TLS, httpHandler);
-// M-10: медленные/зависшие клиенты не держат ресурсы бесконечно.
-// requestTimeout 120 с: голосовые записи до 20 МБ по медленной мобильной сети.
-for (const srv of [server, ownerServer, tunnelServer]) {
+function makeHttpsServer() {
+  const srv = https.createServer(TLS, httpHandler);
+  // M-10: медленные/зависшие клиенты не держат ресурсы бесконечно.
+  // requestTimeout 120 с: голосовые записи до 20 МБ по медленной мобильной сети.
   srv.headersTimeout = 10000;
   srv.requestTimeout = 120000;
   srv.maxConnections = 256;
+  srv.on('upgrade', handleUpgrade);
+  return srv;
 }
-for (const [srv, host] of [[server, LISTEN_HOST], [ownerServer, '127.0.0.1']]) {
+
+// Постоянные слушатели: ошибка — выход (порт занят — уже запущен мост?).
+const fixedServers = FIXED_HOSTS.map((host) => {
+  const srv = makeHttpsServer();
   srv.on('error', (e) => {
     console.error(`  Не удалось слушать порт ${host}:${CONFIG.port} (${e.code || e.message}) — ` +
       'порт занят другим процессом (уже запущен мост?) или недоступен');
     process.exit(1);
   });
-}
+  return { srv, host };
+});
+// Отдельный локальный порт для интернет-туннеля: isOwner() отличает его по localPort.
+const tunnelServer = makeHttpsServer();
 tunnelServer.on('error', (e) => {
   console.error(`  Порт туннеля 127.0.0.1:${TUNNEL_PORT} недоступен (${e.code || e.message}) — ` +
     'доступ через интернет отключён до перезапуска моста');
@@ -917,6 +947,90 @@ tunnelServer.on('error', (e) => {
   inet.enabled = false; // только в памяти: при следующем старте попробуем снова
   stopTunnel();
 });
+
+// ---- LAN-адрес в режиме auto (ревью I-3)
+let lanServer = null; // сервер на LAN-адресе
+let lanHost = null; // адрес, который он слушает (null — LAN-адреса нет)
+let lanBusy = false; // идёт listen
+let lanLastError = '';
+
+/** Адрес для QR/mDNS: тот, что реально слушаем в LAN; null — только этот ПК. */
+function advertisedHost() {
+  if (AUTO_HOST) return lanHost;
+  if (CONFIG.host === '127.0.0.1') return null;
+  if (CONFIG.host === '0.0.0.0') { const a = lanAddress(); return a === '127.0.0.1' ? null : a; }
+  return CONFIG.host;
+}
+
+function warnNoLan() {
+  console.error('  ВНИМАНИЕ: нет LAN-адреса (сеть ещё не поднялась?) — мост доступен только с этого ПК; ' +
+    `сопряжение недоступно. Повторная проверка каждые ${Math.round(LAN_REPICK_MS / 1000)} с.`);
+}
+
+function lanListen(addr) {
+  const srv = makeHttpsServer();
+  lanBusy = true;
+  const onError = (e) => {
+    lanBusy = false;
+    try { srv.close(); } catch { /* не слушал */ }
+    const key = addr + ':' + (e.code || e.message);
+    if (key !== lanLastError) { // не засорять лог одной и той же ошибкой каждые 15 с
+      lanLastError = key;
+      console.error(`  Не удалось слушать LAN-адрес ${addr}:${CONFIG.port} (${e.code || e.message}) — ` +
+        `повтор через ${Math.round(LAN_REPICK_MS / 1000)} с`);
+    }
+  };
+  srv.once('error', onError);
+  srv.once('listening', () => {
+    srv.removeListener('error', onError);
+    srv.on('error', (e) => console.error('  LAN-сервер:', e.message));
+    lanBusy = false;
+    lanLastError = '';
+    lanServer = srv;
+    lanHost = addr;
+    console.log(`  Слушаю LAN: ${addr}:${CONFIG.port}`);
+    announceMdns();
+  });
+  srv.listen(CONFIG.port, addr);
+}
+
+function repickLan() {
+  if (lanBusy) return;
+  const want = lanAddress();
+  const wantHost = want === '127.0.0.1' ? null : want;
+  if (wantHost === lanHost) return;
+  if (lanServer) {
+    // адрес пропал или сменился: соединения по старому адресу всё равно мертвы
+    try { lanServer.close(); } catch { /* уже закрыт */ }
+    console.log(`  LAN-адрес изменился: ${lanHost} -> ${wantHost || 'нет'}`);
+    lanServer = null;
+    lanHost = null;
+    announceMdns();
+    if (!wantHost) warnNoLan();
+  }
+  if (wantHost) lanListen(wantHost);
+}
+
+// ---- mDNS (P-7, ревью I-1): без имени ПК, A-запись — только адрес, который слушаем
+let bonjour = null;
+function announceMdns() {
+  if (TEST_MODE) return;
+  if (bonjour) {
+    const old = bonjour;
+    bonjour = null;
+    try { old.unpublishAll(() => { try { old.destroy(); } catch { /* */ } }); } catch { /* */ }
+  }
+  const host = AUTO_HOST ? lanHost : CONFIG.host;
+  if (!MDNS.shouldPublish(host)) return;
+  try {
+    bonjour = MDNS.publish({
+      listenHost: host, name: CONFIG.mdnsName, port: CONFIG.port, fingerprint: FINGERPRINT,
+      onError: (e) => console.error('mDNS (не критично):', e && e.message),
+    });
+  } catch (e) {
+    console.error('mDNS publish failed (не критично):', e.message);
+  }
+}
 
 // ---------------------------------------------------------------- websocket
 
@@ -953,9 +1067,6 @@ function handleUpgrade(req, sock, head) {
     wss.emit('connection', ws, req, who);
   });
 }
-server.on('upgrade', handleUpgrade);
-ownerServer.on('upgrade', handleUpgrade);
-tunnelServer.on('upgrade', handleUpgrade);
 const allClients = new Set();
 
 function broadcast(obj) {
@@ -1111,10 +1222,16 @@ wss.on('connection', (ws, req, who) => {
           // подтверждения в консоли (P-9: confirmed; ограничение и D-13 — см. setInternet);
           // каждый запрос выдаёт свежий код на 10 минут
           if (ws.deviceId === 'local' && m.confirmed === true) {
+            const host = advertisedHost(); // адрес, который реально слушаем в LAN
+            if (!host) {
+              // QR с 127.0.0.1 телефону бесполезен (ревью I-3)
+              ws.send(JSON.stringify({ type: 'error', message: 'нет LAN-адреса — проверьте сеть' }));
+              break;
+            }
             const p = regenPairCode();
             ws.send(JSON.stringify({
               type: 'pairinfo',
-              host: LISTEN_HOST === '0.0.0.0' ? lanAddress() : LISTEN_HOST, // адрес, который реально слушаем
+              host,
               port: CONFIG.port,
               code: p.code,
               ttlMin: Math.round(PAIR_TTL_MS / 60000),
@@ -1166,9 +1283,17 @@ wss.on('connection', (ws, req, who) => {
 
 // ---------------------------------------------------------------- start
 
+/** Сетевые интерфейсы ПК. Тесты (только CLAUDE_BRIDGE_TEST) подставляют свои через
+ *  CLAUDE_BRIDGE_TEST_IFACES: JSON или путь к JSON-файлу (перечитывается при каждом вызове). */
+function networkInterfaces() {
+  const v = TEST_MODE ? process.env.CLAUDE_BRIDGE_TEST_IFACES : '';
+  if (!v) return os.networkInterfaces();
+  try { return JSON.parse(v.trim().startsWith('{') ? v : fs.readFileSync(v, 'utf8')); } catch { return {}; }
+}
+
 /** Адрес основного LAN-интерфейса (P-7): частный адрес физического адаптера, см. lib/lan.js. */
 function lanAddress() {
-  return pickLanAddress();
+  return pickLanAddress(networkInterfaces());
 }
 
 // UDP-обнаружение: телефон шлёт broadcast "CLAUDE_BRIDGE?" на 8791,
@@ -1211,35 +1336,31 @@ beacon.on('error', (e) => console.error('UDP beacon error (не критично
 // только когда ВСЕ порты моста заняты нами: повторный запуск при работающем мосте
 // (start-bridge.js из Планировщика) выходит по EADDRINUSE, не тронув туннель и
 // хранителей работающего экземпляра.
-let pendingListens = NEED_OWNER_LISTENER ? 2 : 1;
-const listened = () => { if (--pendingListens === 0) onListening(); };
-if (NEED_OWNER_LISTENER) ownerServer.listen(CONFIG.port, '127.0.0.1', listened);
-server.listen(CONFIG.port, LISTEN_HOST, listened);
+let pendingListens = fixedServers.length;
+for (const { srv, host } of fixedServers) {
+  srv.listen(CONFIG.port, host, () => { if (--pendingListens === 0) onListening(); });
+}
 
 function onListening() {
   beacon.bind(CONFIG.port + 1);
   // порт для трафика из интернет-туннеля — только loopback
   if (inet.enabled) { listenTunnelServer(); startTunnel(); }
 
-  if (!TEST_MODE) {
-    try {
-      const bonjour = new Bonjour();
-      bonjour.publish({
-        name: CONFIG.mdnsName || 'claude-bridge',
-        type: 'claude-bridge',
-        port: CONFIG.port,
-        txt: { path: '/', fp: FINGERPRINT },
-      });
-    } catch (e) {
-      console.error('mDNS publish failed (не критично):', e.message);
-    }
+  let lanNote;
+  if (AUTO_HOST) {
+    const first = lanAddress();
+    if (first === '127.0.0.1') { lanNote = 'LAN: нет'; warnNoLan(); } else { lanNote = 'LAN: ' + first; lanListen(first); }
+    setInterval(repickLan, LAN_REPICK_MS).unref();
+  } else {
+    lanNote = 'host из конфига';
+    announceMdns();
   }
 
   restoreSessions();
 
   console.log('');
-  console.log('  Claude Bridge запущен (HTTPS/WSS, ' + LISTEN_HOST + ':' + CONFIG.port +
-    (NEED_OWNER_LISTENER ? ' и 127.0.0.1:' + CONFIG.port : '') + ')');
+  console.log('  Claude Bridge запущен (HTTPS/WSS, ' +
+    FIXED_HOSTS.map((h) => h + ':' + CONFIG.port).join(' и ') + '; ' + lanNote + ')');
   console.log(`  Доверенных устройств: ${pairings.devices.length}` +
     (pairings.devices.length ? ' — подключатся сами' : ''));
   console.log('  Доступ через интернет: ' +

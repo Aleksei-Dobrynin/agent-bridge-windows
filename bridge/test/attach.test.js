@@ -55,15 +55,25 @@ test('--qr with non-TTY stdin refuses (P-9), no pairing code is printed', async 
   assert.doesNotMatch(r.out, /Код для ручного ввода/);
 });
 
-test('--open with CB_NO_BROWSER=1 prints a working one-time login URL', async () => {
-  const r = runAttach(['--open'], { env: { CB_NO_BROWSER: '1' } });
-  assert.strictEqual(await r.exited, 0, r.err);
-  const m = r.out.match(/https:\/\/127\.0\.0\.1:(\d+)\/\?ott=([0-9a-f]{64})/);
-  assert.ok(m, 'URL printed: ' + r.out);
-  assert.strictEqual(Number(m[1]), port);
-  const res = await H.request(port, pin, { path: '/?ott=' + m[2] });
+test('owner login for --open: issueLoginToken over WS gives a working one-time URL', async () => {
+  // сам --open здесь не запускаем: без TTY он только открывает браузер и ссылку не печатает (I-2)
+  const { buildLoginUrl } = require('../lib/open-url');
+  const c = await H.wsConnect(port, pin, { Authorization: 'Bearer ' + owner });
+  c.send({ type: 'issueLoginToken' });
+  assert.ok(await H.waitFor(() => c.msgs.some((m) => m.type === 'loginToken')));
+  c.ws.close();
+  const url = buildLoginUrl(c.msgs.find((m) => m.type === 'loginToken'));
+  assert.ok(url, 'valid login URL');
+  const res = await H.request(port, pin, { path: new URL(url).pathname + new URL(url).search });
   assert.strictEqual(res.statusCode, 302);
   assert.match(String(res.headers['set-cookie']), /bridgeToken=[0-9a-f]{64}/);
+});
+
+test('--device with non-TTY stdin refuses (revocation / internet toggle need a human)', async () => {
+  const r = runAttach(['--device'], { input: '1\ny\n' });
+  assert.strictEqual(await r.exited, 1);
+  assert.match(r.err, /Эта операция требует подтверждения в интерактивной консоли\./);
+  assert.doesNotMatch(r.out, /Доверенные устройства/);
 });
 
 test('server: pairinfo / setInternet from owner need confirmed:true (P-9)', async () => {
@@ -95,9 +105,14 @@ test('bridge down -> clear error, exit 1', async () => {
 });
 
 test('owner connection closed with 4401 -> clear message, exit 1', async () => {
-  const r = runAttach(['--device'], { keepStdin: true }); // ждёт ответа в меню
-  assert.ok(await H.waitFor(() => /Доверенные устройства/.test(r.out)), r.out + r.err);
+  // долгоживущее соединение без TTY: claude-mobile -a к сессии (агент — простой node-процесс)
   const c = await H.wsConnect(port, pin, { Authorization: 'Bearer ' + owner });
+  c.send({ type: 'create', command: process.execPath, args: ['-e', 'setInterval(()=>{},1000)'], cwd: home });
+  assert.ok(await H.waitFor(() => c.msgs.some((m) => m.type === 'created')), 'created');
+  const id = c.msgs.find((m) => m.type === 'created').id;
+  const r = runAttach(['-a', id], { keepStdin: true });
+  await H.sleep(1500); // подключение и attach
+  assert.strictEqual(r.proc.exitCode, null, 'attach.js is attached: ' + r.err);
   c.send({ type: 'rotateOwnerToken' });
   assert.strictEqual(await r.exited, 1);
   assert.match(r.err, /Токен владельца перевыпущен/);

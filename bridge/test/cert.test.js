@@ -53,3 +53,26 @@ test('corrupt pfx is regenerated once with a loud re-pair warning', { timeout: 6
   assert.match(errors.join('\n'), /pair/i);
   assert.ok(b.tls.pfx.length > 100);
 });
+
+test('bridge.cer that does not match the certificate inside the PFX -> treated as corrupted', { timeout: 120000 }, (t) => {
+  const dir = tmpDir(t);
+  const other = tmpDir(t);
+  const a = loadOrCreateCert(dir);
+  const o = loadOrCreateCert(other);
+  // подменённый .cer: отпечаток для телефона/хука не соответствовал бы ключу, которым мост реально отвечает
+  fs.copyFileSync(path.join(other, 'bridge.cer'), path.join(dir, 'bridge.cer'));
+  const orig = console.error;
+  const errors = [];
+  console.error = (...args) => errors.push(args.join(' '));
+  let b;
+  try { b = loadOrCreateCert(dir); } finally { console.error = orig; }
+  assert.match(errors.join('\n'), /pair/i, 'loud re-pair warning');
+  assert.notStrictEqual(b.fingerprint, a.fingerprint);
+  assert.notStrictEqual(b.fingerprint, o.fingerprint);
+  // новый .cer совпадает с сертификатом, которым мост реально отвечает
+  const tls = require('tls');
+  const s = new tls.TLSSocket(null, { secureContext: tls.createSecureContext(b.tls) });
+  const served = crypto.createHash('sha256').update(s.getCertificate().raw).digest('hex');
+  s.destroy();
+  assert.strictEqual(served, b.fingerprint);
+});

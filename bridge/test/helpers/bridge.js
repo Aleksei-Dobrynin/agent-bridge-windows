@@ -21,9 +21,27 @@ async function waitFor(pred, timeoutMs = 20000) {
   return false;
 }
 
-/** Порт из диапазона [base, base+900), шаг 3: port, port+1 (маяк), port+2 (туннель). */
+/** Диапазоны портов, зарезервированные Windows (Hyper-V/WSL/winnat): bind туда даёт EACCES. */
+let excluded = null;
+function excludedRanges() {
+  if (excluded) return excluded;
+  excluded = [];
+  for (const proto of ['tcp', 'udp']) {
+    const r = spawnSync('netsh', ['interface', 'ipv4', 'show', 'excludedportrange', `protocol=${proto}`],
+      { encoding: 'utf8', windowsHide: true });
+    for (const m of String(r.stdout || '').matchAll(/^\s*(\d+)\s+(\d+)/gm)) excluded.push([+m[1], +m[2]]);
+  }
+  return excluded;
+}
+
+/** Порт из диапазона [base, base+900), шаг 3: port, port+1 (маяк), port+2 (туннель);
+ *  тройка не пересекается с зарезервированными Windows диапазонами. */
 function pickPort(base) {
-  return base + Math.floor(Math.random() * 300) * 3;
+  for (let i = 0; i < 1000; i++) {
+    const p = base + Math.floor(Math.random() * 300) * 3;
+    if (!excludedRanges().some(([lo, hi]) => p + 2 >= lo && p <= hi)) return p;
+  }
+  throw new Error('no free port triple near ' + base);
 }
 
 function tempHome(prefix) {

@@ -19,6 +19,7 @@ const { originAllowed } = require('./lib/origin');
 const { loadOrCreateCert } = require('./lib/cert');
 const { installFileLog } = require('./lib/log');
 const K = require('./lib/keeper-channel');
+const { pickLanAddress } = require('./lib/lan');
 
 const TEST_MODE = !!process.env.CLAUDE_BRIDGE_TEST; // тесты: без mDNS, QR и файлового лога
 const DATA = ensureDataDirs();
@@ -465,20 +466,26 @@ function failStt(proc, reason) {
   sttQueue = [];
 }
 
+// Python на Windows — через лаунчер `py` с выбором версии (`-3.11`), см. config.example.json.
+const STT_PYTHON = (typeof CONFIG.sttPython === 'string' && CONFIG.sttPython) || 'py';
+const STT_PYTHON_ARGS = Array.isArray(CONFIG.sttPythonArgs) &&
+  CONFIG.sttPythonArgs.every((a) => typeof a === 'string') ? CONFIG.sttPythonArgs : [];
+
 function ensureStt() {
   if (sttProc) return;
-  const proc = spawn(CONFIG.sttPython || 'python3.11', [path.join(__dirname, 'stt.py')], {
+  const proc = spawn(STT_PYTHON, [...STT_PYTHON_ARGS, path.join(__dirname, 'stt.py')], {
     env: {
       ...process.env,
       STT_MODEL: CONFIG.sttModel || 'large-v3',
       ...(CONFIG.sttPrompt ? { STT_PROMPT: CONFIG.sttPrompt } : {}),
     },
     stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
   });
   sttProc = proc;
   // I-1: без обработчика 'error' отсутствующий python (ENOENT) ронял весь мост
   proc.on('error', (e) => {
-    console.error('[stt] не удалось запустить воркер (' + (CONFIG.sttPython || 'python3.11') + '):', e.message);
+    console.error('[stt] не удалось запустить воркер (' + STT_PYTHON + '):', e.message);
     failStt(proc, 'STT-воркер не запустился');
   });
   proc.stdin.on('error', () => { /* воркер не запустился/умер — ответят 'error'/'exit' */ });
@@ -515,7 +522,7 @@ function transcribe(file) {
 // Включается только явно: claude-mobile --device -> «i».
 
 const INET_FILE = DATA.internet;
-const TUNNEL_BIN = path.join(__dirname, 'bin', 'claude-tunnel');
+const TUNNEL_BIN = path.join(__dirname, 'bin', 'claude-tunnel.exe');
 const TUNNEL_PORT = CONFIG.port + 2; // локальный порт для трафика из туннеля
 // allowlist iroh-узлов: телефон регистрирует свой NodeId (по LAN, через
 // защищённый WS), сюда пишутся id всех сопряжённых устройств. Туннель
@@ -526,7 +533,8 @@ function writeAllowFile() {
   const ids = pairings.devices
     .map((d) => (d.nodeId || '').trim().toLowerCase())
     .filter((x) => /^[0-9a-f]{64}$/.test(x));
-  try { fs.writeFileSync(ALLOW_FILE, ids.join('\n') + (ids.length ? '\n' : ''), { mode: 0o600 }); } catch {}
+  // каталог данных в профиле пользователя закрыт ACL (D-8): mode 0o600 на Windows не нужен
+  try { fs.writeFileSync(ALLOW_FILE, ids.join('\n') + (ids.length ? '\n' : '')); } catch {}
 }
 
 let inet = { enabled: false };
@@ -551,20 +559,25 @@ function broadcastInternet() { broadcast(internetMsg()); }
 
 function startTunnel() {
   if (tunnel || !inet.enabled) return;
+  // Тесты: сайдкар не запускаем — он ушёл бы в интернет (iroh relay), а taskkill
+  // ниже погасил бы туннель настоящего моста пользователя.
+  if (TEST_MODE) return;
   if (!fs.existsSync(TUNNEL_BIN)) {
-    console.error('  Интернет-доступ включён, но bridge/bin/claude-tunnel не собран');
+    console.error('  Интернет-доступ включён, но bridge/bin/claude-tunnel.exe не собран');
     return;
   }
-  // бесхозные туннели прошлых запусков (у них тот же ключ/NodeId) — убрать
+  // бесхозные туннели прошлых запусков (у них тот же ключ/NodeId) — убрать;
   // без шелла: путь установки не интерпретируется как команда
-  try { spawnSync('pkill', ['-f', TUNNEL_BIN + ' listen']); } catch { /* нет прав/нет процессов */ }
+  try {
+    spawnSync('taskkill', ['/IM', 'claude-tunnel.exe', '/F'], { stdio: 'ignore', windowsHide: true, timeout: 10000 });
+  } catch { /* нет прав/нет процессов */ }
   writeAllowFile(); // актуальный allowlist к моменту старта туннеля
   const child = spawn(TUNNEL_BIN, [
     'listen',
     '--target', '127.0.0.1:' + TUNNEL_PORT,
     '--secret-file', path.join(DATA.certs, 'iroh.key'),
     '--allow-file', ALLOW_FILE,
-  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+  ], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
   tunnel = child;
   child.on('error', (e) => console.error('  claude-tunnel не запустился:', e.message)); // затем 'exit'
   let acc = '';
@@ -737,7 +750,8 @@ function httpHandler(req, res) {
       return;
     }
     const tmp = path.join(os.tmpdir(), 'cb-stt-' + crypto.randomBytes(6).toString('hex') + '.m4a');
-    const out = fs.createWriteStream(tmp, { mode: 0o600 });
+    // %TEMP% — в профиле пользователя, закрыт ACL от других учётных записей (D-8)
+    const out = fs.createWriteStream(tmp);
     const cleanup = () => { try { fs.unlinkSync(tmp); } catch {} };
     let size = 0;
     let overflow = false;
@@ -864,21 +878,33 @@ function httpHandler(req, res) {
   });
 }
 
-// Основной сервер (LAN + localhost) и отдельный локальный порт для
-// интернет-туннеля: isOwner() различает их по localPort.
+// Интерфейс по умолчанию — адрес в LAN, а не 0.0.0.0 (P-7, L-11): мост не виден
+// из прочих сетей ПК (VPN, виртуальные адаптеры). "auto" определяется при старте.
+const LISTEN_HOST = (!CONFIG.host || CONFIG.host === 'auto') ? lanAddress() : CONFIG.host;
+// Владелец подключается к 127.0.0.1: если основной сервер слушает только LAN-адрес,
+// loopback обслуживает отдельный сервер на ТОМ ЖЕ номере порта (isOwner проверяет
+// localPort === CONFIG.port, поэтому он проходит как основной порт).
+const NEED_OWNER_LISTENER = LISTEN_HOST !== '0.0.0.0' && LISTEN_HOST !== '127.0.0.1';
+
+// Основной сервер (LAN), loopback-сервер владельца и отдельный локальный порт
+// для интернет-туннеля: isOwner() различает их по localPort.
 const server = https.createServer(TLS, httpHandler);
+const ownerServer = https.createServer(TLS, httpHandler);
 const tunnelServer = https.createServer(TLS, httpHandler);
-// M-10: медленные/зависшие клиенты не держат ресурсы бесконечно
-for (const srv of [server, tunnelServer]) {
+// M-10: медленные/зависшие клиенты не держат ресурсы бесконечно.
+// requestTimeout 120 с: голосовые записи до 20 МБ по медленной мобильной сети.
+for (const srv of [server, ownerServer, tunnelServer]) {
   srv.headersTimeout = 10000;
-  srv.requestTimeout = 30000;
+  srv.requestTimeout = 120000;
   srv.maxConnections = 256;
 }
-server.on('error', (e) => {
-  console.error(`  Не удалось слушать порт ${CONFIG.host || '0.0.0.0'}:${CONFIG.port} (${e.code || e.message}) — ` +
-    'порт занят другим процессом (уже запущен мост?) или недоступен');
-  process.exit(1);
-});
+for (const [srv, host] of [[server, LISTEN_HOST], [ownerServer, '127.0.0.1']]) {
+  srv.on('error', (e) => {
+    console.error(`  Не удалось слушать порт ${host}:${CONFIG.port} (${e.code || e.message}) — ` +
+      'порт занят другим процессом (уже запущен мост?) или недоступен');
+    process.exit(1);
+  });
+}
 tunnelServer.on('error', (e) => {
   console.error(`  Порт туннеля 127.0.0.1:${TUNNEL_PORT} недоступен (${e.code || e.message}) — ` +
     'доступ через интернет отключён до перезапуска моста');
@@ -923,6 +949,7 @@ function handleUpgrade(req, sock, head) {
   });
 }
 server.on('upgrade', handleUpgrade);
+ownerServer.on('upgrade', handleUpgrade);
 tunnelServer.on('upgrade', handleUpgrade);
 const allClients = new Set();
 
@@ -1078,7 +1105,7 @@ wss.on('connection', (ws, req, who) => {
             const p = regenPairCode();
             ws.send(JSON.stringify({
               type: 'pairinfo',
-              host: lanAddress(),
+              host: LISTEN_HOST === '0.0.0.0' ? lanAddress() : LISTEN_HOST, // адрес, который реально слушаем
               port: CONFIG.port,
               code: p.code,
               ttlMin: Math.round(PAIR_TTL_MS / 60000),
@@ -1130,16 +1157,9 @@ wss.on('connection', (ws, req, who) => {
 
 // ---------------------------------------------------------------- start
 
+/** Адрес основного LAN-интерфейса (P-7): частный адрес физического адаптера, см. lib/lan.js. */
 function lanAddress() {
-  for (const [name, addrs] of Object.entries(os.networkInterfaces())) {
-    for (const a of addrs || []) {
-      if (a.family === 'IPv4' && !a.internal && !name.startsWith('docker') &&
-          !name.startsWith('br-') && !name.startsWith('lxc') && !a.address.startsWith('169.254.')) {
-        return a.address;
-      }
-    }
-  }
-  return '127.0.0.1';
+  return pickLanAddress();
 }
 
 // UDP-обнаружение: телефон шлёт broadcast "CLAUDE_BRIDGE?" на 8791,
@@ -1164,14 +1184,15 @@ function isPrivateAddr(ip) {
   return l === '::1' || l.startsWith('fe80:') || l.startsWith('fc') || l.startsWith('fd');
 }
 
-const beacon = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+// Без reuseAddr (P-7): второй процесс не может тихо занять тот же UDP-порт и
+// перехватывать запросы обнаружения.
+const beacon = dgram.createSocket({ type: 'udp4' });
 beacon.on('message', (msg, rinfo) => {
   if (msg.toString().trim() === 'CLAUDE_BRIDGE?' && isPrivateAddr(rinfo.address)) {
     // fp — публичный отпечаток сертификата: телефон по нему понимает,
-    // КАКОЙ из его сопряжённых компьютеров ответил
-    const reply = JSON.stringify({
-      claudeBridge: true, port: CONFIG.port, host: os.hostname(), fp: FINGERPRINT,
-    });
+    // КАКОЙ из его сопряжённых компьютеров ответил. Имя ПК не раскрываем (P-7):
+    // в офисной сети его видел бы любой, кто шлёт broadcast.
+    const reply = JSON.stringify({ claudeBridge: true, port: CONFIG.port, fp: FINGERPRINT });
     beacon.send(reply, rinfo.port, rinfo.address);
   }
 });
@@ -1181,7 +1202,8 @@ beacon.bind(CONFIG.port + 1);
 // порт для трафика из интернет-туннеля — только loopback
 if (inet.enabled) { listenTunnelServer(); startTunnel(); }
 
-server.listen(CONFIG.port, CONFIG.host, () => {
+if (NEED_OWNER_LISTENER) ownerServer.listen(CONFIG.port, '127.0.0.1');
+server.listen(CONFIG.port, LISTEN_HOST, () => {
   if (!TEST_MODE) {
     try {
       const bonjour = new Bonjour();
@@ -1199,7 +1221,8 @@ server.listen(CONFIG.port, CONFIG.host, () => {
   restoreSessions();
 
   console.log('');
-  console.log('  Claude Bridge запущен (HTTPS/WSS, порт ' + CONFIG.port + ')');
+  console.log('  Claude Bridge запущен (HTTPS/WSS, ' + LISTEN_HOST + ':' + CONFIG.port +
+    (NEED_OWNER_LISTENER ? ' и 127.0.0.1:' + CONFIG.port : '') + ')');
   console.log(`  Доверенных устройств: ${pairings.devices.length}` +
     (pairings.devices.length ? ' — подключатся сами' : ''));
   console.log('  Доступ через интернет: ' +

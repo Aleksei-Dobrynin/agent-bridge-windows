@@ -17,7 +17,7 @@ const req = (opts, body) => H.request(port, pin, opts, body);
 
 test.before(async () => {
   // интернет-доступ включён: локальный порт туннеля (port+2) слушается
-  // (бинаря claude-tunnel в тестах нет — сайдкар не стартует, это не мешает)
+  // (в тестовом режиме сайдкар claude-tunnel не запускается — это не мешает)
   fs.writeFileSync(path.join(home, 'internet.json'), JSON.stringify({ enabled: true }));
   bridge = H.startBridge(home, port);
   ({ owner, pin } = await H.ownerAndPin(home));

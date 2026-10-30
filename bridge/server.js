@@ -4,7 +4,6 @@
 const http = require('http');
 const https = require('https');
 const fs = require('fs');
-const net = require('net');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
@@ -19,6 +18,7 @@ const V = require('./lib/validate');
 const { originAllowed } = require('./lib/origin');
 const { loadOrCreateCert } = require('./lib/cert');
 const { installFileLog } = require('./lib/log');
+const K = require('./lib/keeper-channel');
 
 const TEST_MODE = !!process.env.CLAUDE_BRIDGE_TEST; // тесты: без mDNS, QR и файлового лога
 const DATA = ensureDataDirs();
@@ -157,15 +157,15 @@ function revokeDeviceById(id) {
 }
 
 // ---------------------------------------------------------------- sessions
-// Каждая сессия живёт в отдельном процессе-хранителе (keeper.js) и общается
-// с мостом через unix-сокет: перезапуск моста не убивает Claude Code.
+// Каждая сессия живёт в отдельном процессе-хранителе (keeper.js) и общается с
+// мостом через named pipe с взаимной HMAC-проверкой (D-11): перезапуск моста не
+// убивает агента, а pipe без секрета сессии бесполезен (в т.ч. по SMB).
 
-const SESS_DIR = path.join(os.homedir(), '.claude-bridge', 'sessions');
-fs.mkdirSync(SESS_DIR, { recursive: true, mode: 0o700 });
-// mkdir с mode подвержен umask, а на уже существующем каталоге mode не меняет:
-// сокеты хранителей — единственная защита от захвата чужой сессии тем же
-// пользователем, поэтому жёстко чиним 0700 (доступ только владельцу).
-try { fs.chmodSync(SESS_DIR, 0o700); } catch {}
+const SESS_DIR = DATA.sessions;
+// Допустимые значения из meta-файла: только локальный pipe нашего вида (UNC в
+// meta.pipe заставил бы мост пойти по SMB и отдать NTLM — ревью M-3) и секрет 64 hex.
+const PIPE_RE = /^\\\\\.\\pipe\\claude-bridge-[0-9a-f]{32}$/;
+const SECRET_RE = /^[0-9a-f]{64}$/;
 
 const sessions = new Map(); // id -> session
 let seq = 0;
@@ -187,12 +187,15 @@ function rateAllowCreate(deviceId) {
 function makeSession(meta) {
   return {
     id: meta.id,
-    title: meta.title,
-    cwd: meta.cwd,
+    title: typeof meta.title === 'string' ? meta.title : meta.id,
+    cwd: typeof meta.cwd === 'string' ? meta.cwd : '',
     command: meta.cmd,
     pid: null,
     createdAt: meta.createdAt,
-    sock: null,
+    pipe: meta.pipe,
+    secret: meta.secret,
+    hookToken: typeof meta.hookToken === 'string' ? meta.hookToken : null,
+    channel: null,
     buffer: [],
     bufferBytes: 0,
     clients: new Set(),
@@ -206,7 +209,7 @@ function makeSession(meta) {
 }
 
 function keeperSend(session, obj) {
-  if (session.sock) { try { session.sock.write(JSON.stringify(obj) + '\n'); } catch {} }
+  if (session.channel) session.channel.send(obj);
 }
 
 function dropSession(session, exitCode) {
@@ -218,39 +221,35 @@ function dropSession(session, exitCode) {
 }
 
 function connectKeeper(session, retries) {
-  const sockPath = path.join(SESS_DIR, session.id + '.sock');
-  const sock = net.connect(sockPath);
-  let acc = '';
-  sock.on('connect', () => { session.sock = sock; });
-  sock.on('data', (chunk) => {
-    acc += chunk.toString('utf8');
-    let i;
-    while ((i = acc.indexOf('\n')) >= 0) {
-      const line = acc.slice(0, i);
-      acc = acc.slice(i + 1);
-      if (!line.trim()) continue;
-      let m;
-      try { m = JSON.parse(line); } catch { continue; }
+  K.connectAuthenticated(session.pipe, session.secret).then((ch) => {
+    // сессию успели убрать, пока шло рукопожатие — канал не нужен
+    if (sessions.get(session.id) !== session) { ch.socket.destroy(); return; }
+    session.channel = ch;
+    ch.socket.on('error', () => { /* обрыв канала обработает 'close' */ });
+    ch.socket.on('close', () => {
+      if (session.channel === ch) { session.channel = null; dropSession(session, -1); }
+    });
+    ch.onMessage((m) => {
       if (m.t === 'hello') {
-        session.pid = m.pid;
-        session.cols = m.cols;
-        session.rows = m.rows;
-        session.buffer = [m.buffer];
-        session.bufferBytes = Buffer.byteLength(m.buffer);
-        // Клиент-создатель attach'ится РАНЬШЕ, чем мост дозвонится до
-        // хранителя (created уходит сразу, hello — спустя ретраи). Всё, что
-        // claude успел нарисовать до hello (напр. trust-промпт нового
-        // каталога), есть только в этом буфере — досылаем, иначе у клиента
-        // пустой экран до первого нажатия клавиши.
-        if (m.buffer) {
+        session.pid = Number.isInteger(m.pid) ? m.pid : null;
+        if (Number.isInteger(m.cols)) session.cols = m.cols;
+        if (Number.isInteger(m.rows)) session.rows = m.rows;
+        const buf = typeof m.buffer === 'string' ? m.buffer : '';
+        session.buffer = [buf];
+        session.bufferBytes = Buffer.byteLength(buf);
+        // Клиент-создатель attach'ится РАНЬШЕ, чем мост дозвонится до хранителя
+        // (created уходит сразу, hello — спустя ретраи). Всё, что агент успел
+        // нарисовать до hello (напр. trust-промпт), есть только в этом буфере —
+        // досылаем, иначе у клиента пустой экран до первого нажатия клавиши.
+        if (buf) {
           const shot = JSON.stringify({
-            type: 'scrollback', id: session.id, data: m.buffer,
+            type: 'scrollback', id: session.id, data: buf,
             alive: session.alive, cols: session.cols, rows: session.rows,
           });
           for (const ws of session.clients) if (ws.readyState === 1) ws.send(shot);
         }
         broadcastSessions();
-      } else if (m.t === 'out') {
+      } else if (m.t === 'out' && typeof m.d === 'string') {
         session.buffer.push(m.d);
         session.bufferBytes += Buffer.byteLength(m.d);
         while (session.bufferBytes > (CONFIG.scrollbackBytes || 262144) && session.buffer.length > 1) {
@@ -259,86 +258,72 @@ function connectKeeper(session, retries) {
         const msg = JSON.stringify({ type: 'output', id: session.id, data: m.d });
         for (const ws of session.clients) if (ws.readyState === 1) ws.send(msg);
       } else if (m.t === 'exit') {
-        dropSession(session, m.code);
+        dropSession(session, Number.isInteger(m.code) ? m.code : -1);
       }
-    }
+    });
+  }).catch(() => {
+    if (sessions.get(session.id) !== session) return; // сессия уже убрана
+    if (retries > 0) { setTimeout(() => connectKeeper(session, retries - 1), 300); return; }
+    // Хранитель недостижим: не поднялся или умер нечисто (краш, перезагрузка ПК)
+    // и не убрал meta. Убираем сами — иначе мост при каждом старте будет
+    // «восстанавливать» зомби-сессию. Живой хранитель сюда не попадает.
+    try { fs.unlinkSync(path.join(SESS_DIR, session.id + '.json')); } catch { /* уже удалён */ }
+    console.log(`  Сессия ${session.id}: хранитель не отвечает — meta убран`);
+    dropSession(session, -1);
   });
-  sock.on('error', () => {
-    if (!session.sock && retries > 0) {
-      setTimeout(() => connectKeeper(session, retries - 1), 300);
-    } else if (!session.sock) {
-      // Хранитель недостижим: либо не поднялся, либо умер нечисто (краш,
-      // перезагрузка ПК) и не убрал свои файлы. Убираем их сами — иначе мост
-      // при каждом старте будет «восстанавливать» зомби-сессию и тут же её
-      // терять. Живые хранители сюда не попадают: их сокет отвечает.
-      try { fs.unlinkSync(path.join(SESS_DIR, session.id + '.json')); } catch {}
-      try { fs.unlinkSync(path.join(SESS_DIR, session.id + '.sock')); } catch {}
-      console.log(`  Сессия ${session.id}: хранитель не отвечает — файлы убраны`);
-      dropSession(session, -1);
-    }
-  });
-  sock.on('close', () => {
-    if (session.sock === sock) { session.sock = null; dropSession(session, -1); }
-  });
-}
-
-// Рабочий каталог удалённой (телефонной) сессии обязан лежать внутри
-// разрешённых проектов — иначе телефон мог бы запустить claude в произвольном
-// месте ФС. Локальные клиенты (claude-mobile) не ограничены.
-function isUnderAllowedRoot(dir) {
-  const resolved = path.resolve(dir);
-  return (CONFIG.projects || []).some((r) => {
-    const rr = path.resolve(r);
-    return resolved === rr || resolved.startsWith(rr + path.sep);
-  });
-}
-function remoteCwd(cwd) {
-  const fallback = CONFIG.defaultCwd || os.homedir();
-  if (!cwd) return fallback;
-  // realpath снимает симлинки: иначе ссылка ВНУТРИ разрешённого проекта
-  // (напр. /home/user/projects/link -> /etc) прошла бы лексическую проверку и
-  // claude стартовал бы вне проектов. Несуществующий путь -> fallback.
-  let real;
-  try { real = fs.realpathSync(cwd); } catch { return fallback; }
-  return isUnderAllowedRoot(real) ? real : fallback;
 }
 
 function createSession({ cwd, command, args, title, local }) {
   const id = 's' + (++seq) + '-' + crypto.randomBytes(3).toString('hex');
-  // Произвольную КОМАНДУ (бинарь) выбирают только локальные клиенты
-  // (claude-mobile, десктоп-браузер): телефон всегда запускает настроенный
-  // claude — с телефона нельзя запустить /bin/sh и т.п.
-  // Аргументы (напр. --resume, --dangerously-skip-permissions) телефон задаёт
-  // сам — это его штатные опции запуска, а сопряжённое устройство и так имеет
-  // полный интерактивный контроль над PTY, так что ограничивать их смысла нет.
-  // А вот КАТАЛОГ у телефона ограничиваем разрешёнными проектами, чтобы claude
-  // нельзя было стартовать вне них (например, в ~/.ssh).
+  // Произвольную КОМАНДУ выбирают только локальные клиенты (владелец): телефон
+  // всегда запускает настроенный агент. Аргументы телефон задаёт сам — это его
+  // штатные опции запуска, а сопряжённое устройство и так управляет PTY.
+  // КАТАЛОГ телефона ограничен разрешёнными проектами (D-7), путь — канонический
+  // (иначе --resume не найдёт беседы при другом регистре/8.3/junction).
   const cmd = (local && command) ? command : CONFIG.claudeCommand;
   const cmdArgs = (args && args.length) ? args : (CONFIG.claudeArgs || []);
-  const dir = local ? (cwd || CONFIG.defaultCwd || os.homedir()) : remoteCwd(cwd);
+  const fallback = P.canonicalDir(CONFIG.defaultCwd) || CONFIG.defaultCwd;
+  const dir = local
+    ? P.resolveLocalCwd(cwd, fallback)
+    : P.resolveRemoteCwd(cwd, CONFIG.projects, fallback);
 
+  // Секрет канала keeper<->мост и токен хука сессии (P-1): у каждой сессии свои.
+  const secret = crypto.randomBytes(32).toString('hex');
+  const hookToken = T.newToken();
   const meta = {
     id,
     cmd,
     args: cmdArgs,
     cwd: dir,
-    title: title || `${path.basename(dir)} · ${cmd}`,
+    title: title || `${path.basename(dir)} · ${path.basename(String(cmd))}`,
     createdAt: Date.now(),
     cols: 100,
     rows: 30,
     scrollbackBytes: CONFIG.scrollbackBytes || 262144,
+    pipe: K.pipeName(),
+    secret,
+    hookToken,
   };
   // env НЕ пишем в meta-файл: process.env может содержать секреты, а файл
-  // остаётся на диске. Передаём окружение хранителю через сам процесс.
-  const childEnv = { ...process.env, ...CONFIG.env, CLAUDE_BRIDGE_SESSION: id, FORCE_COLOR: '3' };
+  // остаётся на диске. Окружение передаётся хранителю через сам процесс;
+  // CLAUDE_BRIDGE_KEEPER_SECRET keeper удаляет до запуска агента.
+  const extraEnv = (CONFIG.env && typeof CONFIG.env === 'object' && !Array.isArray(CONFIG.env)) ? CONFIG.env : {};
+  const childEnv = {
+    ...process.env, ...extraEnv,
+    CLAUDE_BRIDGE_SESSION: id,
+    CLAUDE_BRIDGE_HOOK_TOKEN: hookToken,
+    CLAUDE_BRIDGE_PORT: String(CONFIG.port),
+    CLAUDE_BRIDGE_CERT_FP: FINGERPRINT,
+    CLAUDE_BRIDGE_KEEPER_SECRET: secret,
+    FORCE_COLOR: '3',
+  };
   const metaPath = path.join(SESS_DIR, id + '.json');
   fs.writeFileSync(metaPath, JSON.stringify(meta));
 
   const child = spawn(process.execPath, [path.join(__dirname, 'keeper.js'), metaPath], {
-    detached: true,
-    stdio: 'ignore',
-    env: childEnv,
+    detached: true, windowsHide: true, stdio: 'ignore', env: childEnv,
   });
+  child.on('error', (e) => console.error(`  Сессия ${id}: не удалось запустить хранитель:`, e.message));
   child.unref();
 
   const session = makeSession(meta);
@@ -348,27 +333,25 @@ function createSession({ cwd, command, args, title, local }) {
   return session;
 }
 
-// Восстановление живых сессий после перезапуска моста
+// Восстановление живых сессий после перезапуска моста: meta-файл + рукопожатие по pipe.
 function restoreSessions() {
   let restored = 0;
   for (const f of fs.readdirSync(SESS_DIR)) {
     if (!f.endsWith('.json')) continue;
-    const metaPath = path.join(SESS_DIR, f);
     try {
-      const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
-      if (!fs.existsSync(metaPath.replace(/\.json$/, '.sock'))) {
-        fs.unlinkSync(metaPath); // хранитель умер вместе с сессией
-        continue;
-      }
-      const n = parseInt(String(meta.id).slice(1), 10);
+      const meta = JSON.parse(fs.readFileSync(path.join(SESS_DIR, f), 'utf8'));
+      if (!meta || typeof meta !== 'object' || !V.sessionId(meta.id) || f !== meta.id + '.json') continue;
+      if (typeof meta.pipe !== 'string' || !PIPE_RE.test(meta.pipe)) continue;
+      if (typeof meta.secret !== 'string' || !SECRET_RE.test(meta.secret)) continue;
+      const n = parseInt(meta.id.slice(1), 10);
       if (n > seq) seq = n;
       const session = makeSession(meta);
       sessions.set(meta.id, session);
       connectKeeper(session, 3);
       restored++;
-    } catch { /* битый meta-файл — пропускаем */ }
+    } catch { /* битый meta — пропускаем */ }
   }
-  if (restored) console.log(`  Восстановлено живых сессий: ${restored}`);
+  if (restored) console.log(`  Восстановлено сессий: ${restored}`);
 }
 
 // Политика размера PTY: «размер следует за тем, кто печатает».

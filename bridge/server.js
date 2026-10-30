@@ -1206,13 +1206,21 @@ beacon.on('message', (msg, rinfo) => {
   }
 });
 beacon.on('error', (e) => console.error('UDP beacon error (не критично):', e.message));
-beacon.bind(CONFIG.port + 1);
 
-// порт для трафика из интернет-туннеля — только loopback
-if (inet.enabled) { listenTunnelServer(); startTunnel(); }
+// Всё, что затрагивает внешний мир (маяк, туннель с taskkill, mDNS, хранители сессий), —
+// только когда ВСЕ порты моста заняты нами: повторный запуск при работающем мосте
+// (start-bridge.js из Планировщика) выходит по EADDRINUSE, не тронув туннель и
+// хранителей работающего экземпляра.
+let pendingListens = NEED_OWNER_LISTENER ? 2 : 1;
+const listened = () => { if (--pendingListens === 0) onListening(); };
+if (NEED_OWNER_LISTENER) ownerServer.listen(CONFIG.port, '127.0.0.1', listened);
+server.listen(CONFIG.port, LISTEN_HOST, listened);
 
-if (NEED_OWNER_LISTENER) ownerServer.listen(CONFIG.port, '127.0.0.1');
-server.listen(CONFIG.port, LISTEN_HOST, () => {
+function onListening() {
+  beacon.bind(CONFIG.port + 1);
+  // порт для трафика из интернет-туннеля — только loopback
+  if (inet.enabled) { listenTunnelServer(); startTunnel(); }
+
   if (!TEST_MODE) {
     try {
       const bonjour = new Bonjour();
@@ -1239,7 +1247,7 @@ server.listen(CONFIG.port, LISTEN_HOST, () => {
   // Код сопряжения при старте не выпускается (P-9) — QR/код только по запросу владельца.
   console.log('  Добавить устройство: claude-mobile --qr');
   console.log(`  Отпечаток сертификата: ${FINGERPRINT.slice(0, 16)}…`);
-});
+}
 
 // Перезапуск моста НЕ убивает сессии: они живут в отдельных хранителях.
 // А вот интернет-туннель — часть моста: его при выходе гасим, иначе при

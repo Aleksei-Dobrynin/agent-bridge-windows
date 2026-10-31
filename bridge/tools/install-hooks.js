@@ -96,17 +96,60 @@ function backupName(file, now = new Date()) {
   return `${file}.bak-${now.toISOString().replace(/[:.]/g, '-')}`;
 }
 
-/** Записать настройки; существующий файл сначала копируется. Возвращает путь копии или null. */
-function writeSettings(file, settings, exists) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  let backup = null;
-  if (exists) {
-    backup = backupName(file);
-    fs.copyFileSync(file, backup, fs.constants.COPYFILE_EXCL);
+/** Резервных копий установщика (имя из backupName) хранится не больше (ревью M-5). */
+const KEEP_BACKUPS = 5;
+const BACKUP_RE = /\.bak-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z$/;
+
+/** Удалить старые копии установщика, кроме последних KEEP_BACKUPS; чужие файлы не трогаются. */
+function pruneBackups(file, keep = KEEP_BACKUPS) {
+  const dir = path.dirname(file);
+  const prefix = path.basename(file) + '.bak-';
+  const ours = fs.readdirSync(dir)
+    .filter((f) => f.startsWith(prefix) && BACKUP_RE.test(f) && f.length === prefix.length + 24)
+    .sort(); // ISO-время в имени — сортировка по имени = по времени
+  for (const f of ours.slice(0, Math.max(0, ours.length - keep))) {
+    try { fs.unlinkSync(path.join(dir, f)); } catch { /* занят — удалим в следующий раз */ }
   }
+}
+
+const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
+/** rename с повтором: на Windows файл настроек может быть кратко занят (антивирус, редактор). */
+function renameWithRetry(from, to, rename, retries = 3, delayMs = 100) {
+  for (let i = 0; ; i++) {
+    try { return rename(from, to); } catch (e) {
+      if (i >= retries || !['EPERM', 'EBUSY'].includes(e.code)) throw e;
+      sleepSync(delayMs * (i + 1));
+    }
+  }
+}
+
+const tryUnlink = (p) => { try { fs.unlinkSync(p); } catch { /* нет файла */ } };
+
+/**
+ * Записать настройки: временный файл -> резервная копия существующего -> rename (ревью M-1).
+ * При любой ошибке временный файл и сделанная копия удаляются, файл настроек не меняется.
+ * io — подмена операций для тестов. Возвращает путь копии или null.
+ */
+function writeSettings(file, settings, exists, io = {}) {
+  const writeFile = io.writeFile || fs.writeFileSync;
+  const rename = io.rename || fs.renameSync;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, JSON.stringify(settings, null, 2) + '\n');
-  fs.renameSync(tmp, file);
+  let backup = null;
+  try {
+    writeFile(tmp, JSON.stringify(settings, null, 2) + '\n');
+    if (exists) {
+      backup = backupName(file);
+      fs.copyFileSync(file, backup, fs.constants.COPYFILE_EXCL);
+    }
+    renameWithRetry(tmp, file, rename, 3, io.delayMs === undefined ? 100 : io.delayMs);
+  } catch (e) {
+    tryUnlink(tmp);
+    if (backup) tryUnlink(backup);
+    throw e;
+  }
+  if (backup) pruneBackups(file);
   return backup;
 }
 
@@ -154,4 +197,4 @@ function main(argv) {
 if (require.main === module) process.exitCode = main(process.argv.slice(2));
 
 module.exports = { HOOK, DEFAULT_SETTINGS, isBridgeEntry, isInstalled, removeBridgeHooks, mergeBridgeHooks,
-  readSettings, writeSettings, backupName, main };
+  readSettings, writeSettings, backupName, pruneBackups, renameWithRetry, KEEP_BACKUPS, main };

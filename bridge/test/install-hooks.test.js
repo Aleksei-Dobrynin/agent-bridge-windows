@@ -146,3 +146,69 @@ test('CLI refuses broken JSON and leaves the file as is', (t) => {
   assert.strictEqual(fs.readFileSync(file, 'utf8'), '{ "hooks": ');
   assert.deepStrictEqual(backups(dir), []);
 });
+
+// ---- ревью M-1, M-5: надёжная запись и ограничение числа резервных копий
+
+function tmpExisting(t, content = '{"model":"opus"}') {
+  const { dir, file } = tmpSettings(t);
+  fs.mkdirSync(path.dirname(file));
+  fs.writeFileSync(file, content);
+  return { dir, file, content };
+}
+const leftovers = (dir) => fs.readdirSync(path.join(dir, 'claude')).filter((f) => f !== 'settings.json');
+const errno = (code) => Object.assign(new Error(code), { code });
+
+test('M-1: failed tmp write leaves no tmp file and no backup; file unchanged', (t) => {
+  const { dir, file, content } = tmpExisting(t);
+  assert.throws(() => IH.writeSettings(file, { a: 1 }, true, {
+    writeFile: (p) => { fs.writeFileSync(p, 'partial'); throw errno('ENOSPC'); },
+  }), /ENOSPC/);
+  assert.strictEqual(fs.readFileSync(file, 'utf8'), content);
+  assert.deepStrictEqual(leftovers(dir), []);
+});
+
+test('M-1: rename retried on EPERM/EBUSY, then succeeds', (t) => {
+  const { dir, file } = tmpExisting(t);
+  let calls = 0;
+  const backup = IH.writeSettings(file, { a: 1 }, true, {
+    rename: (a, b) => { calls++; if (calls < 3) throw errno(calls === 1 ? 'EPERM' : 'EBUSY'); fs.renameSync(a, b); },
+    delayMs: 1,
+  });
+  assert.strictEqual(calls, 3);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { a: 1 });
+  assert.deepStrictEqual(leftovers(dir), [path.basename(backup)]);
+});
+
+test('M-1: rename failing after 3 retries removes tmp and backup; file unchanged', (t) => {
+  const { dir, file, content } = tmpExisting(t);
+  let calls = 0;
+  assert.throws(() => IH.writeSettings(file, { a: 1 }, true, {
+    rename: () => { calls++; throw errno('EPERM'); }, delayMs: 1,
+  }), /EPERM/);
+  assert.strictEqual(calls, 4, '1 attempt + 3 retries');
+  assert.strictEqual(fs.readFileSync(file, 'utf8'), content);
+  assert.deepStrictEqual(leftovers(dir), []);
+});
+
+test('M-1: other rename errors are not retried', (t) => {
+  const { file } = tmpExisting(t);
+  let calls = 0;
+  assert.throws(() => IH.writeSettings(file, { a: 1 }, true, { rename: () => { calls++; throw errno('ENOENT'); } }), /ENOENT/);
+  assert.strictEqual(calls, 1);
+});
+
+test('M-5: only the last 5 installer backups are kept; other files untouched', (t) => {
+  const { dir, file } = tmpExisting(t);
+  const d = path.join(dir, 'claude');
+  const old = [];
+  for (let i = 0; i < 7; i++) {
+    const n = path.basename(IH.backupName(file, new Date(Date.UTC(2026, 0, 1, 0, 0, i))));
+    fs.writeFileSync(path.join(d, n), 'old' + i);
+    old.push(n);
+  }
+  fs.writeFileSync(path.join(d, 'settings.json.bak-manual'), 'mine');
+  fs.writeFileSync(path.join(d, 'settings.json.bak'), 'mine too');
+  const backup = IH.writeSettings(file, { a: 1 }, true);
+  const left = leftovers(dir).sort();
+  assert.deepStrictEqual(left, [...old.slice(-4), path.basename(backup), 'settings.json.bak', 'settings.json.bak-manual'].sort());
+});

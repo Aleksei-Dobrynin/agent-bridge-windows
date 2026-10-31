@@ -24,6 +24,7 @@ const { loadAgents, normalizeOptions } = require('./agents');
 const generic = require('./agents/generic');
 const { findOnPath } = require('./lib/which');
 const SE = require('./lib/session-events');
+const { Confirmations, confirmView } = require('./lib/confirmations');
 
 const TEST_MODE = !!process.env.CLAUDE_BRIDGE_TEST; // тесты: без mDNS, QR и файлового лога
 const DATA = ensureDataDirs();
@@ -1231,6 +1232,64 @@ function devicesMsg(ws) {
   };
 }
 
+// ---------------------------------------------------------------- подтверждения D-13
+
+const confirmations = new Confirmations();
+
+function broadcastToDevices(obj) {
+  const msg = JSON.stringify(obj);
+  for (const c of allClients) if (c.deviceId && c.deviceId !== 'local' && c.readyState === 1) c.send(msg);
+}
+
+function finishConfirmation(e, allow, reason) {
+  broadcastToDevices({ type: 'confirmClosed', confirmId: e.confirmId });
+  wsSend(e.requester, { type: 'confirmResult', confirmId: e.confirmId, action: e.action, allow, reason });
+  if (allow) e.run();
+}
+
+setInterval(() => {
+  for (const e of confirmations.sweep()) finishConfirmation(e, false, 'timeout');
+}, 5000).unref();
+
+/** Операция владельца: без сопряжённых устройств — флаг интерактивной консоли (P-9),
+ *  иначе — только подтверждение на телефоне (D-13); флаг консоли тогда игнорируется. */
+function ownerConfirmed(ws, m, action, run) {
+  if (pairings.devices.length === 0) {
+    if (m.confirmed === true) run();
+    else wsSend(ws, { type: 'confirmRequired', action });
+    return;
+  }
+  const e = confirmations.request(action, ws, run);
+  if (!e) {
+    wsSend(ws, { type: 'error', message: 'Подтверждение этой операции уже ожидается на телефоне' });
+    return;
+  }
+  wsSend(ws, { type: 'confirmPending', confirmId: e.confirmId, action,
+    message: 'Подтвердите операцию на сопряжённом телефоне (2 минуты)…' });
+  broadcastToDevices(confirmView(e));
+}
+
+/** D-18 п. 3: QR с 127.0.0.1 телефону бесполезен — без LAN-адреса код не выпускаем. */
+function noLanError(ws) {
+  wsSend(ws, { type: 'error', message: 'нет LAN-адреса — проверьте сеть' });
+}
+
+function sendPairinfo(ws) {
+  if (!ws || ws.readyState !== 1) return; // запросивший ушёл — код не выпускаем
+  const host = advertisedHost(); // адрес, который реально слушаем в LAN (мог пропасть, пока ждали телефон)
+  if (!host) { noLanError(ws); return; }
+  const p = regenPairCode();
+  wsSend(ws, {
+    type: 'pairinfo',
+    host,
+    port: CONFIG.port,
+    code: p.code,
+    ttlMin: Math.round(PAIR_TTL_MS / 60000),
+    fp: FINGERPRINT,
+    internet: internetMsg(),
+  });
+}
+
 wss.on('connection', (ws, req, who) => {
   ws.on('error', () => { /* необработанная ошибка ws (напр. maxPayload) не должна ронять мост */ });
   // 'local' — имя роли владельца (в этом подплане остальные проверки не меняются)
@@ -1246,6 +1305,8 @@ wss.on('connection', (ws, req, who) => {
         choices: p.choices, message: p.message, title: s.title, at: p.at });
     }
   }
+  // D-13: устройство, подключившееся после запроса, тоже видит ожидающие подтверждения
+  if (ws.deviceId !== 'local') for (const e of confirmations.list()) wsSend(ws, confirmView(e));
 
   ws.on('message', (raw) => {
     let parsed;
@@ -1405,36 +1466,25 @@ wss.on('connection', (ws, req, who) => {
           break;
         }
         case 'setInternet':
-          // включение/выключение — только с самого ПК (claude-mobile --device) и только
-          // после подтверждения человеком в консоли (P-9: confirmed). Флаг шлёт сам
-          // клиент, поэтому от агента с токеном владельца это не защищает — по D-13
-          // подтверждение переедет на сопряжённый телефон (подплан 2).
-          if (ws.deviceId === 'local' && m.confirmed === true) {
-            setInternet(m.enabled === true);
-            broadcastInternet();
-          }
+          // только с самого ПК (claude-mobile --device); выключение безопасно — без подтверждения;
+          // включение — подтверждение на сопряжённом телефоне, без устройств — в консоли (D-13, P-9)
+          if (ws.deviceId !== 'local') break;
+          if (m.enabled !== true) { setInternet(false); broadcastInternet(); break; }
+          ownerConfirmed(ws, m, 'setInternet', () => { setInternet(true); broadcastInternet(); });
           break;
         case 'pairinfo':
-          // данные сопряжения — только локальным клиентам (claude-mobile --qr) после
-          // подтверждения в консоли (P-9: confirmed; ограничение и D-13 — см. setInternet);
-          // каждый запрос выдаёт свежий код на 10 минут
-          if (ws.deviceId === 'local' && m.confirmed === true) {
-            const host = advertisedHost(); // адрес, который реально слушаем в LAN
-            if (!host) {
-              // QR с 127.0.0.1 телефону бесполезен (ревью I-3)
-              ws.send(JSON.stringify({ type: 'error', message: 'нет LAN-адреса — проверьте сеть' }));
-              break;
-            }
-            const p = regenPairCode();
-            ws.send(JSON.stringify({
-              type: 'pairinfo',
-              host,
-              port: CONFIG.port,
-              code: p.code,
-              ttlMin: Math.round(PAIR_TTL_MS / 60000),
-              fp: FINGERPRINT,
-              internet: internetMsg(),
-            }));
+          // код сопряжения — только локальным клиентам (claude-mobile --qr) после подтверждения
+          // (D-13, P-9); подтверждение выпуска кода = подтверждение сопряжения (D-15 п. 6);
+          // каждый выпуск — свежий код на 10 минут
+          if (ws.deviceId !== 'local') break;
+          if (!advertisedHost()) { noLanError(ws); break; } // телефон не беспокоим зря (D-18 п. 3)
+          ownerConfirmed(ws, m, 'pairinfo', () => sendPairinfo(ws));
+          break;
+        case 'confirm':
+          // подтверждает только сопряжённое устройство, не владелец (D-13)
+          if (ws.deviceId && ws.deviceId !== 'local') {
+            const e = confirmations.resolve(V.str(m.confirmId, 64));
+            if (e) finishConfirmation(e, m.allow === true, m.allow === true ? 'allowed' : 'denied');
           }
           break;
         case 'revokeDevice':

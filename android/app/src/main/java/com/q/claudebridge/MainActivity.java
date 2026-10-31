@@ -311,16 +311,16 @@ public class MainActivity extends Activity {
         GmsBarcodeScanner scanner = GmsBarcodeScanning.getClient(this, opts);
         scanner.startScan()
                 .addOnSuccessListener(barcode -> {
+                    // P-7/H-2: отпечаток из QR обязателен — код уходит только на пиннингованный мост;
+                    // M-2: адрес и порт проверены до того, как попадут в URL
+                    Protocol.PairingQr q;
                     try {
-                        JSONObject j = new JSONObject(barcode.getRawValue());
-                        String fp = j.optString("fp", "");
-                        // P-7/H-2: отпечаток из QR обязателен — код уходит только на пиннингованный мост
-                        if (j.optInt("cb") != 1 || !fp.matches("[0-9a-fA-F]{64}")) throw new Exception("не тот QR");
-                        pair(j.getString("host"), j.optInt("port", 8790), j.getString("code"),
-                                fp.toLowerCase(java.util.Locale.ROOT));
-                    } catch (Exception e) {
-                        setPairStatus("Это не QR-код Claude Bridge");
+                        q = Protocol.parsePairingQr(barcode.getRawValue());
+                    } catch (IllegalArgumentException e) {
+                        setPairStatus(e.getMessage());
+                        return;
                     }
+                    pair(q.host, q.port, q.code, q.fp);
                 })
                 .addOnFailureListener(e -> setPairStatus("Сканер недоступен: " + e.getMessage()));
     }

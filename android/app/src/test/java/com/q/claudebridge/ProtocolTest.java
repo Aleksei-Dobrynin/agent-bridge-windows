@@ -105,4 +105,71 @@ public class ProtocolTest {
         assertFalse(Protocol.validCheckCode("12345"));
         assertFalse(Protocol.validCheckCode(null));
     }
+
+    private static final String FP = "ab".repeat(32);
+
+    private static String qr(String host, Object port, String code, String fp) throws Exception {
+        JSONObject j = new JSONObject().put("cb", 1).put("host", host).put("code", code);
+        if (port != null) j.put("port", port);
+        if (fp != null) j.put("fp", fp);
+        return j.toString();
+    }
+
+    private static String qrError(String raw) {
+        try {
+            Protocol.parsePairingQr(raw);
+            return null;
+        } catch (IllegalArgumentException e) {
+            return e.getMessage();
+        }
+    }
+
+    @Test
+    public void pairingQrIsParsed() throws Exception {
+        Protocol.PairingQr q = Protocol.parsePairingQr(qr("192.168.1.20", 8790, "A1B2C3", FP.toUpperCase()));
+        assertEquals("192.168.1.20", q.host);
+        assertEquals(8790, q.port);
+        assertEquals("A1B2C3", q.code);
+        assertEquals(FP, q.fp); // отпечаток — в нижнем регистре
+        assertEquals("my-pc.local", Protocol.parsePairingQr(qr("my-pc.local", null, "X", FP)).host);
+        assertEquals(8790, Protocol.parsePairingQr(qr("my-pc.local", null, "X", FP)).port);
+    }
+
+    @Test
+    public void pairingQrRejectsForeignOrUnpinned() throws Exception {
+        // P-7/H-2: без отпечатка или не наш QR — «не тот QR»
+        String notOurs = "Это не QR-код Claude Bridge";
+        assertEquals(notOurs, qrError("hello"));
+        assertEquals(notOurs, qrError(null));
+        assertEquals(notOurs, qrError(new JSONObject().put("cb", 2).put("host", "h").put("code", "c").put("fp", FP).toString()));
+        assertEquals(notOurs, qrError(qr("h", 8790, "c", null)));
+        assertEquals(notOurs, qrError(qr("h", 8790, "c", "abcd")));
+        assertEquals(notOurs, qrError(qr("h", 8790, "", FP)));
+        assertEquals(notOurs, qrError(qr("h", 8790, "x".repeat(65), FP)));
+    }
+
+    @Test
+    public void pairingQrRejectsBadHostAndPort() throws Exception {
+        // M-2: адрес и порт из QR попадают в URL — только имя хоста/IPv4 и порт 1..65535
+        String badHost = "Некорректный адрес компьютера в QR-коде";
+        for (String h : new String[]{"", "evil.com/path", "user@host", "host:1", "a b", "x".repeat(254), "[::1]", "хост"}) {
+            assertEquals(h, badHost, qrError(qr(h, 8790, "c", FP)));
+        }
+        String badPort = "Некорректный порт в QR-коде";
+        assertEquals(badPort, qrError(qr("h", 0, "c", FP)));
+        assertEquals(badPort, qrError(qr("h", 65536, "c", FP)));
+        assertEquals(badPort, qrError(qr("h", -1, "c", FP)));
+        assertEquals(badPort, qrError(qr("h", "8790x", "c", FP)));
+        assertEquals(65535, Protocol.parsePairingQr(qr("h", 65535, "c", FP)).port);
+    }
+
+    @Test
+    public void credentialsState() {
+        // M-5: токен без отпечатка — не переподключаться вслепую, просить сопрячь заново
+        assertEquals(Protocol.Credentials.NONE, Protocol.credentials(null, FP));
+        assertEquals(Protocol.Credentials.NONE, Protocol.credentials("", null));
+        assertEquals(Protocol.Credentials.REPAIR, Protocol.credentials("tok", null));
+        assertEquals(Protocol.Credentials.REPAIR, Protocol.credentials("tok", ""));
+        assertEquals(Protocol.Credentials.OK, Protocol.credentials("tok", FP));
+    }
 }

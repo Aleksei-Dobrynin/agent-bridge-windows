@@ -56,6 +56,8 @@ public class BridgeService extends Service {
     private static final String CH_STATUS = "bridge_status";
     private static final String CH_EVENTS = "claude_events";
     private static final int STATUS_ID = 1;
+    private static final String REPAIR_STATUS =
+            "Сопрягите телефон заново (QR): нет отпечатка сертификата ПК — claude-mobile --qr";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private OkHttpClient http;
@@ -441,6 +443,15 @@ public class BridgeService extends Service {
             http = Tls.buildClient(certFp);
         }
         if (token == null || connected || connecting) return;
+        // M-5: токен без запиннингованного отпечатка — доверять некому (TOFU нет, L-17):
+        // не переподключаемся впустую, а просим сопрячь телефон заново по QR
+        if (Protocol.credentials(token, fp) == Protocol.Credentials.REPAIR) {
+            if (!REPAIR_STATUS.equals(lastStatus)) {
+                updateStatus(REPAIR_STATUS);
+                broadcastState();
+            }
+            return;
+        }
         if (!allowedNow()) return; // режим экономии: подключимся по событию
 
         // Выбор пути: LAN приоритетен; туннель — только если ПК давно не виден

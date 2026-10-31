@@ -108,5 +108,67 @@ final class Protocol {
         return sb.toString();
     }
 
+    // ------------------------------------------------------------ сопряжение по QR (P-7, M-2)
+
+    static final class PairingQr {
+        final String host;
+        final int port;
+        final String code;
+        final String fp;
+
+        PairingQr(String host, int port, String code, String fp) {
+            this.host = host;
+            this.port = port;
+            this.code = code;
+            this.fp = fp;
+        }
+    }
+
+    private static final Pattern QR_HOST = Pattern.compile("[A-Za-z0-9.-]{1,253}");
+    private static final Pattern FINGERPRINT = Pattern.compile("[0-9a-fA-F]{64}");
+
+    /**
+     * QR сопряжения {cb:1, host, port, code, fp}. Отпечаток обязателен (H-2); host — имя хоста
+     * или IPv4 (только [A-Za-z0-9.-]), port — 1..65535 (M-2): они попадают в URL запроса /pair.
+     * Ошибка — IllegalArgumentException с текстом для пользователя.
+     */
+    static PairingQr parsePairingQr(String raw) {
+        final String notOurs = "Это не QR-код Claude Bridge";
+        JSONObject j;
+        try {
+            j = new JSONObject(raw);
+        } catch (Exception e) {
+            throw new IllegalArgumentException(notOurs);
+        }
+        String fp = j.optString("fp", "");
+        String code = j.optString("code", "");
+        if (j.optInt("cb") != 1 || !FINGERPRINT.matcher(fp).matches()
+                || code.isEmpty() || code.length() > 64) {
+            throw new IllegalArgumentException(notOurs);
+        }
+        String host = j.optString("host", "");
+        if (!QR_HOST.matcher(host).matches()) {
+            throw new IllegalArgumentException("Некорректный адрес компьютера в QR-коде");
+        }
+        int port = 8790;
+        if (j.has("port")) {
+            Object p = j.opt("port");
+            if (!(p instanceof Integer)) throw new IllegalArgumentException("Некорректный порт в QR-коде");
+            port = (Integer) p;
+        }
+        if (port < 1 || port > 65535) throw new IllegalArgumentException("Некорректный порт в QR-коде");
+        return new PairingQr(host, port, code, fp.toLowerCase(java.util.Locale.ROOT));
+    }
+
+    // ------------------------------------------------------------ учётные данные (M-5)
+
+    enum Credentials { NONE, OK, REPAIR }
+
+    /** Токен без отпечатка — подключаться нельзя (TOFU нет, L-17): нужно сопрячь заново. */
+    static Credentials credentials(String token, String fp) {
+        if (token == null || token.isEmpty()) return Credentials.NONE;
+        return fp == null || fp.isEmpty() ? Credentials.REPAIR : Credentials.OK;
+    }
+
     private Protocol() { }
 }

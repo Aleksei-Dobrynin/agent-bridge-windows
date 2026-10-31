@@ -4,7 +4,8 @@
 .DESCRIPTION
   Задача Планировщика и ярлык автозагрузки (D-25 п. 4), работающий мост, хук моста в settings.json
   (с резервной копией), шим и каталог в PATH; -Firewall — правила брандмауэра (UAC); -RemoveData —
-  каталог данных (сопряжения, сертификат, токены). Живые сессии (keeper'ы) не завершаются.
+  каталог данных (сопряжения, сертификат, токены): только распознанный каталог данных моста и только
+  без живых сессий этого каталога. Живые сессии (keeper'ы) не завершаются.
   -StartupShortcut — убрать только ярлык автозагрузки, задачу Планировщика не трогать.
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File .\uninstall.ps1 -Firewall
@@ -33,6 +34,8 @@ try {
   $BridgeDir = Join-Path $PSScriptRoot 'bridge'
   $DataRoot = [IO.Path]::GetFullPath($DataRoot)
   $CustomData = -not (Test-CbSamePath -A $DataRoot -B (Join-Path $env:LOCALAPPDATA 'ClaudeBridge'))
+  $SettingsPath = [IO.Path]::GetFullPath($SettingsPath)
+  $CustomSettings = -not (Test-CbSamePath -A $SettingsPath -B (Join-Path $env:USERPROFILE '.claude\settings.json'))
   $StartupDir = [IO.Path]::GetFullPath($StartupDir)
   $CustomStartup = -not (Test-CbSamePath -A $StartupDir -B ([Environment]::GetFolderPath('Startup')))
   $BinDir = Join-Path $DataRoot 'bin'
@@ -41,17 +44,28 @@ try {
   $Pre = if ($DryRun) { '[dry-run] ' } else { '' }
   function Say([string]$Text) { Write-Output ($Pre + $Text) }
 
+  # Защита тестовых запусков (D-26 п. 4), как в install.ps1 (шага npm здесь нет)
   $SafeAutostart = $SkipTask -or ($StartupShortcut -and $CustomStartup)
-  if ($CustomData -and -not $DryRun -and -not ($SafeAutostart -and $SkipPath)) {
-    throw "Нестандартный -DataRoot ($DataRoot) — только для проверки. Добавьте -SkipTask -SkipPath (или -StartupShortcut -StartupDir <временный каталог> -SkipPath) или -DryRun."
+  $violations = @(Get-CbGuardViolations -CustomData $CustomData -DryRun $DryRun.IsPresent -SkipPath $SkipPath.IsPresent `
+      -SafeAutostart $SafeAutostart -CustomSettings $CustomSettings -SkipNpm $false -Firewall $Firewall.IsPresent -NoNpmStep $true)
+  if ($violations.Count) {
+    throw ("Нестандартный -DataRoot ($DataRoot) — только для проверки: нужны -SkipPath, -SkipTask (или -StartupShortcut " +
+      "-StartupDir <временный каталог>), нестандартный -SettingsPath и без -Firewall; или -DryRun. " +
+      "Не выполнено: $($violations -join ', ')")
   }
-  $keepers = @()
-  if (-not $CustomData) { $keepers = @(Find-CbBridgeProcess -BridgeDir $BridgeDir -Kind keeper) }
-  if ($RemoveData -and $keepers.Count -and -not $DryRun) {
-    throw "Живые сессии моста ($($keepers.Count)) используют каталог данных — завершите их (выйдите из агентов) и повторите"
+
+  # -RemoveData проверяется до любых изменений (ревью I-4, I-6): только каталог данных моста и только
+  # без живых сессий ЭТОГО каталога (meta-файл <DataRoot>\sessions\<id>.json в командной строке keeper'а)
+  if ($RemoveData -and (Test-Path -LiteralPath $DataRoot)) {
+    $why = Get-CbDataDirRefusal -Path $DataRoot
+    if ($why) { throw "Каталог данных не удаляется: $why" }
+    try { $dataKeepers = @(Find-CbKeeperForData -BridgeDir $BridgeDir -DataRoot $DataRoot) }
+    catch { throw "Не удалось проверить живые сессии (WMI/CIM: $($_.Exception.Message)) — каталог данных не удаляется" }
+    if ($dataKeepers.Count) {
+      $msg = "Живые сессии моста ($($dataKeepers.Count)) используют каталог данных — завершите их (выйдите из агентов) и повторите"
+      if ($DryRun) { Write-Warning $msg } else { throw $msg }
+    }
   }
-  # порт — до удаления каталога данных
-  $port = Get-CbBridgePort -ConfigPath $Config
 
   # 1. Автозапуск: задача Планировщика и ярлык автозагрузки (D-25 п. 4)
   if (-not $SkipTask) {
@@ -68,14 +82,18 @@ try {
     }
   }
 
-  # 2. Процессы моста этого репозитория
+  # 2. Работающий мост этого репозитория — процесс server.js, слушающий порт моста (ревью I-6).
+  #    Порт — только для поиска процесса; испорченный конфиг удалению не мешает (ревью I-2).
   if ($CustomData) { Write-Output '  Процессы моста не затрагиваются (нестандартный -DataRoot)' }
   else {
-    foreach ($s in @(Find-CbBridgeProcess -BridgeDir $BridgeDir -Kind server)) {
-      Say "Останавливаю мост (PID $($s.ProcessId))"
-      if (-not $DryRun) { Stop-Process -Id $s.ProcessId -Force }
-    }
-    if ($keepers.Count) { Write-Warning "Живые сессии ($($keepers.Count)) продолжают работать до выхода из агентов; мост больше не запустится" }
+    try {
+      foreach ($s in @(Find-CbOurBridge -BridgeDir $BridgeDir -Port (Get-CbBridgePortOrDefault -ConfigPath $Config))) {
+        Say "Останавливаю мост (PID $($s.ProcessId))"
+        if (-not $DryRun) { Stop-Process -Id $s.ProcessId -Force }
+      }
+      $keepers = @(Find-CbBridgeProcess -BridgeDir $BridgeDir -Kind keeper)
+      if ($keepers.Count) { Write-Warning "Живые сессии ($($keepers.Count)) продолжают работать до выхода из агентов; мост больше не запустится" }
+    } catch { Write-Warning "Не удалось проверить процессы моста: $($_.Exception.Message)" }
   }
 
   # 3. Хук Claude Code
@@ -107,22 +125,10 @@ try {
     }
   }
 
-  # 5. Брандмауэр
-  if ($Firewall) {
-    $fwScript = Join-Path $BridgeDir 'tools\firewall.ps1'
-    if ($DryRun) { & $fwScript -Action remove -Port $port -DryRun }
-    elseif (Test-CbElevated) { & $fwScript -Action remove -Port $port }
-    else {
-      Write-Output '  Удаление правил брандмауэра требует прав администратора — Windows запросит подтверждение (UAC)'
-      try {
-        $p = Start-Process powershell.exe -Verb RunAs -Wait -PassThru `
-          -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$fwScript`" -Action remove -Port $port"
-        if ($p.ExitCode -ne 0) { Write-Warning "Правила брандмауэра не удалены (код $($p.ExitCode))" }
-      } catch { Write-Warning "Правила брандмауэра не удалены: $($_.Exception.Message)" }
-    }
-  }
+  # 5. Брандмауэр: правила удаляются по имени (порт не нужен); ошибка — предупреждение
+  if ($Firewall) { Invoke-CbFirewall -Action remove -Script (Join-Path $BridgeDir 'tools\firewall.ps1') -DryRun:$DryRun }
 
-  # 6. Каталог данных
+  # 6. Каталог данных (проверен выше)
   if ($RemoveData) {
     if (Test-Path -LiteralPath $DataRoot) {
       Say "Удаляю каталог данных $DataRoot (сопряжения, сертификат, токены — телефоны придётся сопрячь заново)"

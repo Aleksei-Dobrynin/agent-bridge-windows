@@ -74,8 +74,8 @@ test('install.ps1 -DryRun (with npm and firewall steps) changes nothing', { time
   assert.strictEqual(r.status, 0, r.out);
   assert.match(r.out, /\[dry-run\] npm ci/);
   assert.match(r.out, /\[dry-run\] Хук моста будет добавлен/);
-  assert.match(r.out, /\[dry-run\] netsh advfirewall firewall add rule name=ClaudeBridge-TCP .*localport=8790 profile=private/);
-  assert.match(r.out, /\[dry-run\] netsh advfirewall firewall add rule name=ClaudeBridge-UDP .*localport=8791 profile=private/);
+  assert.match(r.out, /\[dry-run\] netsh advfirewall firewall add rule name=ClaudeBridge-TCP .*localport=8790 remoteip=localsubnet profile=private/);
+  assert.match(r.out, /\[dry-run\] netsh advfirewall firewall add rule name=ClaudeBridge-UDP .*localport=8791 remoteip=localsubnet profile=private/);
   assert.ok(!fs.existsSync(s.data), 'no data dir');
   assert.ok(!fs.existsSync(s.settings), 'no settings');
 });
@@ -89,6 +89,16 @@ test('install.ps1 refuses a custom -DataRoot without -SkipTask -SkipPath', { tim
   const r2 = ps('install.ps1', ['-DataRoot', s.data, '-SettingsPath', s.settings, '-SkipPath', '-StartupShortcut', '-SkipNpm', '-NoStart']);
   assert.notStrictEqual(r2.status, 0);
   assert.match(r2.out, /только для проверки/);
+  // ревью I-3 (D-26 п. 4): без -SkipNpm, с -Firewall, с настоящим settings.json — тоже отказ
+  for (const [args, missing] of [
+    [[...s.safe, '-NoStart'], '-SkipNpm'],
+    [[...s.safe, '-SkipNpm', '-NoStart', '-Firewall'], '-Firewall'],
+    [['-DataRoot', s.data, '-SkipTask', '-SkipPath', '-SkipNpm', '-NoStart'], '-SettingsPath'],
+  ]) {
+    const r3 = ps('install.ps1', args);
+    assert.notStrictEqual(r3.status, 0, r3.out);
+    assert.match(r3.out, new RegExp('Не выполнено: ' + missing), r3.out);
+  }
   assert.ok(!fs.existsSync(s.data));
   assert.ok(!fs.existsSync(s.settings));
 });
@@ -155,6 +165,14 @@ test('uninstall.ps1 refuses a custom -DataRoot without -SkipTask -SkipPath', { t
   const r2 = ps('uninstall.ps1', ['-DataRoot', s.data, '-SettingsPath', s.settings, '-SkipPath', '-StartupShortcut']);
   assert.notStrictEqual(r2.status, 0);
   assert.match(r2.out, /только для проверки/);
+  for (const [args, missing] of [
+    [[...s.safe, '-Firewall'], '-Firewall'],
+    [['-DataRoot', s.data, '-SkipTask', '-SkipPath'], '-SettingsPath'],
+  ]) {
+    const r3 = ps('uninstall.ps1', args);
+    assert.notStrictEqual(r3.status, 0, r3.out);
+    assert.match(r3.out, new RegExp('Не выполнено: ' + missing), r3.out);
+  }
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(s.settings, 'utf8')), USER);
 });
 
@@ -175,4 +193,17 @@ test('uninstall.ps1 -StartupShortcut removes the autostart shortcut from -Startu
   assert.strictEqual(r.status, 0, r.out);
   assert.doesNotMatch(r.out, /Планировщик/, 'scheduled task untouched');
   assert.ok(!fs.existsSync(lnk), 'shortcut removed');
+});
+
+test('uninstall.ps1 -RemoveData refuses a directory that is not a bridge data dir (review I-4)', { timeout: 600000 }, (t) => {
+  const s = sandbox(t, true);
+  fs.mkdirSync(s.data);
+  fs.writeFileSync(path.join(s.data, 'precious.txt'), 'keep me');
+  fs.writeFileSync(path.join(s.data, 'config.json'), '{}'); // config.json без certs и sessions — не каталог моста
+  const before = fs.readFileSync(s.settings, 'utf8');
+  const r = ps('uninstall.ps1', [...s.safe, '-RemoveData']);
+  assert.notStrictEqual(r.status, 0, r.out);
+  assert.match(r.out, /не похож на каталог данных моста/);
+  assert.strictEqual(fs.readFileSync(path.join(s.data, 'precious.txt'), 'utf8'), 'keep me');
+  assert.strictEqual(fs.readFileSync(s.settings, 'utf8'), before, 'nothing else was changed');
 });

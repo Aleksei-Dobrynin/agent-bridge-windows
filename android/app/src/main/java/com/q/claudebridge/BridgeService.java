@@ -47,6 +47,7 @@ public class BridgeService extends Service {
     public static final String SERVICE_TYPE = "_claude-bridge._tcp.";
     public static final String ACTION_STATE = "com.q.claudebridge.STATE";
     public static final String ACTION_REPLY = "com.q.claudebridge.REPLY";
+    public static final String ACTION_CONFIRM = "com.q.claudebridge.CONFIRM";
     public static final String ACTION_RECONNECT = "com.q.claudebridge.RECONNECT";
     public static final String ACTION_VISIBILITY = "com.q.claudebridge.VISIBILITY";
     public static final String INTERNAL_PERM = "com.q.claudebridge.permission.INTERNAL";
@@ -88,6 +89,8 @@ public class BridgeService extends Service {
     private final java.util.Map<String, String> eventKinds = new java.util.HashMap<>();
     // сессия -> requestId запроса, на который сейчас висят кнопки (D-4)
     private final java.util.Map<String, String> eventReqs = new java.util.HashMap<>();
+    // confirmId -> id уведомления-подтверждения (D-13)
+    private final java.util.Map<String, Integer> confirmNids = new java.util.HashMap<>();
 
     private String token = null;
     private String certFp = null;
@@ -198,6 +201,17 @@ public class BridgeService extends Service {
             if (sess != null) cancelEventNotif(sess);
             // тап по залежавшемуся уведомлению не должен воскрешать демона
             // в режиме «только при открытом приложении»
+            if (!appVisible && "app".equals(bgMode())) stopSelf(startId);
+            return stickiness();
+        }
+
+        // D-13: ответ на запрос подтверждения операции владельца на ПК
+        if (intent != null && ACTION_CONFIRM.equals(intent.getAction())) {
+            String cid = intent.getStringExtra("confirmId");
+            String json = Protocol.confirmJson(cid, intent.getBooleanExtra("allow", false));
+            if (json != null && ws != null && connected) ws.send(json);
+            else if (json != null) toast("Нет связи с мостом — ответ не отправлен");
+            cancelConfirm(cid);
             if (!appVisible && "app".equals(bgMode())) stopSelf(startId);
             return stickiness();
         }
@@ -512,6 +526,11 @@ public class BridgeService extends Service {
                                     ? "Запрос уже закрыт — ответ не отправлен"
                                     : "Ответ не доставлен агенту");
                         }
+                    } else if ("confirmRequest".equals(type)) {
+                        showConfirm(m.optString("confirmId"), m.optString("message"),
+                                m.optString("checkCode"));
+                    } else if ("confirmClosed".equals(type)) {
+                        cancelConfirm(m.optString("confirmId"));
                     } else if ("status".equals(type)) {
                         // Claude снова работает (например, ответили на ПК) —
                         // уведомление этой сессии больше не актуально
@@ -926,6 +945,66 @@ public class BridgeService extends Service {
             }
         }
         nm.notify(nid, b.build());
+    }
+
+    private Notification.Action confirmAction(String confirmId, boolean allow, String label) {
+        Intent i = new Intent(this, BridgeService.class)
+                .setAction(ACTION_CONFIRM)
+                .putExtra("confirmId", confirmId)
+                .putExtra("allow", allow);
+        PendingIntent pi = PendingIntent.getService(this, reqSeq++, i,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        Notification.Action.Builder ab = new Notification.Action.Builder(
+                android.graphics.drawable.Icon.createWithResource(this, R.drawable.ic_stat),
+                label, pi);
+        // «Разрешить» — только с разблокированного телефона (M-4, D-13)
+        if (allow && Build.VERSION.SDK_INT >= 31) ab.setAuthenticationRequired(true);
+        return ab.build();
+    }
+
+    /**
+     * D-13: операция владельца на ПК (код сопряжения, интернет-доступ) ждёт решения здесь.
+     * Контрольный код (D-22.3) человек сверяет с консолью claude-mobile.
+     */
+    private void showConfirm(String confirmId, String message, String checkCode) {
+        if (!Protocol.validRequestId(confirmId)) return;
+        NotificationManager nm = getSystemService(NotificationManager.class);
+        int nid;
+        synchronized (confirmNids) {
+            // повтор того же запроса (рассылка при переподключении) обновляет уведомление на месте
+            Integer prev = confirmNids.get(confirmId);
+            nid = prev != null ? prev : eventSeq++;
+            confirmNids.put(confirmId, nid);
+        }
+        Intent open = new Intent(this, MainActivity.class)
+                .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        PendingIntent pi = PendingIntent.getActivity(this, nid, open,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        String text = Protocol.confirmText(message, checkCode);
+        boolean biolock = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean("biolock", false);
+        Notification.Builder b = new Notification.Builder(this, CH_EVENTS)
+                .setSmallIcon(R.drawable.ic_stat)
+                .setContentTitle("Claude Bridge: нужно подтверждение")
+                .setContentText(text)
+                .setStyle(new Notification.BigTextStyle().bigText(text))
+                .setContentIntent(pi)
+                .setOnlyAlertOnce(true)
+                .setVisibility(biolock ? Notification.VISIBILITY_SECRET : Notification.VISIBILITY_PRIVATE)
+                .setAutoCancel(true);
+        // API < 31: «Разрешить» нельзя защитить разблокировкой — подтверждение только
+        // в открытом приложении (диалог веб-интерфейса, D-15.10)
+        if (Build.VERSION.SDK_INT >= 31) {
+            b.addAction(confirmAction(confirmId, true, "Разрешить"));
+            b.addAction(confirmAction(confirmId, false, "Отклонить"));
+        }
+        nm.notify(nid, b.build());
+    }
+
+    private void cancelConfirm(String confirmId) {
+        if (confirmId == null) return;
+        Integer nid;
+        synchronized (confirmNids) { nid = confirmNids.remove(confirmId); }
+        if (nid != null) getSystemService(NotificationManager.class).cancel(nid);
     }
 
     private void broadcastState() {

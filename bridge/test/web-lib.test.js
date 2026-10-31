@@ -160,3 +160,15 @@ test('armGuard for the confirm dialog: 700 ms after shown, re-armed on new confi
   assert.strictEqual(g.arm('cf_2', 5000, true), true, 'shown again after close');
   assert.strictEqual(g.accept('cf_2', 5100), false);
 });
+
+test('filterPaste removes all format chars (Cf), line/paragraph separators -> newline (review M-1)', () => {
+  const ch = (...cps) => String.fromCodePoint(...cps);
+  // U+061C, U+2060..2064, U+00AD, U+180E, U+FFF9..FFFB, теги U+E0001, U+E0041, U+E007F
+  for (const cp of [0x061c, 0x2060, 0x2064, 0x00ad, 0x180e, 0xfff9, 0xfffb, 0xe0001, 0xe0041, 0xe007f,
+    0x200b, 0x200f, 0x202a, 0x202e, 0x2066, 0x2069, 0xfeff]) {
+    assert.strictEqual(CB.filterPaste('a' + ch(cp) + 'b'), 'ab', 'U+' + cp.toString(16));
+  }
+  assert.strictEqual(CB.filterPaste('a' + ch(0x2028) + 'b' + ch(0x2029) + 'c'), 'a\nb\nc');
+  // обычные не-ASCII символы остаются (эмодзи, кириллица, CJK)
+  assert.strictEqual(CB.filterPaste('ок ' + ch(0x1f600) + ' ' + ch(0x4e2d)), 'ок ' + ch(0x1f600) + ' ' + ch(0x4e2d));
+});

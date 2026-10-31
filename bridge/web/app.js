@@ -783,7 +783,8 @@ for (const btn of document.querySelectorAll('#keys button')) {
 function sendMessage() {
   const inp = $('#msg');
   if (!current) return;
-  if (inp.value) send({ type: 'input', id: current, data: inp.value });
+  const text = CB.filterPaste(inp.value); // M-2: поле могли заполнить в обход фильтра вставки
+  if (text) send({ type: 'input', id: current, data: text });
   send({ type: 'input', id: current, data: '\r' });
   inp.value = '';
 }
@@ -862,7 +863,7 @@ function voiceTranscribe(mode) {
 window.sttResult = (text) => {
   voice.mic.textContent = '🎤';
   voiceClose();
-  text = (text || '').trim();
+  text = CB.filterPaste(text || '').trim(); // M-2: распознанный текст фильтруется, как вставка
   if (!text) { banner('🎤 Речь не распознана'); return; }
   if (voiceMode === 'send' && current) {
     send({ type: 'input', id: current, data: text });

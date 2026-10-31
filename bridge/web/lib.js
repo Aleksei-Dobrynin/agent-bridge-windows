@@ -10,9 +10,10 @@
   function filterPaste(text) {
     if (typeof text !== 'string') return '';
     return text
-      .replace(/\r\n?/g, '\n')
+      .replace(/\r\n?|[\p{Zl}\p{Zp}]/gu, '\n') // U+2028/U+2029 — тоже перевод строки
       .replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '')
-      .replace(/[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, '');
+      // невидимые символы формата (Cf): bidi, нулевой ширины, мягкий перенос, теги U+E0000…
+      .replace(/\p{Cf}/gu, '');
   }
 
   /** D-10: прокрутка альтернативного экрана способом, который объявил адаптер агента:

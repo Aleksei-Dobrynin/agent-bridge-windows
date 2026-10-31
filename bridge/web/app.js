@@ -648,11 +648,16 @@ function beep() {
 
 const requests = CB.requestStore();
 let replying = null; // requestId, на который ушёл reply и ещё нет replyResult
+// I-1: новый запрос под пальцем не одобряется вторым касанием двойного нажатия
+const REQ_ARM_MS = 500;
+const reqArm = CB.armGuard(REQ_ARM_MS);
 
 function renderRequest() {
   const bar = $('#reqbar');
   const r = requests.top(current);
-  if (!r) { bar.classList.add('hidden'); return; }
+  if (!r) { reqArm.arm(null, Date.now()); bar.classList.add('hidden'); return; }
+  if (reqArm.arm(r.requestId, Date.now())) setTimeout(renderRequest, REQ_ARM_MS + 20);
+  const armed = reqArm.ready(Date.now());
   const more = requests.count() > 1 ? ` (+${requests.count() - 1})` : '';
   const text = $('#reqText');
   text.textContent = (r.title ? r.title + ': ' : '') + r.message + more;
@@ -663,9 +668,10 @@ function renderRequest() {
     const b = document.createElement('button');
     b.textContent = c.label; // подпись — как прислал мост (D-23.6)
     b.dataset.decision = c.id;
-    b.disabled = replying === r.requestId;
+    b.disabled = !armed || replying === r.requestId;
     b.addEventListener('click', () => {
       if (replying) return; // двойное нажатие
+      if (!reqArm.accept(r.requestId, Date.now())) return; // I-1: кнопки другого/только что показанного запроса
       replying = r.requestId;
       send(CB.buildReply(r, c.id));
       renderRequest();

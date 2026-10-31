@@ -135,8 +135,29 @@
     return { type: 'reply', id: req.id, requestId: req.requestId, decision };
   }
 
+  /** Защита от «нажатия вслепую» (ревью I-1, I-2): только что показанный элемент (запрос
+   *  разрешения, диалог подтверждения) принимает нажатие не раньше чем через delayMs и только
+   *  для себя — второе касание двойного нажатия не одобрит то, что появилось под пальцем.
+   *  arm(key, now, force) — показан key; true, если вооружено заново (новый key или force). */
+  function armGuard(delayMs) {
+    let armedKey = null;
+    let armedAt = 0;
+    return {
+      arm(key, now, force) {
+        if (key === armedKey && !force) return false;
+        armedKey = key == null ? null : key;
+        armedAt = now;
+        return true;
+      },
+      ready: (now) => armedKey !== null && now - armedAt >= delayMs,
+      accept: (key, now) => armedKey !== null && key === armedKey && now - armedAt >= delayMs,
+      remaining: (now) => (armedKey === null ? 0 : Math.max(0, delayMs - (now - armedAt))),
+      key: () => armedKey,
+    };
+  }
+
   return {
     filterPaste, scrollSequence, buildCreate, confirmPrompt, confirmStatusText, replayGate,
-    requestStore, buildReply,
+    requestStore, buildReply, armGuard,
   };
 });

@@ -116,3 +116,33 @@ test('buildReply: semantic reply for a request (D-4)', () => {
   assert.deepStrictEqual(CB.buildReply({ id: 's_a', requestId: 'req_1' }, 'always'),
     { type: 'reply', id: 's_a', requestId: 'req_1', decision: 'always' });
 });
+
+test('armGuard: a newly shown item accepts input only after the delay and only for itself (I-1, I-2)', () => {
+  const g = CB.armGuard(500);
+  assert.strictEqual(g.ready(0), false, 'nothing armed');
+  assert.strictEqual(g.arm('req_1', 1000), true, 'new key -> armed anew');
+  assert.strictEqual(g.ready(1499), false);
+  assert.strictEqual(g.accept('req_1', 1499), false, 'too early (double tap)');
+  assert.strictEqual(g.ready(1500), true);
+  assert.strictEqual(g.accept('req_1', 1500), true);
+  assert.strictEqual(g.accept('req_0', 1600), false, 'click for another item');
+  assert.strictEqual(g.arm('req_1', 1700), false, 'same key -> keeps arming time');
+  assert.strictEqual(g.accept('req_1', 1700), true);
+  // следующий запрос под пальцем — снова пауза
+  assert.strictEqual(g.arm('req_2', 1800), true);
+  assert.strictEqual(g.accept('req_2', 1900), false);
+  assert.strictEqual(g.accept('req_1', 2400), false);
+  assert.strictEqual(g.accept('req_2', 2300), true);
+  // force: тот же ключ, но показан заново (диалог открыт снова)
+  assert.strictEqual(g.arm('req_2', 3000, true), true);
+  assert.strictEqual(g.accept('req_2', 3100), false);
+  // null — ничего не показано
+  g.arm(null, 4000);
+  assert.strictEqual(g.accept(null, 9000), false);
+  assert.strictEqual(g.ready(9000), false);
+  assert.strictEqual(g.key(), null);
+  assert.strictEqual(g.remaining(1000), 0);
+  g.arm('k', 5000);
+  assert.strictEqual(g.remaining(5100), 400);
+  assert.strictEqual(g.remaining(6000), 0);
+});

@@ -6,6 +6,7 @@ import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Учёт событийных уведомлений (без Android API — тестируется на JVM).
@@ -22,15 +23,13 @@ import java.util.Map;
  */
 final class RequestNotifications {
 
-    /** Куда показать событие: id уведомления, новое ли оно и какие уведомления снять. */
+    /** Куда показать событие: id уведомления и какие уведомления снять. */
     static final class Placement {
         final int nid;
-        final boolean isNew;
         final List<Integer> cancel;
 
-        Placement(int nid, boolean isNew, List<Integer> cancel) {
+        Placement(int nid, List<Integer> cancel) {
             this.nid = nid;
-            this.isNew = isNew;
             this.cancel = Collections.unmodifiableList(cancel);
         }
     }
@@ -76,17 +75,17 @@ final class RequestNotifications {
         if (requestId != null && tracked) {
             String k = key(sessionId, requestId);
             Integer existing = requests.get(k);
-            if (existing != null) return new Placement(existing, false, cancel);
+            if (existing != null) return new Placement(existing, cancel);
             int nid = seq++;
             requests.put(k, nid);
-            return new Placement(nid, true, cancel);
+            return new Placement(nid, cancel);
         }
         int nid = seq++;
         if (tracked) {
             sessionNids.put(sessionId, nid);
             sessionKinds.put(sessionId, kind == null ? "" : kind);
         }
-        return new Placement(nid, true, cancel);
+        return new Placement(nid, cancel);
     }
 
     /** Запрос закрыт (ответили где угодно, агент ушёл дальше) — id его уведомления или null. */
@@ -100,5 +99,40 @@ final class RequestNotifications {
         if (sessionId == null || sessionId.isEmpty()) return null;
         sessionKinds.remove(sessionId);
         return sessionNids.remove(sessionId);
+    }
+
+    /** I-1: связь с мостом установлена заново — мост повторит открытые запросы (D-20). */
+    synchronized void clear() {
+        requests.clear();
+        sessionNids.clear();
+        sessionKinds.clear();
+    }
+
+    /** I-1: сессий больше нет в списке моста — их уведомления (id для снятия) забываются. */
+    synchronized List<Integer> retainSessions(Set<String> alive) {
+        List<Integer> gone = new ArrayList<>();
+        Iterator<Map.Entry<String, Integer>> r = requests.entrySet().iterator();
+        while (r.hasNext()) {
+            Map.Entry<String, Integer> e = r.next();
+            String sid = e.getKey().substring(0, e.getKey().indexOf('\0'));
+            if (!alive.contains(sid)) { gone.add(e.getValue()); r.remove(); }
+        }
+        Iterator<Map.Entry<String, Integer>> s = sessionNids.entrySet().iterator();
+        while (s.hasNext()) {
+            Map.Entry<String, Integer> e = s.next();
+            if (!alive.contains(e.getKey())) { gone.add(e.getValue()); sessionKinds.remove(e.getKey()); s.remove(); }
+        }
+        return gone;
+    }
+
+    /** I-1: пользователь смахнул уведомление nid — запись учёта удаляется; false — не наше. */
+    synchronized boolean onDismissed(int nid) {
+        if (requests.values().remove(nid)) return true;
+        Iterator<Map.Entry<String, Integer>> s = sessionNids.entrySet().iterator();
+        while (s.hasNext()) {
+            Map.Entry<String, Integer> e = s.next();
+            if (e.getValue() == nid) { sessionKinds.remove(e.getKey()); s.remove(); return true; }
+        }
+        return false;
     }
 }

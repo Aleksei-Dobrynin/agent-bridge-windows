@@ -10,6 +10,8 @@ import org.junit.Test;
 
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
 
 public class RequestNotificationsTest {
 
@@ -19,8 +21,6 @@ public class RequestNotificationsTest {
         RequestNotifications rn = new RequestNotifications(100);
         RequestNotifications.Placement a = rn.onEvent("s1-aaaaaa", "request", "per_1");
         RequestNotifications.Placement b = rn.onEvent("s1-aaaaaa", "request", "per_2");
-        assertTrue(a.isNew);
-        assertTrue(b.isNew);
         assertNotEquals(a.nid, b.nid);
         assertTrue(b.cancel.isEmpty()); // второй запрос не гасит первый
         // requestClosed снимает ровно своё уведомление
@@ -45,7 +45,6 @@ public class RequestNotificationsTest {
         RequestNotifications rn = new RequestNotifications(100);
         RequestNotifications.Placement first = rn.onEvent("s1-aaaaaa", "request", "req_1");
         RequestNotifications.Placement again = rn.onEvent("s1-aaaaaa", "request", "req_1");
-        assertFalse(again.isNew);
         assertEquals(first.nid, again.nid);
         assertTrue(again.cancel.isEmpty());
     }
@@ -109,5 +108,44 @@ public class RequestNotificationsTest {
         assertEquals(100, e);
         assertEquals(101, c);
         assertEquals(102, e2);
+    }
+
+    @Test
+    public void clearForgetsEverythingButKeepsIdsGrowing() {
+        // I-1: при переподключении мост заново шлёт открытые запросы (D-20) — учёт с нуля
+        RequestNotifications rn = new RequestNotifications(100);
+        int a = rn.onEvent("s1-aaaaaa", "request", "req_1").nid;
+        rn.onEvent("s1-aaaaaa", "info", null);
+        rn.clear();
+        assertNull(rn.onRequestClosed("s1-aaaaaa", "req_1"));
+        assertNull(rn.onWorking("s1-aaaaaa"));
+        assertNotEquals(a, rn.onEvent("s1-aaaaaa", "request", "req_1").nid);
+    }
+
+    @Test
+    public void retainSessionsDropsVanishedOnes() {
+        RequestNotifications rn = new RequestNotifications(100);
+        int r1 = rn.onEvent("s1-aaaaaa", "request", "req_1").nid;
+        int i1 = rn.onEvent("s1-aaaaaa", "info", null).nid;
+        int r2 = rn.onEvent("s2-bbbbbb", "request", "req_2").nid;
+        List<Integer> gone = rn.retainSessions(new HashSet<>(Collections.singletonList("s2-bbbbbb")));
+        assertEquals(new HashSet<>(Arrays.asList(r1, i1)), new HashSet<>(gone));
+        assertNull(rn.onRequestClosed("s1-aaaaaa", "req_1"));
+        assertEquals(Integer.valueOf(r2), rn.onRequestClosed("s2-bbbbbb", "req_2"));
+    }
+
+    @Test
+    public void dismissedNotificationIsForgotten() {
+        // I-1: пользователь смахнул уведомление — запись учёта удаляется
+        RequestNotifications rn = new RequestNotifications(100);
+        int r1 = rn.onEvent("s1-aaaaaa", "request", "req_1").nid;
+        int i1 = rn.onEvent("s1-aaaaaa", "info", null).nid;
+        assertTrue(rn.onDismissed(r1));
+        assertFalse(rn.onDismissed(r1));
+        assertNull(rn.onRequestClosed("s1-aaaaaa", "req_1"));
+        assertTrue(rn.onDismissed(i1));
+        assertNull(rn.onWorking("s1-aaaaaa"));
+        // повтор того же запроса после смахивания — новое уведомление
+        assertNotEquals(r1, rn.onEvent("s1-aaaaaa", "request", "req_1").nid);
     }
 }

@@ -48,6 +48,7 @@ public class BridgeService extends Service {
     public static final String ACTION_STATE = "com.q.claudebridge.STATE";
     public static final String ACTION_REPLY = "com.q.claudebridge.REPLY";
     public static final String ACTION_CONFIRM = "com.q.claudebridge.CONFIRM";
+    public static final String ACTION_DISMISS = "com.q.claudebridge.DISMISS";
     public static final String ACTION_RECONNECT = "com.q.claudebridge.RECONNECT";
     public static final String ACTION_VISIBILITY = "com.q.claudebridge.VISIBILITY";
     public static final String INTERNAL_PERM = "com.q.claudebridge.permission.INTERNAL";
@@ -61,7 +62,8 @@ public class BridgeService extends Service {
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private OkHttpClient http;
-    private WebSocket ws;
+    // I-2: читаются из потоков OkHttp и из onStartCommand (главный поток)
+    private volatile WebSocket ws;
     private NsdManager nsd;
     private NsdManager.DiscoveryListener discovery;
     private WifiManager.MulticastLock mcLock;
@@ -69,7 +71,7 @@ public class BridgeService extends Service {
 
     private String host = null;
     private int port = 8790;
-    private boolean connected = false;
+    private volatile boolean connected = false;
     private boolean connecting = false;
     private boolean resolving = false;
     private boolean discovering = false;
@@ -89,6 +91,9 @@ public class BridgeService extends Service {
     private final RequestNotifications notifs = new RequestNotifications(100);
     // confirmId -> id уведомления-подтверждения (D-13)
     private final java.util.Map<String, Integer> confirmNids = new java.util.HashMap<>();
+    // C-1: метка этого экземпляра сервиса в data-URI тапа/смахивания — смахивание уведомления
+    // прошлого процесса (с тем же id) не тронет учёт нового
+    private final String notifEpoch = Long.toHexString(new java.security.SecureRandom().nextLong());
 
     private String token = null;
     private String certFp = null;
@@ -122,6 +127,9 @@ public class BridgeService extends Service {
     public void onCreate() {
         super.onCreate();
         createChannels();
+        // C-1: уведомления с кнопками от прошлого процесса — сироты: их учёт потерян, а мост
+        // заново пришлёт открытые запросы и подтверждения при подключении (D-20)
+        clearEventNotifications();
 
         screenReceiver = new BroadcastReceiver() {
             @Override
@@ -188,28 +196,47 @@ public class BridgeService extends Service {
 
         // Быстрый ответ из кнопки уведомления (D-4): решение по requestId, без открытия
         // приложения. Мост сам переведёт его в клавиши/API и отвергнет устаревший ответ.
+        // C-1: значения берутся ТОЛЬКО из data-URI интента (он и задаёт идентичность
+        // PendingIntent), extras не читаются.
         if (intent != null && ACTION_REPLY.equals(intent.getAction())) {
-            String sess = intent.getStringExtra("session");
-            String json = Protocol.replyJson(sess, intent.getStringExtra("requestId"),
-                    intent.getStringExtra("decision"));
-            int nid = intent.getIntExtra("nid", -1);
-            if (json != null && ws != null && connected) ws.send(json);
-            else if (json != null) toast("Нет связи с мостом — ответ не отправлен");
-            if (nid >= 0) getSystemService(NotificationManager.class).cancel(nid);
-            cancelRequestNotif(sess, intent.getStringExtra("requestId"));
+            android.net.Uri d = intent.getData();
+            NotifIntents.Reply r = d == null ? null
+                    : NotifIntents.parseReply(d.getScheme(), d.getSchemeSpecificPart());
+            if (r != null) {
+                // I-2: не ушло — уведомление остаётся, можно нажать снова
+                if (sendToBridge(Protocol.replyJson(r.sessionId, r.requestId, r.decision))) {
+                    cancelRequestNotif(r.sessionId, r.requestId);
+                } else {
+                    toast("Нет связи с мостом — ответ не отправлен");
+                }
+            }
             // тап по залежавшемуся уведомлению не должен воскрешать демона
             // в режиме «только при открытом приложении»
             if (!appVisible && "app".equals(bgMode())) stopSelf(startId);
             return stickiness();
         }
 
-        // D-13: ответ на запрос подтверждения операции владельца на ПК
+        // D-13: ответ на запрос подтверждения операции владельца на ПК (значения — из data, C-1)
         if (intent != null && ACTION_CONFIRM.equals(intent.getAction())) {
-            String cid = intent.getStringExtra("confirmId");
-            String json = Protocol.confirmJson(cid, intent.getBooleanExtra("allow", false));
-            if (json != null && ws != null && connected) ws.send(json);
-            else if (json != null) toast("Нет связи с мостом — ответ не отправлен");
-            cancelConfirm(cid);
+            android.net.Uri d = intent.getData();
+            NotifIntents.Confirm c = d == null ? null
+                    : NotifIntents.parseConfirm(d.getScheme(), d.getSchemeSpecificPart());
+            if (c != null) {
+                if (sendToBridge(Protocol.confirmJson(c.confirmId, c.allow))) cancelConfirm(c.confirmId);
+                else toast("Нет связи с мостом — ответ не отправлен");
+            }
+            if (!appVisible && "app".equals(bgMode())) stopSelf(startId);
+            return stickiness();
+        }
+
+        // I-1: пользователь смахнул уведомление — забыть его в учёте
+        if (intent != null && ACTION_DISMISS.equals(intent.getAction())) {
+            android.net.Uri d = intent.getData();
+            Integer nid = d == null ? null
+                    : NotifIntents.parseDismiss(d.getScheme(), d.getSchemeSpecificPart(), notifEpoch);
+            if (nid != null && !notifs.onDismissed(nid)) {
+                synchronized (confirmNids) { confirmNids.values().remove(nid); }
+            }
             if (!appVisible && "app".equals(bgMode())) stopSelf(startId);
             return stickiness();
         }
@@ -421,6 +448,9 @@ public class BridgeService extends Service {
     /** Разорвать текущее соединение и подключиться заново (например, сменился адрес моста). */
     private synchronized void forceReconnect() {
         if (ws != null) { ws.cancel(); ws = null; }
+        // I-1: кнопки прежнего соединения (возможно, другого ПК) неактуальны;
+        // открытые запросы мост пришлёт заново при подключении (D-20)
+        clearEventNotifications();
         connected = false;
         connecting = false;
         viaTunnel = false;
@@ -506,6 +536,9 @@ public class BridgeService extends Service {
                 }
                 candHost = null; // кандидат разрешён
                 if (!tun && tunnelPort != 0) stopTunnel(); // LAN победил — туннель не нужен
+                // I-1: учёт уведомлений с нуля — мост сейчас же пришлёт открытые запросы
+                // и подтверждения (D-20); старые кнопки могли устареть, пока не было связи
+                clearEventNotifications();
                 updateStatus("Подключено (" + pathRu() + "): " + bridgeName());
                 broadcastState();
                 socket.send("{\"type\":\"internet\"}"); // узнаём/обновляем p2p-адрес ПК
@@ -547,11 +580,15 @@ public class BridgeService extends Service {
                     } else if ("sessions".equals(type)) {
                         int alive = 0;
                         var arr = m.optJSONArray("sessions");
+                        java.util.Set<String> ids = new java.util.HashSet<>();
                         if (arr != null) {
                             for (int i = 0; i < arr.length(); i++) {
                                 if (arr.getJSONObject(i).optBoolean("alive")) alive++;
+                                ids.add(arr.getJSONObject(i).optString("id"));
                             }
                         }
+                        // I-1: уведомления исчезнувших сессий неактуальны
+                        for (Integer gone : notifs.retainSessions(ids)) cancelNotif(gone);
                         updateStatus("Подключено (" + pathRu() + "): " + bridgeName() + " · сессий: " + alive);
                     } else if ("internet".equals(type)) {
                         // мост сообщил свой p2p-адрес — запоминаем на случай отъезда
@@ -825,7 +862,54 @@ public class BridgeService extends Service {
         getSystemService(NotificationManager.class).notify(STATUS_ID, statusNotification(text));
     }
 
-    private int reqSeq = 1000;
+    // requestCode PendingIntent; идентичность задаёт data-URI (C-1), счётчик — лишь различитель
+    private final java.util.concurrent.atomic.AtomicInteger reqSeq =
+            new java.util.concurrent.atomic.AtomicInteger(1000);
+
+    /** I-2: true — сообщение принято в очередь WebSocket; иначе вызывающий сообщает «нет связи». */
+    private boolean sendToBridge(String json) {
+        WebSocket w = ws;
+        return json != null && w != null && connected && w.send(json);
+    }
+
+    /** Снять все уведомления, кроме статусного, и забыть их учёт (связь заново, смена ПК, рестарт). */
+    private void clearEventNotifications() {
+        notifs.clear();
+        synchronized (confirmNids) { confirmNids.clear(); }
+        NotificationManager nm = getSystemService(NotificationManager.class);
+        try {
+            for (android.service.notification.StatusBarNotification sbn : nm.getActiveNotifications()) {
+                if (sbn.getId() != STATUS_ID) nm.cancel(sbn.getTag(), sbn.getId());
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "не удалось перечислить уведомления", e);
+        }
+    }
+
+    /** Тап по уведомлению и его смахивание — data уникальна на уведомление (C-1, I-1). */
+    private PendingIntent openIntent(int nid, String sessionId, boolean withSession) {
+        Intent open = new Intent(this, MainActivity.class)
+                .setData(android.net.Uri.fromParts(NotifIntents.OPEN,
+                        NotifIntents.openSsp(notifEpoch, nid, sessionId), null))
+                .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        if (withSession) {
+            // cbAuth — секрет из приватных prefs: подтверждает, что intent с session
+            // создан нами. Чужое приложение (экспортированная MainActivity) его не
+            // знает, поэтому не сможет заставить нас переключить сессию (F15).
+            open.putExtra("session", sessionId).putExtra("cbAuth", notifAuthSecret(this));
+        }
+        return PendingIntent.getActivity(this, nid, open,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+    }
+
+    private PendingIntent dismissIntent(int nid) {
+        Intent i = new Intent(this, BridgeService.class)
+                .setAction(ACTION_DISMISS)
+                .setData(android.net.Uri.fromParts(NotifIntents.DISMISS,
+                        NotifIntents.dismissSsp(notifEpoch, nid), null));
+        return PendingIntent.getService(this, reqSeq.getAndIncrement(), i,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+    }
 
     /**
      * Секрет для подтверждения, что intent с extra «session» создан этим
@@ -846,14 +930,13 @@ public class BridgeService extends Service {
         return s;
     }
 
-    private Notification.Action replyAction(String sessionId, String requestId, Protocol.Choice c, int nid) {
+    private Notification.Action replyAction(String sessionId, String requestId, Protocol.Choice c) {
+        // C-1: всё значимое — в data; разные запросы/решения — разные PendingIntent
         Intent i = new Intent(this, BridgeService.class)
                 .setAction(ACTION_REPLY)
-                .putExtra("session", sessionId)
-                .putExtra("requestId", requestId)
-                .putExtra("decision", c.id)
-                .putExtra("nid", nid);
-        PendingIntent pi = PendingIntent.getService(this, reqSeq++, i,
+                .setData(android.net.Uri.fromParts(NotifIntents.REPLY,
+                        NotifIntents.replySsp(sessionId, requestId, c.id), null));
+        PendingIntent pi = PendingIntent.getService(this, reqSeq.getAndIncrement(), i,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         Notification.Action.Builder ab = new Notification.Action.Builder(
                 android.graphics.drawable.Icon.createWithResource(this, R.drawable.ic_stat),
@@ -890,49 +973,46 @@ public class BridgeService extends Service {
         RequestNotifications.Placement place = notifs.onEvent(sessionId, event, isRequest ? requestId : null);
         for (Integer old : place.cancel) nm.cancel(old);
         int nid = place.nid;
-        // cbAuth — секрет из приватных prefs: подтверждает, что intent с session
-        // создан нами. Чужое приложение (экспортированная MainActivity) его не
-        // знает, поэтому не сможет заставить нас переключить сессию (F15).
-        Intent open = new Intent(this, MainActivity.class)
-                .putExtra("session", sessionId)
-                .putExtra("cbAuth", notifAuthSecret(this))
-                .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
-        PendingIntent pi = PendingIntent.getActivity(this, nid, open,
-                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         boolean biolock = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean("biolock", false);
+        // Агент ждёт ответа — кнопки по choices от моста (D-4). Нажатие требует
+        // разблокировки (API >= 31); на API < 31 «Всегда» не показываем, а при биометрии
+        // кнопок нет вовсе (M-4). Без choices (generic, D-23.4) — без кнопок.
+        boolean buttons = isRequest && Protocol.canShowActions(Build.VERSION.SDK_INT, biolock);
+        // при биометрии на локскрине не показываем ничего, иначе только заголовок; на API < 31
+        // кнопки нельзя защитить разблокировкой — уведомление с кнопками на локскрине скрыто
+        boolean secret = biolock || (buttons && Build.VERSION.SDK_INT < 31);
         Notification.Builder b = new Notification.Builder(this, CH_EVENTS)
                 .setSmallIcon(R.drawable.ic_stat)
                 .setContentTitle(title)
                 .setContentText(message)
                 .setStyle(new Notification.BigTextStyle().bigText(message))
-                .setContentIntent(pi)
+                .setContentIntent(openIntent(nid, sessionId, true))
+                .setDeleteIntent(dismissIntent(nid))
                 .setOnlyAlertOnce(true)
-                // при биометрии на локскрине не показываем ничего, иначе только заголовок
-                .setVisibility(biolock ? Notification.VISIBILITY_SECRET : Notification.VISIBILITY_PRIVATE)
+                .setVisibility(secret ? Notification.VISIBILITY_SECRET : Notification.VISIBILITY_PRIVATE)
                 .setAutoCancel(true);
-        // Агент ждёт ответа — кнопки по choices от моста (D-4). Нажатие требует
-        // разблокировки (API >= 31); на API < 31 «Всегда» не показываем, а при биометрии
-        // кнопок нет вовсе (M-4). Без choices (generic, D-23.4) — без кнопок.
-        if (isRequest && Protocol.canShowActions(Build.VERSION.SDK_INT, biolock)) {
+        if (buttons) {
             for (Protocol.Choice c : Protocol.visibleChoices(choices, Build.VERSION.SDK_INT)) {
-                b.addAction(replyAction(sessionId, requestId, c, nid));
+                b.addAction(replyAction(sessionId, requestId, c));
             }
         }
         nm.notify(nid, b.build());
     }
 
     private Notification.Action confirmAction(String confirmId, boolean allow, String label) {
+        // C-1: confirmId и решение — в data; разные подтверждения/решения — разные PendingIntent
         Intent i = new Intent(this, BridgeService.class)
                 .setAction(ACTION_CONFIRM)
-                .putExtra("confirmId", confirmId)
-                .putExtra("allow", allow);
-        PendingIntent pi = PendingIntent.getService(this, reqSeq++, i,
+                .setData(android.net.Uri.fromParts(NotifIntents.CONFIRM,
+                        NotifIntents.confirmSsp(confirmId, allow), null));
+        PendingIntent pi = PendingIntent.getService(this, reqSeq.getAndIncrement(), i,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         Notification.Action.Builder ab = new Notification.Action.Builder(
                 android.graphics.drawable.Icon.createWithResource(this, R.drawable.ic_stat),
                 label, pi);
-        // «Разрешить» — только с разблокированного телефона (M-4, D-13)
-        if (allow && Build.VERSION.SDK_INT >= 31) ab.setAuthenticationRequired(true);
+        // обе кнопки — только с разблокированного телефона (M-4, D-13): «Разрешить» одобряет
+        // операцию, а «Отклонить» включает паузу D-22.3 — с локскрина нельзя ни то, ни другое
+        if (Build.VERSION.SDK_INT >= 31) ab.setAuthenticationRequired(true);
         return ab.build();
     }
 
@@ -950,10 +1030,6 @@ public class BridgeService extends Service {
             nid = prev != null ? prev : notifs.nextId();
             confirmNids.put(confirmId, nid);
         }
-        Intent open = new Intent(this, MainActivity.class)
-                .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
-        PendingIntent pi = PendingIntent.getActivity(this, nid, open,
-                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         String text = Protocol.confirmText(message, checkCode);
         boolean biolock = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean("biolock", false);
         Notification.Builder b = new Notification.Builder(this, CH_EVENTS)
@@ -961,7 +1037,8 @@ public class BridgeService extends Service {
                 .setContentTitle("Claude Bridge: нужно подтверждение")
                 .setContentText(text)
                 .setStyle(new Notification.BigTextStyle().bigText(text))
-                .setContentIntent(pi)
+                .setContentIntent(openIntent(nid, "", false))
+                .setDeleteIntent(dismissIntent(nid))
                 .setOnlyAlertOnce(true)
                 .setVisibility(biolock ? Notification.VISIBILITY_SECRET : Notification.VISIBILITY_PRIVATE)
                 .setAutoCancel(true);

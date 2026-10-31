@@ -33,6 +33,7 @@ const WebSocket = require(path.join(__dirname, 'node_modules', 'ws'));
 const { ensureDataDirs } = require('./lib/datadir');
 const { pinnedTlsOptions } = require('./lib/cert');
 const { buildLoginUrl, openInBrowser } = require('./lib/open-url');
+const W32 = require('./lib/win32-input');
 
 const args = process.argv.slice(2);
 
@@ -200,10 +201,14 @@ function enterRaw() {
   process.stdin.setRawMode(true);
   process.stdin.resume();
   process.stdin.on('data', (d) => {
-    if (d.length === 1 && d[0] === 0x1c) { // Ctrl+\
+    const s = d.toString('utf8');
+    // Ctrl+\ — сырой 0x1c или, после \x1b[?9001h от агента, в кодировке win32-input-mode
+    // (D-23.2): порция с этим нажатием в агента не пересылается
+    if (W32.isCtrlBackslash(s)) {
       die('\r\n[отсоединился — сессия продолжает работать; вернуться: claude-mobile -a]\r');
+      return;
     }
-    send({ type: 'input', id: sid, data: d.toString('utf8') });
+    send({ type: 'input', id: sid, data: s });
   });
   // Windows: SIGWINCH нет, изменение размера консоли приходит событием 'resize'
   process.stdout.on('resize', () => {

@@ -196,3 +196,32 @@ test('m-3: a refusal or cancel in the console exits with code 1', { timeout: 900
     assert.match(r.out(), /Отменено/);
   } finally { await nb.stop(); }
 });
+
+test('D-23.2: Ctrl+\\ detaches after the agent enabled win32-input-mode; the key is not forwarded', { timeout: 90000 }, async () => {
+  const o = await b.connect(b.owner);
+  const before = new Set();
+  const list = await o.wait((m) => m.type === 'sessions');
+  for (const s of list.sessions) before.add(s.id);
+  const a = runTty(b, ['--agent', 'echo', '--w32-input']);
+  let exitCode = null;
+  a.done.then((c) => { exitCode = c; });
+  await until(() => /ARGV:\["--w32-input"\]/.test(a.out()), 20000, 'агент запущен: ' + a.out());
+  const msg = await o.wait((m) => m.type === 'sessions' && m.sessions.some((s) => !before.has(s.id)), 10000);
+  const sid = msg.sessions.find((s) => !before.has(s.id)).id;
+  // ConPTY консоли claude-mobile теперь кодирует клавиши в win32-input-mode: 0x1c приходит как
+  // \x1b[17;29;0;1;8;1_\x1b[220;43;28;1;8;1_… (задача 17)
+  a.write('\x1c');
+  await until(() => exitCode !== null, 10000, 'claude-mobile не отсоединился: ' + JSON.stringify(a.out().slice(-200)));
+  assert.strictEqual(exitCode, 0);
+  assert.match(a.out(), /отсоединился/);
+  // сессия жива, нажатие в неё не ушло
+  o.send({ type: 'attach', id: sid, cols: 120, rows: 30 });
+  await o.waitOutput(sid, /ARGV:\["--w32-input"\]/);
+  // агент включил win32-input-mode — и «Z» он получает в этой кодировке (символ 90)
+  o.send({ type: 'input', id: sid, data: 'Z' });
+  await o.waitOutput(sid, /ECHO:".*;90;1;/);
+  const echoes = o.output(sid).match(/ECHO:.*/g);
+  assert.strictEqual(echoes.length, 1, 'Ctrl+\\ packet was forwarded: ' + JSON.stringify(echoes));
+  assert.doesNotMatch(echoes[0], /;28;|\\u001c/);
+  o.send({ type: 'kill', id: sid });
+});

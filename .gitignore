@@ -41,6 +41,13 @@ android/app/src/main/jniLibs/
 .claude/
 .claude-ide/
 .serena/
+# Система спеков для агентов — локальная, машинно-специфичная (как в bga-backend)
+Specs/
+AGENTS.md
+CLAUDE.md
+tools/check-specs.mjs
+tools/inject-specs-entry.mjs
+.opencode/
 CLAUDE-SECURITY-*/
 # Отчёты аудита с описанием ещё не закрытых уязвимостей — не публиковать
 SECURITY_AUDIT_*.md

@@ -32,3 +32,18 @@ test('displayText = clipMiddle(cleanText(s)): a hidden tail stays visible', () =
   assert.ok(out.endsWith(long.slice(-60) + ` (${long.length} симв.)`), out);
   assert.ok(out.startsWith(long.slice(0, 100) + '…'), out);
 });
+
+test('D-23.6: labelText — prefix + sanitized detail, at most 40 UTF-16 units, the tail stays visible', () => {
+  const { labelText } = require('../lib/display-text');
+  assert.strictEqual(labelText('Всегда: ', 'mkdir *'), 'Всегда: mkdir *');
+  assert.strictEqual(labelText('Всегда', ''), 'Всегда');
+  assert.strictEqual(labelText('Всегда: ', '  ​\n '), 'Всегда:', 'empty detail -> trimmed prefix');
+  assert.strictEqual(labelText('Всегда: ', 'a‮b\nc'), 'Всегда: ab c');
+  const long = labelText('Всегда: ', 'x'.repeat(10) + 'y'.repeat(40) + 'END');
+  assert.strictEqual(long.length, 40);
+  assert.ok(long.startsWith('Всегда: x') && long.endsWith('END') && long.includes('…'), long);
+  // суррогатные пары не разрезаются, длина — в единицах UTF-16 (как обрезает мост)
+  const emoji = labelText('Всегда: ', '😀'.repeat(30));
+  assert.ok(emoji.length <= 40, emoji);
+  assert.ok(!/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(emoji), emoji);
+});

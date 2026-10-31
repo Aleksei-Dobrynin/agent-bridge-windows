@@ -27,4 +27,27 @@ function clipMiddle(s, { max = CLIP.max, head = CLIP.head, tail = CLIP.tail } = 
 
 const displayText = (s, clip) => clipMiddle(cleanText(s), clip);
 
-module.exports = { cleanText, clipMiddle, displayText };
+// подпись кнопки ответа: мост обрезает её до 40 единиц UTF-16 (session-events.cleanChoices)
+const LABEL_MAX = 40;
+
+/**
+ * Подпись кнопки (D-23.6): prefix + очищенное detail, не длиннее max единиц UTF-16;
+ * длинное detail — «начало…конец» (конец длиннее: хвост пути/команды важнее). Пустое detail —
+ * только prefix (без хвостовых пробелов).
+ */
+function labelText(prefix, detail, max = LABEL_MAX) {
+  const p = String(prefix);
+  const d = cleanText(detail);
+  if (!d) return cleanText(p);
+  if ((p + d).length <= max) return p + d;
+  const cps = Array.from(d);
+  let room = max - p.length - 1; // 1 — «…»
+  for (; room > 0; room--) {
+    const tail = Math.ceil(room * 0.6);
+    const out = p + cps.slice(0, room - tail).join('') + '…' + cps.slice(cps.length - tail).join('');
+    if (out.length <= max) return out;
+  }
+  return (p + '…').slice(0, max);
+}
+
+module.exports = { cleanText, clipMiddle, displayText, labelText, LABEL_MAX };

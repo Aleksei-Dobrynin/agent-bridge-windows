@@ -411,3 +411,32 @@ test('D-23.5: Notification idle_prompt -> no notify', () => {
   assert.deepStrictEqual(a.onHook(sess(), { hook_event_name: 'Notification', notification_type: 'idle_prompt',
     message: 'Claude is waiting for your input' }), []);
 });
+
+test('D-23.6: "always" label from permission_suggestions', () => {
+  const label = (sugg, extra = {}) => {
+    const ev = mk().onHook(sess(), PR({ permission_suggestions: sugg, ...extra }));
+    const c = ev[0].choices.find((x) => x.id === 'always');
+    return c && c.label;
+  };
+  // факт задачи 17 (2.1.284): addDirectories -> «Yes, and always allow access to <dir> from this project»
+  assert.strictEqual(label([{ type: 'addDirectories', directories: ['C:\\w\\proj'], destination: 'session' }]),
+    'Всегда: доступ к каталогу C:\\w\\proj');
+  assert.strictEqual(label([{ type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'npm run test:*' }],
+    behavior: 'allow', destination: 'localSettings' }]), 'Всегда: npm run test:*');
+  assert.strictEqual(label([{ type: 'addRules', rules: [{ toolName: 'WebFetch' }], behavior: 'allow' }]), 'Всегда: WebFetch');
+  assert.strictEqual(label([{ type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'mkdir *' }], behavior: 'allow' },
+    { type: 'addDirectories', directories: ['C:\\w'] }]), 'Всегда: mkdir *; доступ к каталогу C:\\w');
+  // неизвестное / непригодное — просто «Всегда»
+  for (const sugg of [[{ type: 'setMode', mode: 'acceptEdits' }], [{ type: 'addRules', rules: 'x' }],
+    [{ type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'rm *' }], behavior: 'deny' }],
+    [{ type: 'addDirectories', directories: [5, ''] }], [null, 7]]) {
+    assert.strictEqual(label(sugg), 'Всегда', JSON.stringify(sugg));
+  }
+  // санитизация и предел длины: невидимые символы и переводы строк убраны, хвост пути виден
+  const long = label([{ type: 'addDirectories', directories: ['C:\\Users\\someone\\very\\long\\path\\to\\the\\project\u202e\nend'] }]);
+  assert.ok(long.length <= 40, long);
+  assert.ok(long.startsWith('Всегда: доступ к каталогу '), long);
+  assert.ok(long.endsWith('ject end'), long);
+  assert.ok(long.includes('…'), long);
+  assert.ok(!/[\u202e\n]/.test(long), long);
+});

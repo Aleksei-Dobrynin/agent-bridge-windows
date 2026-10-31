@@ -7,7 +7,7 @@
 const crypto = require('crypto');
 const { npmShimExe } = require('../lib/agent-exe');
 const { findOnPath } = require('../lib/which');
-const { displayText } = require('../lib/display-text');
+const { cleanText, displayText, labelText } = require('../lib/display-text');
 const W32 = require('../lib/win32-input');
 
 const EXE_REL = ['node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe'];
@@ -18,6 +18,8 @@ const OPTIONS = Object.freeze([
 const RESUME_FLAGS = new Set(['--resume', '-r', '--continue', '-c']);
 const ONCE = { id: 'once', label: 'Да' };
 const ALWAYS = { id: 'always', label: 'Всегда' };
+// команды: правило — сама команда (`npm run test:*`); прочие инструменты — Инструмент(правило)
+const COMMAND_TOOLS = new Set(['Bash', 'PowerShell']);
 const REJECT = { id: 'reject', label: 'Нет' };
 // диалог разрешения: 1 — да, 2 — всегда (текст зависит от команды), Esc — отказ; без Enter.
 // D-23.1: Esc — в кодировке win32-input-mode (одиночный \x1b ConPTY может потерять)
@@ -68,6 +70,34 @@ function describeTool(p) {
   const detail = [ti.command, ti.file_path, ti.url, ti.pattern, ti.path].find((v) => typeof v === 'string' && v) || '';
   // D-19 п. 2: невидимые/bidi символы и переводы строк не прячут хвост команды
   return displayText(name + (detail ? ': ' + detail : ''));
+}
+
+/**
+ * D-23.6: подпись «Всегда» по permission_suggestions — тем же, что Claude Code пишет в пункте 2
+ * диалога (2.1.284: addRules — правило, addDirectories — «always allow access to <каталог>»).
+ * Непонятные предложения (setMode и т.п.) — просто «Всегда».
+ */
+function alwaysLabel(suggestions) {
+  const rules = [];
+  const dirs = [];
+  for (const s of Array.isArray(suggestions) ? suggestions : []) {
+    if (!s || typeof s !== 'object') continue;
+    if (s.type === 'addRules' && (s.behavior === undefined || s.behavior === 'allow') && Array.isArray(s.rules)) {
+      for (const r of s.rules) {
+        if (!r || typeof r.toolName !== 'string' || !cleanText(r.toolName)) continue;
+        const content = typeof r.ruleContent === 'string' ? cleanText(r.ruleContent) : '';
+        rules.push(!content ? cleanText(r.toolName)
+          : COMMAND_TOOLS.has(r.toolName) ? content : `${cleanText(r.toolName)}(${content})`);
+      }
+    } else if (s.type === 'addDirectories' && Array.isArray(s.directories)) {
+      for (const d of s.directories) if (typeof d === 'string' && cleanText(d)) dirs.push(cleanText(d));
+    }
+  }
+  if (!rules.length && !dirs.length) return ALWAYS.label;
+  const access = `доступ к ${dirs.length > 1 ? 'каталогам' : 'каталогу'} `;
+  // только каталоги — сокращается сам путь (виден его хвост), а не «доступ к ка…»
+  if (!rules.length) return labelText('Всегда: ' + access, dirs.join(', '));
+  return labelText('Всегда: ', rules.join(', ') + (dirs.length ? '; ' + access + dirs.join(', ') : ''));
 }
 
 function stable(v) {
@@ -160,7 +190,7 @@ function create(id, cfg, opts = {}) {
         const withAlways = Array.isArray(p.permission_suggestions) && p.permission_suggestions.length > 0;
         const item = {
           message: 'Claude просит разрешение — ' + describeTool(p),
-          choices: withAlways ? [ONCE, ALWAYS, REJECT] : [ONCE, REJECT],
+          choices: withAlways ? [ONCE, { id: 'always', label: alwaysLabel(p.permission_suggestions) }, REJECT] : [ONCE, REJECT],
           key: callKey(p),
         };
         if (r.open) { r.queue.push(item); return []; }

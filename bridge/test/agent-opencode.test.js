@@ -352,3 +352,22 @@ test('D-23.3: reply uses the stored child session id; a malformed one is refused
   assert.deepStrictEqual(await a.reply(session, { requestId: 'per_3', agentSessionId: '../x' }, 'once'), { ok: false, events: [] });
   assert.deepStrictEqual(stub.replies, [['ses_child', 'per_1', 'once'], ['ses_x', 'per_2', 'once']]);
 });
+
+test('D-23.6: "always" label from save[] (sanitized, length-limited)', () => {
+  const stub = stubClient();
+  const a = oc.create('opencode', { command: process.execPath }, { opencodeClient: stub, now: () => 1 });
+  const ev = [];
+  a.subscribe({ id: 's1', agentState: { opencodeSessionId: 'ses_x' } }, (e) => ev.push(...e));
+  const always = (save, id) => {
+    stub.handler({ type: 'permission.asked', data: { id, sessionID: 'ses_x', action: 'shell', resources: ['x'], save } });
+    const req = ev.find((e) => e.kind === 'request' && e.requestId === id);
+    const c = req.choices.find((x) => x.id === 'always');
+    return c && c.label;
+  };
+  // факт задачи 17 (v2.1.4): resources ["mkdir oc-e2e-1"], save ["mkdir *"]
+  assert.strictEqual(always(['mkdir *'], 'per_1'), 'Всегда: mkdir *');
+  assert.strictEqual(always(['git add *', 'git commit *'], 'per_2'), 'Всегда: git add *, git commit *');
+  assert.strictEqual(always([5, ''], 'per_3'), undefined, 'nothing to save -> no "always"');
+  const long = always(['echo ' + 'a'.repeat(80) + '‮\n*'], 'per_4');
+  assert.ok(long.length <= 40 && long.startsWith('Всегда: echo a') && long.endsWith('a *') && !/[‮\n]/.test(long), long);
+});

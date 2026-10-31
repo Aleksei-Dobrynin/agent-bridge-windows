@@ -6,7 +6,7 @@ const os = require('os');
 const { spawn } = require('child_process');
 const { npmShimExe } = require('../lib/agent-exe');
 const { findOnPath, resolveSpawn } = require('../lib/which');
-const { cleanText, clipMiddle, displayText } = require('../lib/display-text');
+const { cleanText, clipMiddle, displayText, labelText } = require('../lib/display-text');
 const { OpencodeClient } = require('./opencode-client');
 
 const EXE_REL = ['node_modules', '@opencode', 'cli', 'bin', 'opencode.exe'];
@@ -33,8 +33,9 @@ function describe(p, sub = false) {
 
 function choicesFor(p) {
   const out = [{ id: 'once', label: 'Да' }];
-  // «Всегда» сохраняет шаблоны save[]; без них сохранять нечего
-  if (Array.isArray(p.save) && p.save.length) out.push({ id: 'always', label: 'Всегда' });
+  // «Всегда» сохраняет шаблоны save[]; без них сохранять нечего. D-23.6: подпись — сами шаблоны
+  const save = Array.isArray(p.save) ? p.save.filter((x) => typeof x === 'string').map(cleanText).filter(Boolean) : [];
+  if (save.length) out.push({ id: 'always', label: labelText('Всегда: ', save.join(', ')) });
   out.push({ id: 'reject', label: 'Нет' });
   return out;
 }

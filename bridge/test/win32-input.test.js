@@ -30,7 +30,7 @@ test('MODE_OFF switches win32-input-mode off', () => {
   assert.strictEqual(W32.MODE_OFF, '\x1b[?9001l');
 });
 
-test('D-25.5: CONSOLE_RESET switches off win32-input, focus, mouse modes and the alternate screen', () => {
+test('D-25.5, D-26.5: CONSOLE_RESET switches off win32-input, focus, mouse modes and the alternate screen, cursor saved/restored', () => {
   assert.strictEqual(W32.CONSOLE_RESET,
-    '\x1b[?9001l\x1b[?1004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1049l');
+    '\x1b7\x1b[?9001l\x1b[?1004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1049l\x1b8');
 });

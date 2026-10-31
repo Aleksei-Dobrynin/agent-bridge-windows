@@ -39,6 +39,15 @@ test('after Ctrl+\\ the next program in the same console gets plain keys (\\x1b[
     await until(() => got().length > 0, 10000, 'raw-echo получил ввод');
     await H.sleep(300); // отпускание клавиши в win32-input-mode приходит второй порцией
     assert.deepStrictEqual(got(), ['[got 5a]'], 'консоль осталась в win32-input-mode: ' + JSON.stringify(out().slice(-300)));
+    // D-26 п. 5: сброс режимов (с ?1049l) вне альтернативного экрана не переносит курсор в начало —
+    // сырой вывод (без снятия ANSI) после агента не содержит перехода в строку 1, и следующие
+    // строки идут после уже выведенных
+    const tail = raw.slice(raw.lastIndexOf('ARGV:'));
+    assert.doesNotMatch(tail, /\x1b\[(?:1?(?:;1?)?)H/, 'курсор ушёл в начало экрана: ' + JSON.stringify(tail));
+    const plain = H.stripAnsi(tail);
+    const iDetach = plain.indexOf('[отсоединился');
+    const iExit = plain.indexOf('[attach exit 0]');
+    assert.ok(iDetach > 0 && iExit > iDetach && plain.indexOf('[raw true]') > iExit, JSON.stringify(plain));
   } finally {
     try { term.kill(); } catch { /* вышел */ }
   }

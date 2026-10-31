@@ -1,0 +1,157 @@
+'use strict';
+// Сквозной тест opencode через мост на фейковом сервисе (D-12, D-14, D-4): сессия через API,
+// TUI с --server/--session и паролем в окружении keeper'а (не в файлах), SSE -> notify,
+// reply -> API, ресинхронизация после обрыва SSE и после перезапуска моста.
+const test = require('node:test');
+const assert = require('node:assert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const crypto = require('crypto');
+const H = require('./helpers/bridge');
+const { startFakeOpencode } = require('./helpers/fake-opencode');
+
+const { FAKE_AGENT, DEVICE, createAndAttach, sleep } = H;
+const waitUntil = async (fn, ms = 10000) => assert.ok(await H.waitFor(fn, ms), 'условие не выполнено за ' + ms + ' мс');
+
+let fake;
+let svcDir;
+let b;
+let c;
+let sid;
+test.before(async () => {
+  fake = await startFakeOpencode({ password: 'ocpw-' + crypto.randomBytes(8).toString('hex') });
+  svcDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cb-ocs-'));
+  const file = fake.writeServiceFile(svcDir);
+  b = await H.startTestBridge({ prefix: 'cb-ocit-', devices: [DEVICE], config: {
+    defaultAgent: 'opencode',
+    agents: { opencode: { command: process.execPath, prefixArgs: [FAKE_AGENT], serviceFile: file } },
+  } });
+  c = await b.connect(DEVICE.token);
+});
+test.after(async () => {
+  if (b) await b.stop();
+  if (fake) await fake.close();
+  if (svcDir) fs.rmSync(svcDir, { recursive: true, force: true });
+});
+
+/** Все файлы каталога данных моста (meta, логи keeper'ов, конфиг) — пароль сервиса не должен там оказаться. */
+function filesWith(dir, needle) {
+  const hits = [];
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) hits.push(...filesWith(p, needle));
+    else {
+      try { if (fs.readFileSync(p).includes(needle)) hits.push(p); } catch { /* занят keeper'ом */ }
+    }
+  }
+  return hits;
+}
+
+test('create: API session with ask-shell, TUI args and password env (D-12, D-14)', { timeout: 60000 }, async () => {
+  const r = await createAndAttach(c, { agent: 'opencode', cwd: b.cwd, options: { askShell: true } });
+  assert.strictEqual(r.type, 'created');
+  sid = r.id;
+  const body = fake.state.sessions[0].body;
+  assert.strictEqual(body.location.directory, b.cwd);
+  assert.deepStrictEqual(body.permissions, [{ action: 'shell', resource: '*', effect: 'ask' }]);
+  const argv = JSON.parse((await c.waitOutput(sid, /ARGV:(\[[^\]]*\])/))[1]);
+  assert.deepStrictEqual(argv, ['--server', fake.url, '--session', 'ses_fake1']);
+  await c.waitOutput(sid, new RegExp('OCPW:' + fake.password));
+  // пароль сервиса — только в окружении keeper'а/агента: не в meta-файле и не в логах
+  const meta = JSON.parse(fs.readFileSync(path.join(b.home, 'sessions', sid + '.json'), 'utf8'));
+  assert.deepStrictEqual(meta.agentState, { opencodeSessionId: 'ses_fake1' });
+  assert.strictEqual(meta.env, undefined);
+  assert.deepStrictEqual(filesWith(b.home, fake.password), []);
+  const listed = (await c.wait((m) => m.type === 'sessions' && m.sessions.some((s) => s.id === sid))).sessions
+    .find((s) => s.id === sid);
+  assert.deepStrictEqual([listed.agent, listed.agentName, listed.scroll], ['opencode', 'opencode', 'wheel']);
+});
+
+test('permission.asked -> notify; foreign session ignored; reply -> API; stale', { timeout: 30000 }, async () => {
+  await waitUntil(() => fake.state.sse.size >= 1);
+  await sleep(200);
+  const at = c.mark();
+  fake.ask('ses_other', { id: 'per_x' });
+  fake.ask('ses_fake1', { id: 'per_1', action: 'shell', resources: ['echo hi'], save: ['echo *'] });
+  const n = await c.wait((m) => m.type === 'notify' && m.event === 'request' && m.requestId === 'per_1', 5000, at);
+  assert.strictEqual(n.id, sid);
+  assert.match(n.message, /shell: echo hi/);
+  assert.deepStrictEqual(n.choices.map((x) => x.id), ['once', 'always', 'reject']);
+  await c.wait((m) => m.type === 'status' && m.id === sid && m.status === 'waiting', 5000, at);
+  assert.ok(!c.msgs.slice(at).some((m) => m.requestId === 'per_x'));
+
+  c.send({ type: 'reply', id: sid, requestId: 'per_1', decision: 'once' });
+  const ok = await c.wait((m) => m.type === 'replyResult' && m.requestId === 'per_1', 5000, at);
+  assert.strictEqual(ok.ok, true);
+  assert.deepStrictEqual(fake.state.replies, [{ sessionID: 'ses_fake1', requestID: 'per_1', decision: 'once' }]);
+  await c.wait((m) => m.type === 'requestClosed' && m.requestId === 'per_1', 5000, at);
+  const at2 = c.mark();
+  c.send({ type: 'reply', id: sid, requestId: 'per_1', decision: 'once' });
+  const stale = await c.wait((m) => m.type === 'replyResult' && m.requestId === 'per_1', 5000, at2);
+  assert.deepStrictEqual([stale.ok, stale.error], [false, 'stale']);
+  assert.strictEqual(fake.state.replies.length, 1, 'stale reply never reaches the service');
+});
+
+test('reply already answered in the TUI -> 404 from the service -> stale, request closed', { timeout: 30000 }, async () => {
+  await waitUntil(() => fake.state.sse.size >= 1);
+  const at = c.mark();
+  fake.ask('ses_fake1', { id: 'per_tui', action: 'shell', resources: ['ls'] });
+  await c.wait((m) => m.type === 'notify' && m.requestId === 'per_tui', 5000, at);
+  // ответ в самом TUI: сервис уже убрал запрос, а permission.replied ещё не дошёл
+  fake.state.perms.set('ses_fake1', (fake.state.perms.get('ses_fake1') || []).filter((p) => p.id !== 'per_tui'));
+  c.send({ type: 'reply', id: sid, requestId: 'per_tui', decision: 'once' });
+  const r = await c.wait((m) => m.type === 'replyResult' && m.requestId === 'per_tui', 5000, at);
+  assert.deepStrictEqual([r.ok, r.error], [false, 'stale']);
+  await c.wait((m) => m.type === 'requestClosed' && m.requestId === 'per_tui', 5000, at);
+});
+
+test('missed request is restored after SSE drop (resync)', { timeout: 30000 }, async () => {
+  const at = c.mark();
+  fake.addSilently('ses_fake1', { id: 'per_2', action: 'edit', resources: ['a.txt'], save: [] });
+  fake.dropSse();
+  const n = await c.wait((m) => m.type === 'notify' && m.requestId === 'per_2', 15000, at);
+  assert.deepStrictEqual(n.choices.map((x) => x.id), ['once', 'reject']);
+});
+
+test('execution events -> working / idle + done', { timeout: 30000 }, async () => {
+  await waitUntil(() => fake.state.sse.size >= 1);
+  const at = c.mark();
+  fake.emit({ type: 'session.execution.started', data: { sessionID: 'ses_fake1' } });
+  await c.wait((m) => m.type === 'status' && m.id === sid && m.status === 'working', 5000, at);
+  fake.emit({ type: 'session.execution.succeeded', data: { sessionID: 'ses_fake1' } });
+  await c.wait((m) => m.type === 'status' && m.id === sid && m.status === 'idle', 5000, at);
+  await c.wait((m) => m.type === 'notify' && m.id === sid && m.event === 'done', 5000, at);
+});
+
+test('bridge restart: the restored session subscribes again and knows the pending request', { timeout: 90000 }, async () => {
+  c.close();
+  await b.restart();
+  c = await b.connect(DEVICE.token);
+  // per_2 ещё ждёт ответа в сервисе: восстановленная сессия узнаёт о нём из ресинхронизации SSE
+  // (клиент, подключившийся позже notify, видит запрос в lastNotify списка сессий)
+  const lastNotify = (m) => ((m.sessions || []).find((x) => x.id === sid) || {}).lastNotify;
+  await c.wait((m) => m.type === 'sessions' && lastNotify(m) && lastNotify(m).event === 'request', 30000);
+  await waitUntil(() => fake.state.sse.size >= 1);
+  const at = c.mark();
+  fake.ask('ses_fake1', { id: 'per_3', action: 'shell', resources: ['dir'] });
+  const n = await c.wait((m) => m.type === 'notify' && m.requestId === 'per_3', 5000, at);
+  assert.strictEqual(n.id, sid);
+  for (const [rid, decision] of [['per_2', 'reject'], ['per_3', 'once']]) {
+    c.send({ type: 'reply', id: sid, requestId: rid, decision });
+    const ok = await c.wait((m) => m.type === 'replyResult' && m.requestId === rid, 5000, at);
+    assert.strictEqual(ok.ok, true, rid);
+  }
+  assert.deepStrictEqual(fake.state.replies.slice(-2), [
+    { sessionID: 'ses_fake1', requestID: 'per_2', decision: 'reject' },
+    { sessionID: 'ses_fake1', requestID: 'per_3', decision: 'once' },
+  ]);
+  assert.deepStrictEqual(filesWith(b.home, fake.password), []);
+});
+
+test('kill: SSE subscription of the session is dropped', { timeout: 30000 }, async () => {
+  const at = c.mark();
+  c.send({ type: 'kill', id: sid });
+  await c.wait((m) => m.type === 'exit' && m.id === sid, 10000, at);
+  await waitUntil(() => fake.state.sse.size === 0, 10000);
+});

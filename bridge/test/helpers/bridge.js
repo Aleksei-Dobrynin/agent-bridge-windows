@@ -193,7 +193,8 @@ async function startTestBridge({ config = {}, devices = [], prefix = 'cb-it-' } 
     port, host: '127.0.0.1', defaultCwd: cwd, projects: [cwd], env: {}, scrollbackBytes: 65536, ...config,
   }));
   if (devices.length) fs.writeFileSync(path.join(home, 'pairings.json'), JSON.stringify({ devices }));
-  const bridge = startBridge(home, port);
+  let bridge = startBridge(home, port);
+  const procs = [bridge.proc];
   const clients = [];
   let pin;
   let owner;
@@ -204,7 +205,17 @@ async function startTestBridge({ config = {}, devices = [], prefix = 'cb-it-' } 
     throw new Error(e.message + '; stderr: ' + bridge.stderr);
   }
   return {
-    home, cwd, port, owner, pin, bridge,
+    home, cwd, port, owner, pin,
+    get bridge() { return bridge; },
+    /** Перезапуск моста без /T: keeper'ы (отсоединённые) переживают его, как в жизни. */
+    async restart() {
+      const old = bridge.proc;
+      const exited = new Promise((r) => (old.exitCode !== null ? r() : old.once('exit', r)));
+      old.kill();
+      await exited;
+      bridge = startBridge(home, port);
+      procs.push(bridge.proc);
+    },
     async connect(token) {
       let c = null;
       if (!await waitFor(async () => { try { c = await connectClient(port, pin, token); return true; } catch { return false; } }, 30000)) {
@@ -221,7 +232,7 @@ async function startTestBridge({ config = {}, devices = [], prefix = 'cb-it-' } 
     },
     async stop() {
       for (const c of clients) c.close();
-      await cleanup(home, [bridge.proc]);
+      await cleanup(home, procs);
     },
   };
 }

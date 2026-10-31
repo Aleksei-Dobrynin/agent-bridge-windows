@@ -720,6 +720,8 @@ function onNotify(m) {
 // Браузеру владельца на ПК мост их не шлёт.
 
 let confirmShown = null; // confirmId открытого диалога
+const CONFIRM_ARM_MS = 700;
+const confirmArm = CB.armGuard(CONFIRM_ARM_MS);
 const confirmSeen = new Set(); // повтор после переподключения — без повторного сигнала
 
 function onConfirmRequest(m) {
@@ -730,14 +732,27 @@ function onConfirmRequest(m) {
   $('#confirmCode').textContent = p.code;
   $('#confirmCodeBox').classList.toggle('hidden', !p.code);
   const d = $('#confirmDialog');
-  if (!d.open) d.showModal();
+  const wasOpen = d.open;
+  if (!wasOpen) d.showModal();
+  // I-2: «Разрешить» — не раньше чем через 700 мс после показа или смены запроса; фокус — на «Отклонить»
+  if (confirmArm.arm(m.confirmId, Date.now(), !wasOpen)) {
+    $('#confirmAllow').disabled = true;
+    $('#confirmDeny').focus();
+    setTimeout(updateConfirmAllow, CONFIRM_ARM_MS + 20);
+  }
   if (confirmSeen.has(m.confirmId)) return;
   confirmSeen.add(m.confirmId);
   if (navigator.vibrate) navigator.vibrate([120, 60, 120]);
   beep();
 }
 
+function updateConfirmAllow() {
+  $('#confirmAllow').disabled = !confirmArm.ready(Date.now());
+}
+
 function answerConfirm(allow) {
+  // I-2: одобрение только вооружённого (показанного не менее 700 мс) запроса; отказ — всегда
+  if (allow && !confirmArm.accept(confirmShown, Date.now())) return;
   if (confirmShown) send({ type: 'confirm', confirmId: confirmShown, allow });
   confirmShown = null;
   $('#confirmDialog').close();

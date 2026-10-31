@@ -146,3 +146,17 @@ test('armGuard: a newly shown item accepts input only after the delay and only f
   assert.strictEqual(g.remaining(5100), 400);
   assert.strictEqual(g.remaining(6000), 0);
 });
+
+test('armGuard for the confirm dialog: 700 ms after shown, re-armed on new confirmId or re-show (I-2)', () => {
+  const g = CB.armGuard(700);
+  g.arm('cf_1', 0, true); // показан
+  assert.strictEqual(g.accept('cf_1', 699), false);
+  assert.strictEqual(g.accept('cf_1', 700), true);
+  assert.strictEqual(g.arm('cf_1', 800, false), false, 'same request while open -> stays armed');
+  assert.strictEqual(g.accept('cf_1', 800), true);
+  assert.strictEqual(g.arm('cf_2', 900, false), true, 'content changed');
+  assert.strictEqual(g.accept('cf_2', 1599), false);
+  assert.strictEqual(g.accept('cf_2', 1600), true);
+  assert.strictEqual(g.arm('cf_2', 5000, true), true, 'shown again after close');
+  assert.strictEqual(g.accept('cf_2', 5100), false);
+});

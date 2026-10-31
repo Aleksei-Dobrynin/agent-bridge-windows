@@ -29,3 +29,14 @@ test('keeps OS order among equal candidates; nothing usable -> loopback', () => 
   assert.strictEqual(pickLanAddress({ lo: [v4('127.0.0.1', true)] }), '127.0.0.1');
   assert.strictEqual(pickLanAddress({}), '127.0.0.1');
 });
+
+test('no private (RFC 1918) IPv4 -> loopback, never a public/CGNAT address (m-5)', () => {
+  assert.strictEqual(pickLanAddress({ Ethernet: [v4('8.8.4.4')] }), '127.0.0.1', 'public');
+  assert.strictEqual(pickLanAddress({ 'Мобильная сеть': [v4('100.72.10.5')] }), '127.0.0.1', 'CGNAT');
+  assert.strictEqual(pickLanAddress({ 'Radmin VPN': [v4('26.240.136.90')], Tailscale: [v4('100.100.1.2')] }), '127.0.0.1', 'VPN overlays');
+  assert.strictEqual(pickLanAddress({ Ethernet: [v4('8.8.4.4')], 'vEthernet (WSL)': [v4('172.18.128.1')] }), '172.18.128.1',
+    'private virtual still beats public');
+  for (const ip of ['172.15.0.1', '172.32.0.1', '192.169.1.1', '11.0.0.1']) {
+    assert.strictEqual(pickLanAddress({ Ethernet: [v4(ip)] }), '127.0.0.1', ip);
+  }
+});

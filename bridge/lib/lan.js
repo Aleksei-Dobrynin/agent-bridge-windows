@@ -13,17 +13,18 @@ function isRfc1918(ip) {
 }
 
 /**
- * Выбрать адрес из os.networkInterfaces(): IPv4, не loopback, не link-local.
- * Приоритет: частный адрес (RFC 1918) физического адаптера > частный адрес любого
- * адаптера > любой оставшийся. Нет подходящих — '127.0.0.1' (только этот ПК).
+ * Выбрать адрес из os.networkInterfaces(): только частный IPv4 (RFC 1918).
+ * Приоритет: физический адаптер > виртуальный/VPN (по имени). Публичные, CGNAT
+ * (100.64/10, Tailscale) и прочие адреса не берутся никогда (m-5): мост не должен
+ * слушать их и показывать в QR. Нет частного адреса — '127.0.0.1' («LAN нет»).
  */
 function pickLanAddress(ifaces = os.networkInterfaces()) {
   const cands = [];
   for (const [name, addrs] of Object.entries(ifaces || {})) {
     for (const a of addrs || []) {
       if (a.family !== 'IPv4' && a.family !== 4) continue;
-      if (a.internal || a.address.startsWith('127.') || a.address.startsWith('169.254.')) continue;
-      const rank = (isRfc1918(a.address) ? 0 : 2) + (VIRTUAL_NAME.test(name) ? 1 : 0);
+      if (a.internal || !isRfc1918(a.address)) continue;
+      const rank = VIRTUAL_NAME.test(name) ? 1 : 0;
       cands.push({ rank, address: a.address });
     }
   }

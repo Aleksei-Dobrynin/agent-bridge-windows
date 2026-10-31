@@ -169,7 +169,7 @@ Config: `%LOCALAPPDATA%\ClaudeBridge\config.json` (created from `bridge\config.e
 | Key | Purpose |
 |---|---|
 | `port` | Bridge port, default `8790` (beacon `port+1`, tunnel entry `port+2`). |
-| `host` | `"auto"` — `127.0.0.1` plus the main LAN adapter address (virtual and VPN adapters are skipped, re-checked every 15 s); or an explicit address. |
+| `host` | `"auto"` — `127.0.0.1` plus the private (10/8, 172.16/12, 192.168/16) address of the main LAN adapter (virtual and VPN adapters are skipped, public addresses are never used, re-checked every 15 s); or an explicit address. |
 | `defaultAgent` | Default agent (`claude`). |
 | `agents` | Agents: `{ "claude": {}, "opencode": {} }`; your own — `"aider": { "type": "generic", "name": "Aider", "command": "aider", "args": [], "scroll": "pageKeys" }` (`scroll`: `wheel` or `pageKeys`). |
 | `projects` | Directories where the **phone** may start sessions; a path outside the list falls back to `defaultCwd`. |

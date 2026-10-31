@@ -11,13 +11,14 @@ const { spawnSync } = require('child_process');
 const H = require('./helpers/bridge');
 const { pickLanAddress } = require('../lib/lan');
 
-// Реальный адрес этого ПК (bind должен пройти), по возможности НЕ тот, что выбрал бы
-// мост сам, — так видно, что мост берёт адаптеры из подставленного списка.
+// Реальный частный (RFC 1918) адрес этого ПК (bind должен пройти; публичные/CGNAT мост не
+// берёт, m-5), по возможности НЕ тот, что выбрал бы мост сам, — так видно, что мост берёт
+// адаптеры из подставленного списка.
 function realAddrs() {
   const out = [];
   for (const list of Object.values(os.networkInterfaces())) {
     for (const a of list || []) {
-      if (a.family === 'IPv4' && !a.internal && !a.address.startsWith('169.254.')) out.push(a.address);
+      if (a.family === 'IPv4' && !a.internal && pickLanAddress({ x: [a] }) === a.address) out.push(a.address);
     }
   }
   return out;

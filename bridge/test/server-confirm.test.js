@@ -175,8 +175,9 @@ test('D-22.3: check code in confirmPending and confirmRequest; cooldown after de
   } finally { await b.stop(); }
 });
 
-test('I-2: requester disconnect cancels its confirmation (confirmClosed), the slot is free', { timeout: 90000 }, async () => {
-  const b = await H.startTestBridge({ prefix: 'cb-cf5-', devices: [DEVICE], config: { host: TEST_LAN_HOST } });
+test('I-2: requester disconnect cancels its confirmation (confirmClosed) and starts the pause', { timeout: 90000 }, async () => {
+  const b = await H.startTestBridge({ prefix: 'cb-cf5-', devices: [DEVICE], config: { host: TEST_LAN_HOST },
+    env: { CLAUDE_BRIDGE_TEST_COOLDOWN_MS: '1500' } });
   try {
     const o = await b.connect(b.owner);
     const tmp = await b.connect(b.owner);
@@ -190,10 +191,19 @@ test('I-2: requester disconnect cancels its confirmation (confirmClosed), the sl
     d.send({ type: 'confirm', confirmId: req.confirmId, allow: true });
     await sleep(400);
     assert.ok(!o.msgs.slice(at).some((m) => m.type === 'pairinfo' || m.type === 'confirmResult'));
+    // отмена отключением — не одобрение: пауза, как после отказа (цикл «запрос+отключение» не спамит телефон)
     atD = d.mark();
     o.send({ type: 'pairinfo' });
-    const pend = await o.wait((m) => m.type === 'confirmPending' || m.type === 'error' || m.type === 'confirmResult', 5000, at);
-    assert.strictEqual(pend.type, 'confirmPending', 'no "already pending", no cooldown');
+    const cd = await o.wait((m) => m.type === 'confirmPending' || m.type === 'error' || m.type === 'confirmResult', 5000, at);
+    assert.deepStrictEqual([cd.type, cd.reason], ['confirmResult', 'cooldown']);
+    await sleep(300);
+    assert.ok(!d.msgs.slice(atD).some((m) => m.type === 'confirmRequest'), 'phone not bothered');
+    // после паузы слот свободен
+    await sleep(1400);
+    const at2 = o.mark();
+    o.send({ type: 'pairinfo' });
+    const pend = await o.wait((m) => m.type === 'confirmPending' || m.type === 'error' || m.type === 'confirmResult', 5000, at2);
+    assert.strictEqual(pend.type, 'confirmPending', 'no "already pending" after the pause');
     await d.wait((m) => m.type === 'confirmRequest' && m.confirmId === pend.confirmId, 5000, atD);
   } finally { await b.stop(); }
 });

@@ -93,3 +93,20 @@ test('stt without python, busy tunnel port, busy main port, failing create', { t
   assert.match(second.stderr, new RegExp(`порт.*${port}`, 'i'));
   assert.ok(await health(), 'first bridge unaffected');
 });
+
+test('corrupt pairings.json: clear error and exit 1, not an empty device list (fail closed)', { timeout: 90000 }, async (t) => {
+  const home = H.tempHome('cb-rob-pair-');
+  const procs = [];
+  t.after(() => H.cleanup(home, procs));
+  const port = H.pickPort(21790);
+  fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({ port, host: '127.0.0.1' }));
+  for (const garbage of ['{not json', '[]', '"x"', 'null', '{"devices":5}', '{"devices":[],"phoneRequired":"yes"}']) {
+    fs.writeFileSync(path.join(home, 'pairings.json'), garbage);
+    const b = H.startBridge(home, port);
+    procs.push(b.proc);
+    const code = await Promise.race([b.exited, H.sleep(40000).then(() => 'still running')]);
+    assert.strictEqual(code, 1, garbage);
+    assert.match(b.stderr, /pairings\.json повреждён — исправьте или удалите файл при остановленном мосте/, garbage);
+    assert.strictEqual(fs.readFileSync(path.join(home, 'pairings.json'), 'utf8'), garbage, 'file left untouched');
+  }
+});

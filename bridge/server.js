@@ -126,10 +126,28 @@ const loginTokens = new T.OneTimeTokens(60000);
 // Токен владельца в cookie не попадает; новый при каждом старте и при ротации.
 let BROWSER_TOKEN = T.newToken();
 
-// Доверенные устройства.
+// Доверенные устройства. Нет файла — первый запуск. Файл есть, но не читается или имеет неверную
+// форму — отказ запуска (fail closed): пустой список с потерянным phoneRequired (D-22.2) снова
+// открыл бы консольный путь подтверждения.
 let pairings = { devices: [] };
-try { pairings = JSON.parse(fs.readFileSync(DATA.pairings, 'utf8')); } catch { /* первый запуск */ }
-if (!pairings || !Array.isArray(pairings.devices)) pairings = { devices: [] };
+{
+  let raw = null;
+  try { raw = fs.readFileSync(DATA.pairings, 'utf8'); } catch (e) {
+    if (e.code !== 'ENOENT') raw = e;
+  }
+  if (raw !== null) {
+    let parsed = null;
+    if (typeof raw === 'string') { try { parsed = JSON.parse(raw); } catch { /* ниже — отказ */ } }
+    const okShape = parsed && typeof parsed === 'object' && !Array.isArray(parsed) && Array.isArray(parsed.devices) &&
+      (parsed.phoneRequired === undefined || typeof parsed.phoneRequired === 'boolean');
+    if (!okShape) {
+      console.error('  pairings.json повреждён — исправьте или удалите файл при остановленном мосте (' + DATA.pairings + ')' +
+        (raw instanceof Error ? ': ' + raw.message : ''));
+      process.exit(1);
+    }
+    pairings = parsed;
+  }
+}
 // Код сопряжения живёт 10 минут. Защита от перебора: 5 неверных попыток с адреса ->
 // блокировка /pair на 15 минут; плюс общий предел попыток на текущий код (F11/F14).
 const PAIR_TTL_MS = 10 * 60 * 1000;
@@ -1551,7 +1569,11 @@ wss.on('connection', (ws, req, who) => {
   ws.on('close', () => {
     allClients.delete(ws);
     // I-2: запросивший ушёл — его ожидающие подтверждения снимаются (телефон больше не видит запрос)
-    for (const e of confirmations.cancelByRequester(ws)) broadcastToDevices({ type: 'confirmClosed', confirmId: e.confirmId });
+    // и это не одобрение — пауза, как после отказа: цикл «запрос + отключение» не спамит телефон
+    for (const e of confirmations.cancelByRequester(ws)) {
+      confirmations.noteOutcome(e.action, false);
+      broadcastToDevices({ type: 'confirmClosed', confirmId: e.confirmId });
+    }
     if (ws.attached) { const s = sessions.get(ws.attached); if (s) s.clients.delete(ws); }
   });
 });

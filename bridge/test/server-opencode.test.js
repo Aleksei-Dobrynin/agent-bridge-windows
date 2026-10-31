@@ -124,14 +124,15 @@ test('execution events -> working / idle + done', { timeout: 30000 }, async () =
   await c.wait((m) => m.type === 'notify' && m.id === sid && m.event === 'done', 5000, at);
 });
 
-test('bridge restart: the restored session subscribes again and knows the pending request', { timeout: 90000 }, async () => {
+test('bridge restart: the restored session subscribes again; pending request reaches the client (D-20)', { timeout: 90000 }, async () => {
   c.close();
   await b.restart();
   c = await b.connect(DEVICE.token);
-  // per_2 ещё ждёт ответа в сервисе: восстановленная сессия узнаёт о нём из ресинхронизации SSE
-  // (клиент, подключившийся позже notify, видит запрос в lastNotify списка сессий)
-  const lastNotify = (m) => ((m.sessions || []).find((x) => x.id === sid) || {}).lastNotify;
-  await c.wait((m) => m.type === 'sessions' && lastNotify(m) && lastNotify(m).event === 'request', 30000);
+  // per_2 ещё ждёт ответа в сервисе: восстановленная сессия узнаёт о нём из ресинхронизации SSE,
+  // клиент получает notify с кнопками — рассылкой или повтором при подключении (D-20)
+  const replayed = await c.wait((m) => m.type === 'notify' && m.event === 'request' && m.requestId === 'per_2', 30000);
+  assert.strictEqual(replayed.id, sid);
+  assert.deepStrictEqual(replayed.choices.map((x) => x.id), ['once', 'reject']);
   await waitUntil(() => fake.state.sse.size >= 1);
   const at = c.mark();
   fake.ask('ses_fake1', { id: 'per_3', action: 'shell', resources: ['dir'] });

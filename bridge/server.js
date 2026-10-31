@@ -1188,6 +1188,14 @@ wss.on('connection', (ws, req, who) => {
   allClients.add(ws);
   ws.attached = null;
   ws.send(JSON.stringify(sessionsMsg()));
+  // D-20: ожидающие запросы разрешений — новому клиенту (переподключившийся телефон,
+  // запрос из ресинхронизации после рестарта моста), иначе у него нет кнопок ответа
+  for (const s of sessions.values()) {
+    for (const p of s.pending.values()) {
+      wsSend(ws, { type: 'notify', id: s.id, event: 'request', requestId: p.requestId,
+        choices: p.choices, message: p.message, title: s.title, at: p.at });
+    }
+  }
 
   ws.on('message', (raw) => {
     let parsed;

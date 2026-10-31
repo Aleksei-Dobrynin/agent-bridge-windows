@@ -88,6 +88,31 @@ test('reply validation: unknown request, foreign session, decision not offered',
   await c.wait((m) => m.type === 'requestClosed' && m.requestId === n.requestId, 5000, at);
 });
 
+test('pending requests are replayed to a newly connected client (D-20)', { timeout: 30000 }, async () => {
+  const n = await openRequest();
+  const late = await b.connect(DEVICE.token);
+  const first = await late.wait((m) => m.type === 'sessions');
+  const replay = await late.wait((m) => m.type === 'notify' && m.event === 'request' && m.requestId === n.requestId);
+  assert.ok(late.msgs.indexOf(first) < late.msgs.indexOf(replay), 'replay comes after the initial sessions');
+  assert.deepStrictEqual(
+    [replay.id, replay.choices, replay.message, replay.title, replay.at],
+    [sid, n.choices, n.message, n.title, n.at]);
+  assert.strictEqual(late.msgs.filter((m) => m.type === 'notify' && m.requestId === n.requestId).length, 1);
+  const at = late.mark();
+  const cAt = c.mark();
+  late.send({ type: 'reply', id: sid, requestId: n.requestId, decision: 'once' });
+  const ok = await late.wait((m) => m.type === 'replyResult' && m.requestId === n.requestId, 5000, at);
+  assert.strictEqual(ok.ok, true);
+  await c.wait((m) => m.type === 'requestClosed' && m.requestId === n.requestId, 5000, cAt);
+  // закрытый запрос следующему клиенту уже не повторяется
+  const later = await b.connect(DEVICE.token);
+  await later.wait((m) => m.type === 'sessions');
+  await sleep(500);
+  assert.ok(!later.msgs.some((m) => m.type === 'notify' && m.requestId === n.requestId));
+  late.close();
+  later.close();
+});
+
 test('PTY input from any client closes the request; focus reports and scroll do not', { timeout: 30000 }, async () => {
   const owner = await b.connect(b.owner);
   const n = await openRequest();

@@ -13,7 +13,8 @@ import okhttp3.OkHttpClient;
 
 /**
  * TLS с пиннингом самоподписанного сертификата моста.
- * fpHex == null — режим TOFU (доверяем при первом сопряжении и запоминаем).
+ * Доверие — только сертификату с отпечатком, полученным вне сети (из QR при сопряжении, P-7).
+ * Без отпечатка (fpHex == null или пустой) не доверяем никому — TOFU нет нигде (H-2, L-17).
  */
 public final class Tls {
 
@@ -36,14 +37,19 @@ public final class Tls {
         }
     }
 
-    /** Доверяем только сертификату с данным отпечатком (fpHex == null — TOFU). */
+    /** Доверяем только сертификату с данным отпечатком; без отпечатка — никому (fail closed, L-17). */
     public static X509TrustManager pinnedTrust(String fpHex) {
         return new X509TrustManager() {
             @Override public void checkClientTrusted(X509Certificate[] c, String a) { }
             @Override public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
             @Override
             public void checkServerTrusted(X509Certificate[] chain, String a) throws CertificateException {
-                if (fpHex == null) return; // TOFU при сопряжении
+                if (fpHex == null || fpHex.isEmpty()) {
+                    throw new CertificateException("Отпечаток сертификата моста неизвестен — соединение запрещено");
+                }
+                if (chain == null || chain.length == 0) {
+                    throw new CertificateException("Мост не предъявил сертификат");
+                }
                 try {
                     if (!fingerprint(chain[0]).equalsIgnoreCase(fpHex)) {
                         throw new CertificateException("Отпечаток сертификата моста не совпадает");

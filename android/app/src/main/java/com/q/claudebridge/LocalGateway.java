@@ -176,7 +176,7 @@ public final class LocalGateway {
         // прокси подставит токен только предъявителю nonce этого запуска —
         // иначе к мосту мог бы подключиться любой процесс на телефоне
         if (!nonceOk(head)) return;
-        byte[] injected = injectTokenCookie(head, token);
+        byte[] injected = upgradeHead(head, token);
 
         SSLSocket backend = (SSLSocket) Tls.socketFactory(fp).createSocket();
         try {
@@ -232,14 +232,29 @@ public final class LocalGateway {
                 expected.getBytes(StandardCharsets.ISO_8859_1));
     }
 
-    /** Вставить Cookie с токеном перед завершающей пустой строкой заголовка. */
-    private static byte[] injectTokenCookie(byte[] head, String token) {
+    /** Origin, который мост пропускает для WebView (bridge/lib/origin.js WEBVIEW_ORIGIN). */
+    static final String WEBVIEW_ORIGIN = "http://127.0.0.1:38471";
+
+    /**
+     * Заголовок апгрейда для моста: Origin заменяется фиксированным WEBVIEW_ORIGIN (D-15.12 —
+     * если порт 38471 был занят и шлюз взял случайный, allowlist моста иначе ответил бы 403),
+     * перед завершающей пустой строкой добавляется Cookie с токеном.
+     */
+    static byte[] upgradeHead(byte[] head, String token) {
         String s = new String(head, StandardCharsets.ISO_8859_1);
         String safe = token.replaceAll("[\\r\\n]", ""); // токен — hex, перестрахуемся
-        // head оканчивается на CRLFCRLF: срезаем его и дописываем строку Cookie
-        String out = s.substring(0, s.length() - 4)
-                + "\r\nCookie: bridgeToken=" + safe + "\r\n\r\n";
-        return out.getBytes(StandardCharsets.ISO_8859_1);
+        // head оканчивается на CRLFCRLF: срезаем его, выкидываем Origin и дописываем свои строки
+        String[] lines = s.substring(0, s.length() - 4).split("\r\n", -1);
+        StringBuilder out = new StringBuilder(lines[0]); // строка запроса GET …
+        for (int i = 1; i < lines.length; i++) {
+            int colon = lines[i].indexOf(':');
+            String name = colon > 0 ? lines[i].substring(0, colon).trim() : "";
+            if (name.equalsIgnoreCase("Origin")) continue;
+            out.append("\r\n").append(lines[i]);
+        }
+        out.append("\r\nOrigin: ").append(WEBVIEW_ORIGIN)
+                .append("\r\nCookie: bridgeToken=").append(safe).append("\r\n\r\n");
+        return out.toString().getBytes(StandardCharsets.ISO_8859_1);
     }
 
     private static Thread pump(String name, Socket from, Socket to) {

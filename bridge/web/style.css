@@ -54,6 +54,23 @@ body {
 }
 #banner.hidden { display: none; }
 
+/* запрос разрешения агента: кнопки по choices от моста (D-4) */
+#reqbar { background: #1e293b; border-bottom: 2px solid #f59e0b; padding: 8px 10px; }
+#reqbar.hidden { display: none; }
+#reqText {
+  font-size: 13px; color: #fde68a; margin-bottom: 6px; cursor: pointer;
+  white-space: pre-line; max-height: 4.2em; overflow: hidden;
+}
+#reqBtns { display: flex; gap: 6px; flex-wrap: wrap; }
+#reqBtns button {
+  flex: 1 1 auto; min-width: 0; padding: 9px 10px; border: none; border-radius: 8px;
+  background: #334155; color: #fff; font-size: 14px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+#reqBtns button[data-decision="once"] { background: #16a34a; }
+#reqBtns button[data-decision="reject"] { background: #b91c1c; }
+#reqBtns button:disabled { opacity: .5; }
+
 #termwrap { flex: 1; position: relative; min-height: 0; background: #0b1120; overflow: auto; }
 #terminal {
   margin: 4px; width: max-content; min-width: calc(100% - 8px);

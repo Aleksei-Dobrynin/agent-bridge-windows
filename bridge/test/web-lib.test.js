@@ -70,3 +70,49 @@ test('replayGate: active while any scrollback replay is in progress, end is idem
   end2();
   assert.strictEqual(g.active(), false);
 });
+
+const REQ = (o = {}) => ({ type: 'notify', id: 's_a', event: 'request', requestId: 'req_1', message: 'Bash: ls',
+  title: 'w · Claude Code', at: 100, choices: [{ id: 'once', label: 'Да' }, { id: 'always', label: 'Всегда: ls *' },
+    { id: 'reject', label: 'Нет' }], ...o });
+
+test('requestStore: buttons only for request with choices; idempotent by requestId (D-4, D-20)', () => {
+  const r = CB.requestStore();
+  assert.strictEqual(r.add(REQ({ choices: [] })), null, 'no choices -> no buttons');
+  assert.strictEqual(r.add(REQ({ choices: undefined })), null);
+  assert.strictEqual(r.add(REQ({ event: 'info' })), null, 'info notify -> no buttons');
+  assert.strictEqual(r.add(REQ({ requestId: '' })), null);
+  assert.strictEqual(r.top(), null);
+  assert.strictEqual(r.add(REQ()), 'new');
+  assert.strictEqual(r.add(REQ()), 'dup', 'same requestId again (replay) -> no duplicate');
+  assert.strictEqual(r.count(), 1);
+  const t = r.top();
+  assert.deepStrictEqual(t.choices.map((c) => c.label), ['Да', 'Всегда: ls *', 'Нет'], 'labels as provided');
+  assert.strictEqual(t.message, 'Bash: ls');
+  // переподключение: мост повторяет открытые запросы — они «знакомые», не новые
+  r.reconnect();
+  assert.strictEqual(r.top(), null, 'stale entries dropped until the bridge replays them');
+  assert.strictEqual(r.add(REQ()), 'replayed');
+  assert.strictEqual(r.add(REQ({ requestId: 'req_2', at: 200 })), 'new');
+  assert.strictEqual(r.count(), 2);
+});
+
+test('requestStore: top prefers the current session, then the latest; close and retain', () => {
+  const r = CB.requestStore();
+  r.add(REQ({ id: 's_a', requestId: 'req_a', at: 100 }));
+  r.add(REQ({ id: 's_b', requestId: 'req_b', at: 300 }));
+  r.add(REQ({ id: 's_a', requestId: 'req_a2', at: 200 }));
+  assert.strictEqual(r.top().requestId, 'req_b');
+  assert.strictEqual(r.top('s_a').requestId, 'req_a2');
+  assert.strictEqual(r.top('s_x').requestId, 'req_b');
+  assert.strictEqual(r.close('s_a', 'req_a2'), true);
+  assert.strictEqual(r.close('s_a', 'req_a2'), false);
+  assert.strictEqual(r.top('s_a').requestId, 'req_a');
+  r.retain(['s_a']);
+  assert.strictEqual(r.top().requestId, 'req_a');
+  assert.strictEqual(r.count(), 1);
+});
+
+test('buildReply: semantic reply for a request (D-4)', () => {
+  assert.deepStrictEqual(CB.buildReply({ id: 's_a', requestId: 'req_1' }, 'always'),
+    { type: 'reply', id: 's_a', requestId: 'req_1', decision: 'always' });
+});

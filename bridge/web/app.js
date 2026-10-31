@@ -495,6 +495,10 @@ function connect() {
   ws.onopen = () => {
     reconnectDelay = 500;
     setStatus('🟢'); // в панели показываем только индикатор, чтобы не занимать место
+    // D-20: открытые запросы мост пришлёт заново сразу после sessions
+    requests.reconnect();
+    replying = null;
+    renderRequest();
     if (current) attach(current, false);
   };
 
@@ -506,6 +510,8 @@ function connect() {
         projects = m.projects || [];
         agents = Array.isArray(m.agents) ? m.agents : [];
         defaultAgent = m.defaultAgent || (agents[0] && agents[0].id) || null;
+        requests.retain(sessions.filter((s) => s.alive).map((s) => s.id));
+        renderRequest();
         renderTabs();
         if (current && !sessions.find((s) => s.id === current)) {
           current = sessions.length ? sessions[0].id : null;
@@ -538,6 +544,12 @@ function connect() {
         break;
       case 'notify':
         onNotify(m);
+        break;
+      case 'requestClosed':
+        onRequestClosed(m);
+        break;
+      case 'replyResult':
+        onReplyResult(m);
         break;
       case 'devices':
         renderDevices(m);
@@ -589,6 +601,7 @@ function attach(id, save) {
   const v = viewport();
   send({ type: 'attach', id, cols: v.cols, rows: v.rows });
   renderTabs();
+  renderRequest(); // запрос текущей сессии — в приоритете
 }
 
 function renderTabs() {
@@ -631,8 +644,56 @@ function beep() {
   } catch {}
 }
 
+// ---- запросы разрешений агента: кнопки по choices → reply (D-4)
+
+const requests = CB.requestStore();
+let replying = null; // requestId, на который ушёл reply и ещё нет replyResult
+
+function renderRequest() {
+  const bar = $('#reqbar');
+  const r = requests.top(current);
+  if (!r) { bar.classList.add('hidden'); return; }
+  const more = requests.count() > 1 ? ` (+${requests.count() - 1})` : '';
+  const text = $('#reqText');
+  text.textContent = (r.title ? r.title + ': ' : '') + r.message + more;
+  text.onclick = () => { if (r.id !== current) attach(r.id, true); };
+  const box = $('#reqBtns');
+  box.innerHTML = '';
+  for (const c of r.choices) {
+    const b = document.createElement('button');
+    b.textContent = c.label; // подпись — как прислал мост (D-23.6)
+    b.dataset.decision = c.id;
+    b.disabled = replying === r.requestId;
+    b.addEventListener('click', () => {
+      if (replying) return; // двойное нажатие
+      replying = r.requestId;
+      send(CB.buildReply(r, c.id));
+      renderRequest();
+    });
+    box.appendChild(b);
+  }
+  bar.classList.remove('hidden');
+}
+
+function onRequestClosed(m) {
+  if (requests.close(m.id, m.requestId) && replying === m.requestId) replying = null;
+  renderRequest();
+}
+
+function onReplyResult(m) {
+  if (m.requestId === replying) replying = null;
+  if (m.ok) requests.close(m.id, m.requestId);
+  else if (m.error === 'stale') { requests.close(m.id, m.requestId); banner('⚠ Запрос уже закрыт'); }
+  else banner('⚠ Не удалось ответить — попробуйте ещё раз');
+  renderRequest();
+}
+
 function onNotify(m) {
-  const text = `${m.title || m.id}: ${m.message}`;
+  // D-20: повтор открытого запроса (после переподключения) — только кнопки, без сигнала
+  const r = requests.add(m);
+  if (r) renderRequest();
+  if (r === 'dup' || r === 'replayed') return;
+  const text = m.title ? `${m.title}: ${m.message}` : m.message;
   const banner = $('#banner');
   banner.textContent = '🔔 ' + text;
   banner.classList.remove('hidden');

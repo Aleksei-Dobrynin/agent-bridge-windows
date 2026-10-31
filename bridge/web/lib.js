@@ -78,5 +78,65 @@
     };
   }
 
-  return { filterPaste, scrollSequence, buildCreate, confirmPrompt, confirmStatusText, replayGate };
+  /** D-4: открытые запросы разрешений, на которые можно ответить кнопками. Кнопки — только у
+   *  notify{event:'request'} с непустым choices (D-23.4/5: info и waiting без запроса — без кнопок);
+   *  подписи — как прислал мост (D-23.6). D-20: после переподключения мост повторяет открытые
+   *  запросы — reconnect() забывает прежний список (закрытые за время обрыва уходят), но помнит
+   *  requestId, чтобы повтор не сигналил как новый. */
+  function requestStore() {
+    const map = new Map(); // requestId -> { id, requestId, message, title, at, choices, seq }
+    const seen = new Set();
+    let seq = 0;
+    return {
+      /** 'new' | 'replayed' | 'dup' — запрос с кнопками; null — кнопок нет. */
+      add(m) {
+        if (!m || m.event !== 'request' || typeof m.id !== 'string' || !m.id ||
+            typeof m.requestId !== 'string' || !m.requestId) return null;
+        const choices = (Array.isArray(m.choices) ? m.choices : [])
+          .filter((c) => c && typeof c.id === 'string' && c.id && typeof c.label === 'string')
+          .map((c) => ({ id: c.id, label: c.label }));
+        if (!choices.length) return null;
+        if (map.has(m.requestId)) return 'dup';
+        map.set(m.requestId, { id: m.id, requestId: m.requestId, message: String(m.message || ''),
+          title: String(m.title || ''), at: Number(m.at) || 0, choices, seq: ++seq });
+        if (seen.has(m.requestId)) return 'replayed';
+        seen.add(m.requestId);
+        return 'new';
+      },
+      close(id, requestId) {
+        const e = map.get(requestId);
+        if (!e || e.id !== id) return false;
+        map.delete(requestId);
+        return true;
+      },
+      reconnect() { map.clear(); },
+      /** Оставить запросы только этих сессий. */
+      retain(ids) {
+        const keep = new Set(ids);
+        for (const [k, e] of map) if (!keep.has(e.id)) map.delete(k);
+      },
+      /** Запрос для показа: последний в предпочитаемой сессии, иначе последний вообще. */
+      top(preferId) {
+        let best = null;
+        let bestPref = null;
+        const later = (a, b) => !b || a.at > b.at || (a.at === b.at && a.seq > b.seq);
+        for (const e of map.values()) {
+          if (later(e, best)) best = e;
+          if (e.id === preferId && later(e, bestPref)) bestPref = e;
+        }
+        return bestPref || best;
+      },
+      count: () => map.size,
+    };
+  }
+
+  /** D-4: семантический ответ на запрос — мост сам переводит решение в действие агента. */
+  function buildReply(req, decision) {
+    return { type: 'reply', id: req.id, requestId: req.requestId, decision };
+  }
+
+  return {
+    filterPaste, scrollSequence, buildCreate, confirmPrompt, confirmStatusText, replayGate,
+    requestStore, buildReply,
+  };
 });

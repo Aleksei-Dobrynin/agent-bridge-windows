@@ -286,7 +286,7 @@ subscribe(), reply()`. События адаптера (`status`, `request`, `re
 
 #### Заголовки безопасности статики
 
-CSP заголовком (`default-src 'self'`, `script-src 'self'`, `connect-src` к loopback ws/wss,
+CSP заголовком (`default-src 'self'`, `script-src 'self'`, `connect-src 'self'`; `<meta>`-CSP страницы дополнительно разрешает loopback ws/wss для шлюза WebView;
 `object-src 'none'`, `frame-ancestors 'none'`), `X-Frame-Options: DENY`, `nosniff`,
 `Referrer-Policy: no-referrer`; путь статики — `path.normalize` + `startsWith(WEB_DIR + sep)`.
 Статика и `/health` — только владельцу или устройству.
@@ -552,7 +552,7 @@ xterm в `assets/web` перед сборкой). `versionName "0.2.0"`, `versio
 - `connect()` идемпотентен; перечитывает prefs (активный ПК/токен могли
   смениться). Эффективный адрес пишется в `useHost/usePort` (их же читают WebView
   ws-прокси и загрузка аудио).
-- URL: `wss://<host>:<port>/ws?token=<token>`; клиент — `Tls.buildClient(fp)`
+- URL: `wss://<host>:<port>/ws`, токен — в заголовке `Cookie: bridgeToken=…` (не в URL); клиент — `Tls.buildClient(fp)`
   (пиннинг, ping 20 с).
 - В `onOpen`: запрос `internet`-статуса и `registerNode` (сообщает мосту
   постоянный NodeId телефона).
@@ -627,7 +627,7 @@ loopback (фиксированные порты для стабильного or
      только запрос, содержащий `?cbnonce=<nonce>` (сверка **постоянного времени**,
      `MessageDigest.isEqual`). Nonce знает лишь наш WebView (через `wsUrl()`);
      чужое приложение подключиться не сможет.
-  2. **Токен подставляется нативно** (`injectTokenCookie`): страница токен не
+  2. **Токен подставляется нативно** (`upgradeHead`): страница токен не
      знает, прокси дописывает `Cookie: bridgeToken=…` в апгрейд-заголовок перед
      форвардингом. XSS в UI не утащит токен — он не покидает нативную часть.
 - `readHttpHead` читает заголовок побайтно до CRLFCRLF (лимит 16 КБ), не задев
@@ -681,7 +681,7 @@ token, fp, internet (флаг разрешения p2p), nodeTicket (iroh-адр
 - `RequestNotifications` — учёт событийных уведомлений (§5.2).
 - `NotifIntents` — data-URI PendingIntent'ов уведомлений (C-1).
 - Тесты: `android/app/src/test/java/com/q/claudebridge/` (`ProtocolTest`, `RequestNotificationsTest`,
-  `NotifIntentsTest`, `LocalGatewayTest`, `TlsTest`; 37 тестов), запуск — `gradlew testDebugUnitTest`.
+  `NotifIntentsTest`, `LocalGatewayTest`, `TlsTest`; 38 тестов), запуск — `gradlew testDebugUnitTest`.
   Тестовые зависимости `junit`, `org.json` — только `testImplementation`, в APK не попадают (D-15.8).
 
 ---
@@ -697,7 +697,7 @@ token, fp, internet (флаг разрешения p2p), nodeTicket (iroh-адр
 
 ### 6.1 Терминал
 
-- **xterm.js** (`@xterm/xterm` + `addon-fit`), тема тёмно-синяя, scrollback 10000.
+- **xterm.js** (`@xterm/xterm`; размер считает собственная `viewport()` в `app.js`, addon-fit не подключается), тема тёмно-синяя, scrollback 10000.
 - Ввод (`term.onData`) → `{type:'input'}`. Локальный экран **зеркалит фактический
   размер PTY** (сервер шлёт `resized`/`scrollback`); свой размер клиент лишь
   «предлагает» (`resize`), сервер применяет его, когда клиент печатает.
@@ -967,8 +967,8 @@ xterm рисует.
   каждой сессии Claude на ПК; вне сессий моста хук сразу выходит.
 - **Мост работает только в сеансе пользователя** (задача Планировщика или ярлык автозагрузки, не
   служба): до входа в Windows мост недоступен.
-- **Мост не перезапускается после падения (финальное ревью m-4):** обработчика
-  `uncaughtException` нет — необработанное исключение завершает процесс моста, и он не поднимается
+- **Мост не перезапускается после падения (финальное ревью m-4):** обработчик
+  `uncaughtException` (`lib/log.js`) лишь пишет FATAL в лог и завершает процесс моста, и он не поднимается
   до следующего входа в Windows или ручного запуска: задача Планировщика (без `RestartCount`) и
   `start-bridge.js` (запускает `server.js` отсоединённым и сразу выходит) процесс не контролируют.
   Живые сессии в keeper'ах переживают падение и подхватываются при следующем старте моста.

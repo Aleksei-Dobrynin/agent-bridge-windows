@@ -90,7 +90,9 @@ function rt(session) {
     // (agentState в meta): после рестарта моста Notification не должен открывать запрос с кнопками
     const st = session.agentState;
     const saw = !!(st && typeof st === 'object' && st.sawPermissionRequest === true);
-    session.runtime.claude = { open: null, queue: [], answered: [], sawPermissionRequest: saw, lastActiveAt: -Infinity };
+    // blind — статус waiting по уведомлению о неизвестном диалоге (D-23.4)
+    session.runtime.claude = { open: null, queue: [], answered: [], sawPermissionRequest: saw, lastActiveAt: -Infinity,
+      blind: false };
   }
   return session.runtime.claude;
 }
@@ -146,6 +148,8 @@ function create(id, cfg, opts = {}) {
     if (!p || typeof p !== 'object') return [];
     const r = rt(session);
     const sub = typeof p.agent_id === 'string' && p.agent_id !== '';
+    // D-23.4: любой хук, кроме уведомления, сам задаёт статус — «ожидание вслепую» снято
+    if (p.hook_event_name !== 'Notification') r.blind = false;
     switch (p.hook_event_name) {
       case 'PermissionRequest': {
         // диалог показывается и для субагента — запрос открываем независимо от agent_id
@@ -163,9 +167,17 @@ function create(id, cfg, opts = {}) {
         return show(r, item);
       }
       case 'Notification': {
+        // D-23.5: «ждёт ввода» через ~60 с после каждого «готово» — лишнее уведомление
+        if (p.notification_type === 'idle_prompt') return [];
         const msg = typeof p.message === 'string' && p.message ? displayText(p.message) : '';
         if (p.notification_type === 'permission_prompt') {
           if (r.open || now() - r.lastActiveAt < LATE_NOTIFICATION_MS) return [];
+          // D-23.4: сессия восстановлена после рестарта моста — диалог открыт до рестарта и мосту
+          // не известен: статус waiting, уведомление без кнопок (клавиши вслепую не отправляем)
+          if (session.restored === true) {
+            r.blind = true;
+            return [{ kind: 'notify', message: msg || 'Claude просит разрешение' }, status('waiting')];
+          }
           if (r.sawPermissionRequest) return [{ kind: 'notify', message: msg || 'Claude просит разрешение' }];
           // запасной путь: хук PermissionRequest не зарегистрирован
           return show(r, { message: msg || 'Claude просит разрешение', choices: [ONCE, REJECT], key: null });
@@ -208,10 +220,15 @@ function create(id, cfg, opts = {}) {
     if (typeof data !== 'string' || data === '' || isPassiveInput(data)) return [];
     const r = rt(session);
     r.lastActiveAt = now();
-    if (!r.open) return [];
     // Esc — отказ (ход прерывается, остальные диалоги исчезают); «4» — No в диалоге с пунктом
     // auto mode. «3» в 3-пунктовом диалоге (= No) оставляет working — принято (поправка 8 плана)
     const reject = data === '\x1b' || data === W32.ESC || data === '4';
+    if (!r.open) {
+      // D-23.4: ответ в терминале на неизвестный мосту диалог — после Esc хуков нет, статус задаём сами
+      if (!r.blind) return [];
+      r.blind = false;
+      return [status(reject ? 'idle' : 'working')];
+    }
     return finish(r, { answered: true, dropQueue: reject, idleStatus: reject ? 'idle' : 'working' });
   }
 

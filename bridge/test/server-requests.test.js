@@ -206,3 +206,34 @@ test('M-9: input that did not reach the keeper does not close the request', { ti
   assert.deepStrictEqual([res.ok, res.error], [false, 'failed'], 'D-19 п. 6: key not delivered');
   assert.ok(!d.msgs.slice(at).some((m) => m.type === 'requestClosed'));
 });
+
+test('D-23.4 / D-23.5: restored session — permission_prompt -> waiting + info without buttons; idle_prompt is silent', { timeout: 90000 }, async () => {
+  const e = await b.connect(DEVICE.token);
+  const r = await createAndAttach(e, { agent: 'claude', cwd: b.cwd });
+  assert.strictEqual(r.type, 'created');
+  const id = r.id;
+  const tok = (await e.waitOutput(id, /HOOKTOKEN:([0-9a-f]{64})/))[1];
+  e.close();
+  await b.restart(); // диалог, открытый до рестарта, мосту не известен
+  const d = await b.connect(DEVICE.token);
+  await d.wait((m) => m.type === 'sessions' && m.sessions.some((x) => x.id === id && x.alive), 20000);
+  d.send({ type: 'attach', id, cols: 120, rows: 30 });
+  let at = d.mark();
+  assert.strictEqual(await b.postHook(id, tok, { hook_event_name: 'Notification', notification_type: 'permission_prompt',
+    message: 'Claude needs your permission' }), 200);
+  const n = await d.wait((m) => m.type === 'notify' && m.id === id, 5000, at);
+  assert.strictEqual(n.event, 'info');
+  assert.strictEqual(n.message, 'Claude needs your permission');
+  assert.ok(!('requestId' in n) && !('choices' in n), 'no buttons');
+  await d.wait((m) => m.type === 'status' && m.id === id && m.status === 'waiting', 5000, at);
+  // ответ в терминале (Esc) — статус idle, хотя хуков после отказа нет
+  at = d.mark();
+  d.send({ type: 'input', id, data: '\x1b' });
+  await d.wait((m) => m.type === 'status' && m.id === id && m.status === 'idle', 5000, at);
+  // D-23.5
+  at = d.mark();
+  assert.strictEqual(await b.postHook(id, tok, { hook_event_name: 'Notification', notification_type: 'idle_prompt',
+    message: 'Claude is waiting for your input' }), 200);
+  await sleep(500);
+  assert.ok(!d.msgs.slice(at).some((m) => m.type === 'notify'), 'idle_prompt -> no notify');
+});

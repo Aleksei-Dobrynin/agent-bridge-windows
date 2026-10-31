@@ -591,6 +591,8 @@ function restoreSessions() {
       const n = parseInt(meta.id.slice(1), 10);
       if (n > seq) seq = n;
       const session = makeSession(meta);
+      // D-23.4: адаптер знает, что диалог мог открыться до рестарта моста и мосту не известен
+      session.restored = true;
       sessions.set(meta.id, session);
       connectKeeper(session, 3);
       startAgentEvents(session);

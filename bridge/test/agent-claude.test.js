@@ -371,3 +371,43 @@ test('M-6: sawPermissionRequest is persisted in agentState and survives a bridge
   // agentState отсутствует / не объект — не бросает
   assert.doesNotThrow(() => mk().onHook({ id: 'z' }, PR()));
 });
+
+const NPROMPT = { hook_event_name: 'Notification', notification_type: 'permission_prompt', message: 'Claude needs your permission' };
+
+test('D-23.4: restored session without an open request: permission_prompt -> waiting + info without buttons', () => {
+  for (const saw of [true, false]) {
+    let clock = 100000;
+    const a = mk({}, { now: () => clock });
+    // рестарт моста: сессия восстановлена (restored), runtime пустой
+    const s = { ...sess(), restored: true, agentState: saw ? { sawPermissionRequest: true } : {} };
+    const ev = a.onHook(s, NPROMPT);
+    assert.deepStrictEqual(ev, [{ kind: 'notify', message: 'Claude needs your permission' }, { kind: 'status', status: 'waiting' }],
+      'sawPermissionRequest=' + saw);
+    assert.ok(!ev.some((e) => e.kind === 'request'));
+    // ответ в терминале (хуков после Esc нет): статус не остаётся waiting
+    assert.deepStrictEqual(a.onInput(s, '\x1b[I'), [], 'passive input');
+    assert.deepStrictEqual(a.onInput(s, '\x1b'), [{ kind: 'status', status: 'idle' }]);
+    assert.deepStrictEqual(a.onInput(s, '1'), [], 'only once');
+    clock += 10000; // позже окна позднего уведомления
+    a.onHook(s, NPROMPT);
+    assert.deepStrictEqual(a.onInput(s, '1'), [{ kind: 'status', status: 'working' }]);
+    // следующий PermissionRequest в восстановленной сессии — обычный запрос с кнопками
+    assert.deepStrictEqual(kinds(a.onHook(s, PR())), ['request', 'status:waiting']);
+  }
+  // незнакомая сессия (не восстановлена) без PermissionRequest — прежний запасной путь
+  assert.deepStrictEqual(kinds(mk().onHook(sess(), NPROMPT)), ['request', 'status:waiting']);
+});
+
+test('D-23.4: hooks after the blind waiting reset it (no stale status change on later input)', () => {
+  const a = mk();
+  const s = { ...sess(), restored: true, agentState: {} };
+  a.onHook(s, NPROMPT);
+  assert.deepStrictEqual(kinds(a.onHook(s, { hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: {} })), ['status:working']);
+  assert.deepStrictEqual(a.onInput(s, '\x1b'), [], 'nothing to reset any more');
+});
+
+test('D-23.5: Notification idle_prompt -> no notify', () => {
+  const a = mk();
+  assert.deepStrictEqual(a.onHook(sess(), { hook_event_name: 'Notification', notification_type: 'idle_prompt',
+    message: 'Claude is waiting for your input' }), []);
+});

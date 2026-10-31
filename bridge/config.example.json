@@ -1,8 +1,11 @@
 {
   "port": 8790,
   "host": "auto",
-  "claudeCommand": "claude",
-  "claudeArgs": [],
+  "defaultAgent": "claude",
+  "agents": {
+    "claude": {},
+    "opencode": {}
+  },
   "defaultCwd": "~",
   "projects": [],
   "env": {},

@@ -20,6 +20,9 @@ const { installFileLog } = require('./lib/log');
 const K = require('./lib/keeper-channel');
 const { pickLanAddress } = require('./lib/lan');
 const MDNS = require('./lib/mdns');
+const { loadAgents, normalizeOptions } = require('./agents');
+const generic = require('./agents/generic');
+const { findOnPath } = require('./lib/which');
 
 const TEST_MODE = !!process.env.CLAUDE_BRIDGE_TEST; // тесты: без mDNS, QR и файлового лога
 const DATA = ensureDataDirs();
@@ -54,6 +57,26 @@ function parsePort(v) {
 // expandConfigPath -> null для относительных путей и «голой» буквы диска: такие отбрасываем
 CONFIG.projects = (Array.isArray(CONFIG.projects) ? CONFIG.projects : []).map(P.expandConfigPath).filter(Boolean);
 CONFIG.defaultCwd = P.expandConfigPath(CONFIG.defaultCwd || '') || os.homedir();
+
+// D-3/D-5: адаптеры агентов из конфига (без ключа agents — claude + opencode, если установлены)
+const AGENTS = loadAgents(CONFIG);
+console.log('  Агенты: ' + (AGENTS.list().map((a) => a.id).join(', ') || 'нет ни одного доступного'));
+
+/** Ошибка создания сессии, текст которой можно показать клиенту (без внутренних путей). */
+function userError(message) {
+  const e = new Error(message);
+  e.userMessage = message;
+  return e;
+}
+
+/** Адаптер сессии по meta: своя команда владельца или пропавший из конфига агент — generic «только зеркало». */
+function adapterFor(meta) {
+  const configured = meta.custom === true ? null : AGENTS.get(meta.agent);
+  if (configured) return configured;
+  const cmd = typeof meta.cmd === 'string' && meta.cmd ? meta.cmd : 'custom';
+  return generic.create(typeof meta.agent === 'string' && meta.agent ? meta.agent : 'custom',
+    { name: path.basename(cmd), command: cmd });
+}
 
 const WEB_DIR = path.join(__dirname, 'web');
 const VENDOR = {
@@ -229,11 +252,18 @@ function makeSession(meta) {
     clients: new Set(),
     alive: true,
     lastNotify: null,
-    status: 'idle', // idle | working | waiting — по hooks
+    status: 'idle', // idle | working | waiting — по событиям адаптера
     cols: meta.cols,
     rows: meta.rows,
     keeperPid: Number.isInteger(meta.keeperPid) && meta.keeperPid > 0 ? meta.keeperPid : null,
     lastInput: null, // клиент, печатавший последним — его размер и держим
+    agent: typeof meta.agent === 'string' && meta.agent ? meta.agent : 'custom',
+    agentState: meta.agentState && typeof meta.agentState === 'object' && !Array.isArray(meta.agentState)
+      ? meta.agentState : {},
+    adapter: adapterFor(meta),
+    runtime: {},          // состояние адаптера в памяти (не сохраняется)
+    pending: new Map(),   // requestId -> ожидающий запрос разрешения (D-4)
+    unsubscribe: null,    // отписка от событий SSE (opencode)
   };
 }
 
@@ -327,29 +357,45 @@ function connectKeeper(session, retries, state = { deadline: 0, delay: 500 }) {
 
 const BRIDGE_OWN_ENV = ['CLAUDE_BRIDGE_HOME', 'CLAUDE_BRIDGE_LISTEN_PORT', 'CLAUDE_BRIDGE_TEST'];
 
-function createSession({ cwd, command, args, title, local }) {
-  const id = 's' + (++seq) + '-' + crypto.randomBytes(3).toString('hex');
-  // Произвольную КОМАНДУ выбирают только локальные клиенты (владелец): телефон
-  // всегда запускает настроенный агент. Аргументы телефон задаёт сам — это его
-  // штатные опции запуска, а сопряжённое устройство и так управляет PTY.
-  // КАТАЛОГ телефона ограничен разрешёнными проектами (D-7), путь — канонический
-  // (иначе --resume не найдёт беседы при другом регистре/8.3/junction).
-  const cmd = (local && command) ? command : CONFIG.claudeCommand;
-  const cmdArgs = (args && args.length) ? args : (CONFIG.claudeArgs || []);
+async function createSession({ cwd, agentId, options, rawArgs, command, title, local }) {
+  // Произвольную КОМАНДУ и сырые аргументы задаёт только владелец (P-3); устройство —
+  // только id агента и id его опций (D-5): командную строку мост строит сам.
+  // КАТАЛОГ устройства ограничен разрешёнными проектами (D-7) — после P-3 это граница
+  // (D-16 п. 2); путь канонический (иначе --resume не найдёт беседы при другом регистре/8.3/junction).
+  let adapter;
+  let custom = false;
+  if (local && command) {
+    if (!findOnPath(command)) throw userError('команда не найдена: ' + command);
+    adapter = generic.create('custom', { name: path.basename(command), command, args: [] });
+    custom = true;
+  } else {
+    adapter = AGENTS.get(agentId || AGENTS.defaultId);
+    if (!adapter) throw userError('неизвестный агент: ' + String(agentId || '(нет агента по умолчанию)'));
+  }
   const fallback = P.canonicalDir(CONFIG.defaultCwd) || CONFIG.defaultCwd;
   const dir = local
     ? P.resolveLocalCwd(cwd, fallback)
     : P.resolveRemoteCwd(cwd, CONFIG.projects, fallback);
+  const opts = normalizeOptions(adapter, options);
+  const extra = local ? (rawArgs || []) : [];
+  const finalTitle = title || `${path.basename(dir) || dir} · ${adapter.name}`;
+  // opencode создаёт сессию в своём сервисе (D-12) — асинхронно
+  const spec = await adapter.spawnSpec({ cwd: dir, title: finalTitle, options: opts, rawArgs: extra });
+  if (sessions.size >= MAX_SESSIONS) throw userError('достигнут предел числа сессий');
+  const id = 's' + (++seq) + '-' + crypto.randomBytes(3).toString('hex');
 
   // Секрет канала keeper<->мост и токен хука сессии (P-1): у каждой сессии свои.
   const secret = crypto.randomBytes(32).toString('hex');
   const hookToken = T.newToken();
   const meta = {
     id,
-    cmd,
-    args: cmdArgs,
+    cmd: spec.command,
+    args: spec.args,
     cwd: dir,
-    title: title || `${path.basename(dir)} · ${path.basename(String(cmd))}`,
+    title: finalTitle,
+    agent: adapter.id,
+    ...(custom ? { custom: true } : {}),
+    agentState: spec.state || {},
     createdAt: Date.now(),
     cols: 100,
     rows: 30,
@@ -358,16 +404,17 @@ function createSession({ cwd, command, args, title, local }) {
     secret,
     hookToken,
   };
-  // env НЕ пишем в meta-файл: process.env может содержать секреты, а файл
-  // остаётся на диске. Окружение передаётся хранителю через сам процесс;
+  // env НЕ пишем в meta-файл: process.env и env адаптера (OPENCODE_PASSWORD, D-12) содержат
+  // секреты, а файл остаётся на диске. Окружение передаётся хранителю через сам процесс;
   // CLAUDE_BRIDGE_KEEPER_SECRET keeper удаляет до запуска агента.
   const extraEnv = (CONFIG.env && typeof CONFIG.env === 'object' && !Array.isArray(CONFIG.env)) ? CONFIG.env : {};
+  const agentEnv = (spec.env && typeof spec.env === 'object' && !Array.isArray(spec.env)) ? spec.env : {};
   const baseEnv = { ...process.env };
   // настройки самого моста агенту не передаются (M-11): иначе мост, запущенный
   // из сессии, унаследовал бы чужой каталог данных/порт/тестовый режим
   for (const k of BRIDGE_OWN_ENV) delete baseEnv[k];
   const childEnv = {
-    ...baseEnv, ...extraEnv,
+    ...baseEnv, ...extraEnv, ...agentEnv,
     CLAUDE_BRIDGE_SESSION: id,
     CLAUDE_BRIDGE_HOOK_TOKEN: hookToken,
     CLAUDE_BRIDGE_PORT: String(CONFIG.port),
@@ -450,7 +497,17 @@ function sessionList() {
     status: s.status,
     createdAt: s.createdAt,
     lastNotify: s.lastNotify,
+    agent: s.agent,
+    agentName: s.adapter.name,
+    scroll: s.adapter.scroll, // D-10
   }));
+}
+
+function sessionsMsg() {
+  return {
+    type: 'sessions', sessions: sessionList(), projects: CONFIG.projects || [],
+    agents: AGENTS.list(), defaultAgent: AGENTS.defaultId,
+  };
 }
 
 // ---------------------------------------------------------------- stt
@@ -1073,8 +1130,11 @@ function broadcast(obj) {
   const msg = JSON.stringify(obj);
   for (const ws of allClients) if (ws.readyState === 1) ws.send(msg);
 }
+function wsSend(ws, obj) {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+}
 function broadcastSessions() {
-  broadcast({ type: 'sessions', sessions: sessionList(), projects: CONFIG.projects || [] });
+  broadcast(sessionsMsg());
 }
 function devicesMsg(ws) {
   return {
@@ -1090,7 +1150,7 @@ wss.on('connection', (ws, req, who) => {
   ws.deviceId = who === 'owner' ? 'local' : who.id;
   allClients.add(ws);
   ws.attached = null;
-  ws.send(JSON.stringify({ type: 'sessions', sessions: sessionList(), projects: CONFIG.projects || [] }));
+  ws.send(JSON.stringify(sessionsMsg()));
 
   ws.on('message', (raw) => {
     let parsed;
@@ -1104,29 +1164,30 @@ wss.on('connection', (ws, req, who) => {
       switch (m.type) {
         case 'create': {
           if (sessions.size >= MAX_SESSIONS) {
-            ws.send(JSON.stringify({ type: 'error', message: 'Достигнут предел числа сессий' }));
+            wsSend(ws, { type: 'error', message: 'Достигнут предел числа сессий' });
             break;
           }
           if (!rateAllowCreate(ws.deviceId)) {
-            ws.send(JSON.stringify({ type: 'error', message: 'Слишком часто — подождите немного' }));
+            wsSend(ws, { type: 'error', message: 'Слишком часто — подождите немного' });
             break;
           }
-          let created;
-          try {
-            created = createSession({
-              cwd: V.str(m.cwd, 1024),
-              command: V.str(m.command, 1024),
-              args: Array.isArray(m.args) && m.args.length <= 64 &&
-                m.args.every((a) => typeof a === 'string' && a.length <= 4096) ? m.args : [],
-              title: V.cleanTitle(m.title),
-              local: ws.deviceId === 'local',
+          const local = ws.deviceId === 'local';
+          createSession({
+            cwd: V.str(m.cwd, 1024),
+            title: V.cleanTitle(m.title), // L-8
+            agentId: V.str(m.agent, 32),
+            options: m.options,
+            // P-3: сырые аргументы и своя команда — только владельцу; от устройства игнорируются
+            rawArgs: local && Array.isArray(m.args) && m.args.length <= 64 &&
+              m.args.every((a) => typeof a === 'string' && a.length <= 4096) ? m.args : [],
+            command: local ? V.str(m.command, 1024) : null,
+            local,
+          }).then((created) => wsSend(ws, { type: 'created', id: created.id }))
+            .catch((e) => {
+              console.error('  Не удалось создать сессию:', e && e.message);
+              wsSend(ws, { type: 'error',
+                message: 'Не удалось создать сессию' + (e && e.userMessage ? ': ' + e.userMessage : '') });
             });
-          } catch (e) {
-            console.error('  Не удалось создать сессию:', e && e.message);
-            ws.send(JSON.stringify({ type: 'error', message: 'не удалось создать сессию' }));
-            break;
-          }
-          ws.send(JSON.stringify({ type: 'created', id: created.id }));
           break;
         }
         case 'attach': {
@@ -1181,7 +1242,7 @@ wss.on('connection', (ws, req, who) => {
           if (s && !s.alive) { sessions.delete(s.id); broadcastSessions(); }
           break;
         case 'list':
-          ws.send(JSON.stringify({ type: 'sessions', sessions: sessionList(), projects: CONFIG.projects || [] }));
+          ws.send(JSON.stringify(sessionsMsg()));
           break;
         case 'devices':
           // список устройств — только локальным клиентам (десктоп-браузер,

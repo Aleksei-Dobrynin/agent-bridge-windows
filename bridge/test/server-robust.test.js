@@ -43,7 +43,8 @@ test('stt without python, busy tunnel port, busy main port, failing create', { t
   // порт в конфиге строкой — приводится к числу (M-7)
   fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({
     port: String(port), host: '127.0.0.1', sttPython: 'nonexistent-python-xyz',
-    claudeCommand: process.execPath, claudeArgs: ['-e', 'setInterval(()=>{},1000)'],
+    defaultAgent: 'idle',
+    agents: { idle: { type: 'generic', command: process.execPath, args: ['-e', 'setInterval(()=>{},1000)'] } },
     defaultCwd: home, projects: [home], env: {},
   }));
   fs.writeFileSync(path.join(home, 'internet.json'), JSON.stringify({ enabled: true }));

@@ -31,10 +31,12 @@ const metaFile = (id) => path.join(home, 'sessions', id + '.json');
 
 test.before(async () => {
   fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({
-    port, host: '127.0.0.1', claudeCommand: process.execPath,
-    claudeArgs: ['-e', "const e=process.env;console.log('ENV:'+[e.CLAUDE_BRIDGE_HOME,e.CLAUDE_BRIDGE_LISTEN_PORT," +
+    port, host: '127.0.0.1',
+    // агент типа claude: события хуков идут через его адаптер; командная строка — node -e
+    defaultAgent: 'claude',
+    agents: { claude: { command: process.execPath, prefixArgs: ['-e', "const e=process.env;console.log('ENV:'+[e.CLAUDE_BRIDGE_HOME,e.CLAUDE_BRIDGE_LISTEN_PORT," +
       "e.CLAUDE_BRIDGE_TEST,!!e.CLAUDE_BRIDGE_HOOK_TOKEN,e.CLAUDE_BRIDGE_PORT].join('|'));" +
-      "process.stdin.on('data',d=>process.stdout.write('ECHO:'+d));setInterval(()=>{},1000)"],
+      "process.stdin.on('data',d=>process.stdout.write('ECHO:'+d));setInterval(()=>{},1000)"] } },
     defaultCwd: home, projects: [home], env: {}, scrollbackBytes: 65536,
   }));
   startBridge();

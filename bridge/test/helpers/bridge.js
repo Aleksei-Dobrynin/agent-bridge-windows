@@ -128,6 +128,105 @@ async function cleanup(home, procs = []) {
   }
 }
 
+// ---------------------------------------------------------------- стенд подплана 2
+// Мост в изолированном каталоге с конфигом агентов, клиенты с ожиданием сообщений и вывода.
+
+const FAKE_AGENT = path.join(__dirname, '..', 'fixtures', 'fake-agent.js');
+const DEVICE = { id: 'devtest00001', token: 'd'.repeat(48), name: 'Test phone', addedAt: '2026-10-31T00:00:00.000Z' };
+
+function stripAnsi(s) {
+  return String(s)
+    .replace(/\x1b\[[0-9;?<>=]*[ -\/]*[@-~]/g, '')
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+    .replace(/\x1b[@-_]/g, '');
+}
+
+/** WS-клиент: msgs, mark() — позиция для wait(…, since), вывод сессий без ANSI. */
+async function connectClient(port, pin, token) {
+  const c = await wsConnect(port, pin, { Authorization: 'Bearer ' + token });
+  if (!c) throw new Error('WS не подключился');
+  const out = {};
+  c.ws.on('message', (d) => {
+    const m = JSON.parse(d);
+    if (m.type === 'scrollback') out[m.id] = m.data;
+    else if (m.type === 'output') out[m.id] = (out[m.id] || '') + m.data;
+  });
+  return Object.assign(c, {
+    mark: () => c.msgs.length,
+    async wait(pred, timeoutMs = 10000, since = 0) {
+      const end = Date.now() + timeoutMs;
+      for (;;) {
+        for (let i = since; i < c.msgs.length; i++) if (pred(c.msgs[i])) return c.msgs[i];
+        if (Date.now() > end) throw new Error('не дождались сообщения');
+        await sleep(50);
+      }
+    },
+    async waitOutput(id, re, timeoutMs = 15000) {
+      const end = Date.now() + timeoutMs;
+      for (;;) {
+        const m = stripAnsi(out[id] || '').match(re);
+        if (m) return m;
+        if (Date.now() > end) throw new Error(`не дождались вывода ${re}; хвост: ${JSON.stringify(stripAnsi(out[id] || '').slice(-300))}`);
+        await sleep(100);
+      }
+    },
+    output: (id) => stripAnsi(out[id] || ''),
+    close: () => { try { c.ws.close(); } catch { /* закрыт */ } },
+  });
+}
+
+/** create + attach; resolve: сообщение created | error | createConflict. */
+async function createAndAttach(c, msg) {
+  const at = c.mark();
+  c.send({ type: 'create', ...msg });
+  const r = await c.wait((m) => m.type === 'created' || m.type === 'error' || m.type === 'createConflict', 20000, at);
+  if (r.type === 'created') c.send({ type: 'attach', id: r.id, cols: 120, rows: 30 });
+  return r;
+}
+
+/** Мост с заданным конфигом и сопряжёнными устройствами; stop() гасит мост, keeper'ы и каталог. */
+async function startTestBridge({ config = {}, devices = [], prefix = 'cb-it-' } = {}) {
+  const home = tempHome(prefix);
+  const cwd = fs.realpathSync.native(home);
+  const port = pickPort(22000);
+  fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({
+    port, host: '127.0.0.1', defaultCwd: cwd, projects: [cwd], env: {}, scrollbackBytes: 65536, ...config,
+  }));
+  if (devices.length) fs.writeFileSync(path.join(home, 'pairings.json'), JSON.stringify({ devices }));
+  const bridge = startBridge(home, port);
+  const clients = [];
+  let pin;
+  let owner;
+  try {
+    ({ owner, pin } = await ownerAndPin(home));
+  } catch (e) {
+    await cleanup(home, [bridge.proc]);
+    throw new Error(e.message + '; stderr: ' + bridge.stderr);
+  }
+  return {
+    home, cwd, port, owner, pin, bridge,
+    async connect(token) {
+      let c = null;
+      if (!await waitFor(async () => { try { c = await connectClient(port, pin, token); return true; } catch { return false; } }, 30000)) {
+        throw new Error('WS не подключился; stderr: ' + bridge.stderr);
+      }
+      clients.push(c);
+      return c;
+    },
+    postHook(sid, token, payload) {
+      return request(port, pin, {
+        path: '/hook', method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token, 'X-Bridge-Session': sid },
+      }, JSON.stringify(payload)).then((r) => (r ? r.statusCode : 'error'));
+    },
+    async stop() {
+      for (const c of clients) c.close();
+      await cleanup(home, [bridge.proc]);
+    },
+  };
+}
+
 module.exports = {
   sleep, waitFor, pickPort, tempHome, startBridge, ownerAndPin, request, wsConnect, keeperPids, killTree, cleanup,
+  FAKE_AGENT, DEVICE, stripAnsi, connectClient, createAndAttach, startTestBridge,
 };

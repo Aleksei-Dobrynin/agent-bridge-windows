@@ -199,7 +199,7 @@ async function createAndAttach(c, msg) {
 /** Мост с заданным конфигом и сопряжёнными устройствами; stop() гасит мост, keeper'ы и каталог. */
 /** devices — устройства с токеном (в pairings.json попадёт только хэш); rawPairings — содержимое
  *  pairings.json как есть (например, устаревшие записи с открытым токеном). */
-async function startTestBridge({ config = {}, devices = [], rawPairings = null, prefix = 'cb-it-' } = {}) {
+async function startTestBridge({ config = {}, devices = [], rawPairings = null, prefix = 'cb-it-', env = {} } = {}) {
   const home = tempHome(prefix);
   const cwd = fs.realpathSync.native(home);
   const port = pickPort(22000);
@@ -208,7 +208,7 @@ async function startTestBridge({ config = {}, devices = [], rawPairings = null, 
   }));
   if (rawPairings) fs.writeFileSync(path.join(home, 'pairings.json'), JSON.stringify(rawPairings));
   else if (devices.length) fs.writeFileSync(path.join(home, 'pairings.json'), JSON.stringify({ devices: devices.map(pairingRecord) }));
-  let bridge = startBridge(home, port);
+  let bridge = startBridge(home, port, env);
   const all = [bridge]; // все экземпляры моста (restart) — для logs()
   const procs = [bridge.proc];
   const clients = [];
@@ -233,7 +233,7 @@ async function startTestBridge({ config = {}, devices = [], rawPairings = null, 
       old.kill();
       await exited;
       if (beforeStart) await beforeStart();
-      bridge = startBridge(home, port);
+      bridge = startBridge(home, port, env);
       all.push(bridge);
       procs.push(bridge.proc);
     },

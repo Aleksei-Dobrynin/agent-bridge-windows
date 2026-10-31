@@ -23,7 +23,8 @@ const AGENTS = {
 
 let b; // мост с сопряжённым телефоном
 test.before(async () => {
-  b = await H.startTestBridge({ prefix: 'cb-cm-', devices: [DEVICE], config: { host: TEST_LAN_HOST, ...AGENTS } });
+  b = await H.startTestBridge({ prefix: 'cb-cm-', devices: [DEVICE], config: { host: TEST_LAN_HOST, ...AGENTS },
+    env: { CLAUDE_BRIDGE_TEST_COOLDOWN_MS: '1500' } }); // пауза после отказа (D-22.3) — короткая
 });
 test.after(() => b && b.stop());
 
@@ -108,10 +109,16 @@ test('--qr with a paired phone waits for the phone (D-13); QR has no manual code
   const no = runTty(b, ['--qr']);
   let req = await d.wait((m) => m.type === 'confirmRequest', 15000, atD);
   await until(() => /сопряжённом телефоне/.test(no.out()), 10000, 'подсказка про телефон: ' + no.out());
+  await until(() => no.out().includes('Сверьте код на телефоне: ' + req.checkCode), 10000, 'контрольный код (D-22.3)');
   assert.doesNotMatch(no.out(), /\[y\/N\]/, 'no console question when a phone is paired');
   d.send({ type: 'confirm', confirmId: req.confirmId, allow: false });
   assert.strictEqual(await no.done, 1);
   assert.match(no.out(), /Отклонено на телефоне/);
+  // сразу повтор — пауза после отказа (D-22.3), телефон не беспокоим
+  const cd = runTty(b, ['--qr']);
+  assert.strictEqual(await cd.done, 1);
+  assert.match(cd.out(), /повторите через \d+ с/);
+  await H.sleep(1600);
   // разрешение на телефоне
   atD = d.mark();
   const a = runTty(b, ['--qr']);
@@ -147,4 +154,17 @@ test('--device: enabling internet waits for the phone (D-13); denial ends the me
   d.send({ type: 'confirm', confirmId: req.confirmId, allow: false });
   assert.strictEqual(await a.done, 1);
   assert.match(a.out(), /Отклонено на телефоне/);
+});
+
+test('C-1 / D-22.2: after the last phone is revoked --qr refuses instead of asking the console', { timeout: 90000 }, async () => {
+  const nb = await H.startTestBridge({ prefix: 'cb-cm1-', devices: [DEVICE], config: { host: TEST_LAN_HOST, ...AGENTS } });
+  try {
+    const o = await nb.connect(nb.owner);
+    o.send({ type: 'revokeDevice', id: DEVICE.id });
+    await o.wait((m) => m.type === 'devices' && m.devices.length === 0, 5000);
+    const a = runTty(nb, ['--qr']);
+    assert.strictEqual(await a.done, 1);
+    assert.match(a.out(), /нужен сопряжённый телефон/);
+    assert.doesNotMatch(a.out(), /\[y\/N\]/);
+  } finally { await nb.stop(); }
 });

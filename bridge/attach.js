@@ -347,9 +347,14 @@ ws.on('message', (rawMsg) => {
       break;
     case 'confirmPending':
       console.log(typeof m.message === 'string' && m.message ? m.message : 'Подтвердите операцию на сопряжённом телефоне…');
+      // D-22.3: человек сверяет код с запросом на телефоне — так виден чужой (агентский) запрос
+      if (typeof m.checkCode === 'string' && /^\d{4}$/.test(m.checkCode)) console.log(`Сверьте код на телефоне: ${m.checkCode}`);
       break;
     case 'confirmResult':
-      if (!m.allow) {
+      if (m.reason === 'cooldown') {
+        const sec = Number.isInteger(m.retryAfterSec) ? m.retryAfterSec : 0;
+        die(`Недавний запрос этой операции отклонён или истёк — повторите через ${sec} с.`, 1);
+      } else if (!m.allow) {
         die(m.reason === 'timeout' ? 'Время подтверждения истекло.' : 'Отклонено на телефоне.', 1);
       } else if (m.action === 'setInternet') {
         console.log('Подтверждено на телефоне.');

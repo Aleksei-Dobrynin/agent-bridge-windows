@@ -22,6 +22,10 @@ test.after(() => b && b.stop());
 test('legacy plaintext pairing entry is not accepted (D-9)', async () => {
   assert.strictEqual(await H.wsConnect(b.port, b.pin, { Authorization: 'Bearer ' + LEGACY }), null);
   assert.match(b.logs(), /открыт/);
+  // m-4: файл переписан сразу при старте — открытого токена на диске больше нет; флаг D-22.2 не ставится
+  const raw = fs.readFileSync(path.join(b.home, 'pairings.json'), 'utf8');
+  assert.ok(!raw.includes(LEGACY), 'legacy plaintext token removed from disk at startup');
+  assert.deepStrictEqual(JSON.parse(raw), { phoneRequired: false, devices: [] });
 });
 
 test('/pair stores only the token hash; login with the token works; info notify', { timeout: 60000 }, async () => {
@@ -47,6 +51,7 @@ test('/pair stores only the token hash; login with the token works; info notify'
   assert.strictEqual(devs[0].tokenHash, H.sha256(token));
   assert.strictEqual(devs[0].id, H.sha256(token).slice(0, 12));
   assert.strictEqual(devs[0].name, 'new phone');
+  assert.strictEqual(JSON.parse(raw).phoneRequired, true, 'D-22.2: set by the first successful pairing');
 
   const d = await b.connect(token);
   await d.wait((m) => m.type === 'sessions');

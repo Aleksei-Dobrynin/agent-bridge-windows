@@ -156,17 +156,22 @@ function tokenHashOf(token) {
   return crypto.createHash('sha256').update(token).digest('hex');
 }
 {
-  // D-9: записи с открытым token (до хэширования) не поддерживаются — пропускаем (при следующем
-  // сохранении они исчезнут из файла); id всегда выводится из хэша, а не берётся из файла
+  // D-9: записи с открытым token (до хэширования) не поддерживаются — отбрасываем и сразу
+  // переписываем файл (m-4: открытые токены не остаются на диске); id всегда выводится из хэша
   const ok = pairings.devices.filter((d) => d && typeof d === 'object' && typeof d.tokenHash === 'string' &&
     TOKEN_HASH_RE.test(d.tokenHash));
   const skipped = pairings.devices.length - ok.length;
-  if (skipped) {
-    console.error(`  pairings.json: пропущено устаревших записей устройств (открытый токен или нет tokenHash): ${skipped} — ` +
-      'сопрягите эти устройства заново (claude-mobile --qr)');
-  }
   for (const d of ok) { delete d.token; d.id = d.tokenHash.slice(0, 12); }
-  pairings.devices = ok;
+  // D-22.2: после первого успешного сопряжения консольный путь подтверждения закрыт навсегда
+  // (флаг phoneRequired); уже сопряжённые устройства в файле — тоже признак сопряжения.
+  // Устаревшие записи флаг не ставят: их токены не поддерживаются (D-9).
+  pairings = { phoneRequired: pairings.phoneRequired === true || ok.length > 0, devices: ok };
+  if (skipped) {
+    // console.error после installFileLog — попадает и в файловый лог моста
+    console.error(`  pairings.json: отброшено устаревших записей устройств (открытый токен или нет tokenHash): ${skipped} — ` +
+      'сопрягите эти устройства заново (claude-mobile --qr)');
+    try { savePairings(); } catch (e) { console.error('  pairings.json: не удалось переписать: ' + e.message); }
+  }
 }
 
 function savePairings() {
@@ -225,6 +230,9 @@ function revokeDeviceById(id) {
   for (const c of allClients) {
     if (c.deviceId === id) { try { c.close(4401, 'revoked'); } catch { /* закрыт */ } }
   }
+  // D-22.2: оставшиеся устройства узнают об отзыве (агент с токеном владельца мог отозвать телефон)
+  broadcast({ type: 'notify', id: '', event: 'info', message: `Устройство отозвано: ${name}`,
+    title: 'Claude Bridge', at: Date.now() });
   // Живое iroh-соединение отозванного узла не рвётся само: перезапуск туннеля
   // сбрасывает все p2p-соединения, легитимные устройства переподключатся.
   if (tunnel && inet.enabled) { stopTunnel(); startTunnel(); }
@@ -901,6 +909,7 @@ function httpHandler(req, res) {
         name: safeName,
         addedAt: new Date().toISOString(),
       });
+      pairings.phoneRequired = true; // D-22.2: дальше — только подтверждение на телефоне
       savePairings();
       console.log(`\n  Сопряжено новое устройство: ${safeName}`);
       // уже сопряжённые устройства узнают о новом (D-15 п. 6); формат notify — D-15 п. 1
@@ -1234,7 +1243,10 @@ function devicesMsg(ws) {
 
 // ---------------------------------------------------------------- подтверждения D-13
 
-const confirmations = new Confirmations();
+// тесты (только CLAUDE_BRIDGE_TEST) укорачивают паузу после отказа (D-22.3)
+const TEST_COOLDOWN_MS = TEST_MODE ? parseInt(process.env.CLAUDE_BRIDGE_TEST_COOLDOWN_MS, 10) : NaN;
+const confirmations = new Confirmations(TEST_COOLDOWN_MS > 0 ? { cooldownMs: TEST_COOLDOWN_MS, maxCooldownMs: TEST_COOLDOWN_MS * 15 } : {});
+const PHONE_REQUIRED_MSG = 'нужен сопряжённый телефон; сброс — удалить pairings.json при остановленном мосте';
 
 function broadcastToDevices(obj) {
   const msg = JSON.stringify(obj);
@@ -1242,6 +1254,7 @@ function broadcastToDevices(obj) {
 }
 
 function finishConfirmation(e, allow, reason) {
+  confirmations.noteOutcome(e.action, allow); // D-22.3: отказ/истечение — пауза, одобрение — сброс
   broadcastToDevices({ type: 'confirmClosed', confirmId: e.confirmId });
   wsSend(e.requester, { type: 'confirmResult', confirmId: e.confirmId, action: e.action, allow, reason });
   if (allow) e.run();
@@ -1255,8 +1268,17 @@ setInterval(() => {
  *  иначе — только подтверждение на телефоне (D-13); флаг консоли тогда игнорируется. */
 function ownerConfirmed(ws, m, action, run) {
   if (pairings.devices.length === 0) {
+    // D-22.2: после первого сопряжения консольный путь закрыт, даже если телефоны отозваны
+    if (pairings.phoneRequired) { wsSend(ws, { type: 'error', message: PHONE_REQUIRED_MSG }); return; }
     if (m.confirmed === true) run();
     else wsSend(ws, { type: 'confirmRequired', action });
+    return;
+  }
+  // D-22.3: после отказа/истечения — пауза для этого действия, телефон не беспокоим
+  const wait = confirmations.cooldownMs(action);
+  if (wait > 0) {
+    wsSend(ws, { type: 'confirmResult', action, ok: false, allow: false, reason: 'cooldown',
+      retryAfterSec: Math.ceil(wait / 1000) });
     return;
   }
   const e = confirmations.request(action, ws, run);
@@ -1264,7 +1286,7 @@ function ownerConfirmed(ws, m, action, run) {
     wsSend(ws, { type: 'error', message: 'Подтверждение этой операции уже ожидается на телефоне' });
     return;
   }
-  wsSend(ws, { type: 'confirmPending', confirmId: e.confirmId, action,
+  wsSend(ws, { type: 'confirmPending', confirmId: e.confirmId, action, checkCode: e.checkCode,
     message: 'Подтвердите операцию на сопряжённом телефоне (2 минуты)…' });
   broadcastToDevices(confirmView(e));
 }
@@ -1481,8 +1503,10 @@ wss.on('connection', (ws, req, who) => {
           ownerConfirmed(ws, m, 'pairinfo', () => sendPairinfo(ws));
           break;
         case 'confirm':
-          // подтверждает только сопряжённое устройство, не владелец (D-13)
-          if (ws.deviceId && ws.deviceId !== 'local') {
+          // подтверждает только сопряжённое устройство, не владелец (D-13); m-1: соединение открыто
+          // и устройство не отозвано (сообщение могло прийти в момент отзыва)
+          if (ws.deviceId && ws.deviceId !== 'local' && ws.readyState === 1 &&
+              pairings.devices.some((d) => d.id === ws.deviceId)) {
             const e = confirmations.resolve(V.str(m.confirmId, 64));
             if (e) finishConfirmation(e, m.allow === true, m.allow === true ? 'allowed' : 'denied');
           }
@@ -1524,6 +1548,8 @@ wss.on('connection', (ws, req, who) => {
 
   ws.on('close', () => {
     allClients.delete(ws);
+    // I-2: запросивший ушёл — его ожидающие подтверждения снимаются (телефон больше не видит запрос)
+    for (const e of confirmations.cancelByRequester(ws)) broadcastToDevices({ type: 'confirmClosed', confirmId: e.confirmId });
     if (ws.attached) { const s = sessions.get(ws.attached); if (s) s.clients.delete(ws); }
   });
 });

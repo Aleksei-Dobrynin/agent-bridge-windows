@@ -15,7 +15,6 @@ import android.media.MediaRecorder;
 import android.net.http.SslError;
 import android.os.Build;
 import android.os.Bundle;
-import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
 import android.webkit.JavascriptInterface;
@@ -25,7 +24,6 @@ import android.webkit.WebChromeClient;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Button;
-import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -270,7 +268,7 @@ public class MainActivity extends Activity {
         box.addView(title);
 
         TextView hint = new TextView(this);
-        hint.setText("\nЗапустите мост на компьютере\n(npm start в папке bridge)\nи отсканируйте QR-код из терминала.\n");
+        hint.setText("\nНа компьютере выполните\nclaude-mobile --qr\nи отсканируйте QR-код.\n");
         hint.setTextColor(Color.parseColor("#94a3b8"));
         hint.setTextSize(15);
         hint.setGravity(Gravity.CENTER);
@@ -282,27 +280,6 @@ public class MainActivity extends Activity {
         scan.setTextColor(Color.WHITE);
         scan.setOnClickListener(v -> startScan());
         box.addView(scan);
-
-        TextView or = new TextView(this);
-        or.setText("\nили введите код с экрана ПК:\n");
-        or.setTextColor(Color.parseColor("#94a3b8"));
-        or.setGravity(Gravity.CENTER);
-        box.addView(or);
-
-        EditText code = new EditText(this);
-        code.setHint("например: A1B2C3");
-        code.setHintTextColor(Color.parseColor("#475569"));
-        code.setTextColor(Color.WHITE);
-        code.setGravity(Gravity.CENTER);
-        code.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS);
-        box.addView(code);
-
-        Button manual = new Button(this);
-        manual.setText("Подключиться по коду");
-        manual.setBackgroundColor(Color.parseColor("#2563eb"));
-        manual.setTextColor(Color.WHITE);
-        manual.setOnClickListener(v -> pairByCode(code.getText().toString().trim()));
-        box.addView(manual);
 
         pairStatus = new TextView(this);
         pairStatus.setTextColor(Color.parseColor("#fbbf24"));
@@ -336,9 +313,11 @@ public class MainActivity extends Activity {
                 .addOnSuccessListener(barcode -> {
                     try {
                         JSONObject j = new JSONObject(barcode.getRawValue());
-                        if (j.optInt("cb") != 1) throw new Exception("не тот QR");
-                        pair(j.getString("host"), j.optInt("port", 8790),
-                                j.getString("code"), j.optString("fp", null));
+                        String fp = j.optString("fp", "");
+                        // P-7/H-2: отпечаток из QR обязателен — код уходит только на пиннингованный мост
+                        if (j.optInt("cb") != 1 || !fp.matches("[0-9a-fA-F]{64}")) throw new Exception("не тот QR");
+                        pair(j.getString("host"), j.optInt("port", 8790), j.getString("code"),
+                                fp.toLowerCase(java.util.Locale.ROOT));
                     } catch (Exception e) {
                         setPairStatus("Это не QR-код Claude Bridge");
                     }
@@ -346,19 +325,12 @@ public class MainActivity extends Activity {
                 .addOnFailureListener(e -> setPairStatus("Сканер недоступен: " + e.getMessage()));
     }
 
-    /** Обмен кода сопряжения на постоянный токен + пиннинг сертификата. */
-    private void pair(String host, int port, String code, String expectedFp) {
+    /** Обмен кода из QR на постоянный токен; отпечаток из того же QR пиннится сразу (P-7). */
+    private void pair(String host, int port, String code, String fp) {
         setPairStatus("Сопряжение…");
         new Thread(() -> {
             try {
-                // QR: отпечаток уже проверен вне канала → пиннится expectedFp.
-                // Ручной код: TOFU, но пиннится ФАКТИЧЕСКИЙ серт рукопожатия
-                // (seen), а не значение из тела ответа — иначе MITM подтвердит
-                // собственный серт. Затем — сверка отпечатка пользователем.
-                java.util.concurrent.atomic.AtomicReference<String> seen = new java.util.concurrent.atomic.AtomicReference<>();
-                OkHttpClient client = expectedFp != null
-                        ? Tls.buildClient(expectedFp)
-                        : Tls.capturingClient(seen);
+                OkHttpClient client = Tls.buildClient(fp);
                 JSONObject body = new JSONObject()
                         .put("code", code)
                         .put("name", Build.MANUFACTURER + " " + Build.MODEL);
@@ -367,47 +339,26 @@ public class MainActivity extends Activity {
                         .post(RequestBody.create(body.toString(), MediaType.get("application/json")))
                         .build();
                 try (Response resp = client.newCall(req).execute()) {
-                    if (resp.code() == 403) { setPairStatus("Неверный код. Проверьте код в терминале ПК."); return; }
+                    if (resp.code() == 403) {
+                        setPairStatus("Код неверный или истёк. Выполните claude-mobile --qr на ПК заново.");
+                        return;
+                    }
                     if (!resp.isSuccessful()) { setPairStatus("Ошибка моста: HTTP " + resp.code()); return; }
                     JSONObject j = new JSONObject(resp.body().string());
-                    String realFp = expectedFp != null ? expectedFp : seen.get();
-                    if (realFp == null || realFp.isEmpty()) {
-                        setPairStatus("Не удалось получить сертификат моста"); return;
-                    }
                     BridgeStore.Bridge b = new BridgeStore.Bridge();
                     b.token = j.getString("token");
-                    b.fp = realFp;
+                    b.fp = fp;
                     b.host = host;
                     b.port = j.optInt("port", port);
                     b.name = j.optString("hostname", host);
                     String tk = j.optString("nodeTicket", "");
                     if (!tk.isEmpty()) b.nodeTicket = tk; // p2p-адрес, если ПК его дал
-                    if (expectedFp != null) {
-                        commitPairing(b); // QR — отпечаток уже доверен
-                    } else {
-                        runOnUiThread(() -> confirmFingerprint(b)); // ручной — сверить с ПК
-                    }
+                    commitPairing(b);
                 }
             } catch (Exception e) {
                 setPairStatus("Не удалось: " + e.getMessage());
             }
         }, "pair").start();
-    }
-
-    /** Ручное сопряжение: пользователь сверяет отпечаток с показанным в терминале ПК. */
-    private void confirmFingerprint(BridgeStore.Bridge b) {
-        String shown = b.fp.length() >= 16 ? b.fp.substring(0, 16) : b.fp;
-        new AlertDialog.Builder(this)
-                .setTitle("Проверьте отпечаток")
-                .setMessage("Отпечаток сертификата этого компьютера:\n\n" + shown + "\n\n"
-                        + "Он совпадает с тем, что показан в терминале на ПК\n"
-                        + "(строка «Отпечаток сертификата»)?\n\n"
-                        + "Если НЕ совпадает — возможен перехват в сети, не подключайтесь.")
-                .setPositiveButton("Совпадает", (d, w) -> commitPairing(b))
-                .setNegativeButton("Нет", (d, w) ->
-                        setPairStatus("Отменено: отпечаток не подтверждён"))
-                .setCancelable(false)
-                .show();
     }
 
     private void commitPairing(BridgeStore.Bridge b) {
@@ -417,7 +368,7 @@ public class MainActivity extends Activity {
         runOnUiThread(this::recreate); // перезапуск на основной экран
     }
 
-    // ---------------------------------------------- сопряжение по коду: цель
+    // ---------------------------------------------- новые компьютеры в сети
 
     /** Мосты, замеченные в сети, с которыми мы ещё не сопряжены. */
     private java.util.List<JSONObject> unpairedDiscovered() {
@@ -429,39 +380,6 @@ public class MainActivity extends Activity {
             if (fp.isEmpty() || store.byFp(fp) == null) out.add(d);
         }
         return out;
-    }
-
-    /** Сопряжение по коду: цель — новый (несопряжённый) ПК, найденный в сети. */
-    private void pairByCode(String code) {
-        if (code.isEmpty()) { setPairStatus("Введите код с экрана ПК"); return; }
-        java.util.List<JSONObject> cand = unpairedDiscovered();
-        if (cand.isEmpty()) {
-            // ещё ни одного сопряжения — сервис кладёт адрес найденного моста в prefs
-            String host = store.list().isEmpty() ? prefs.getString("host", null) : null;
-            if (host == null) {
-                setPairStatus("Новый компьютер в сети не найден — подождите пару секунд или используйте QR");
-                return;
-            }
-            pair(host, prefs.getInt("port", 8790), code, null);
-            return;
-        }
-        if (cand.size() == 1) {
-            JSONObject d = cand.get(0);
-            pair(d.optString("host"), d.optInt("port", 8790), code, null);
-            return;
-        }
-        // несколько новых ПК в сети: уточняем, к какому подключаться
-        String[] names = new String[cand.size()];
-        for (int i = 0; i < cand.size(); i++) {
-            names[i] = cand.get(i).optString("name") + "  (" + cand.get(i).optString("host") + ")";
-        }
-        new AlertDialog.Builder(this)
-                .setTitle("К какому компьютеру подключиться?")
-                .setItems(names, (dlg, which) -> {
-                    JSONObject d = cand.get(which);
-                    pair(d.optString("host"), d.optInt("port", 8790), code, null);
-                })
-                .show();
     }
 
     // ================================================== настройки компьютеров
@@ -746,13 +664,12 @@ public class MainActivity extends Activity {
         pcDialog = themedDialog("Настройки", box);
     }
 
-    /** Диалог добавления нового ПК: QR или код с экрана. */
+    /** Диалог добавления нового ПК: только QR (P-7); найденные в сети ПК — для информации. */
     private void showAddPc() {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
 
-        box.addView(themedText("На новом ПК выполните claude-mobile --qr\n" +
-                "и отсканируйте QR-код, либо введите код:", C_MUTED, 14));
+        box.addView(themedText("На новом ПК выполните claude-mobile --qr\nи отсканируйте QR-код.", C_MUTED, 14));
 
         Button scan = themedBtn("Сканировать QR-код", C_GREEN);
         scan.setOnClickListener(v -> startScan());
@@ -771,25 +688,6 @@ public class MainActivity extends Activity {
         TextView found = themedText(sb.toString(), C_MUTED, 13);
         found.setPadding(0, dp(10), 0, 0);
         box.addView(found);
-
-        EditText code = new EditText(this);
-        code.setHint("код, например A1B2C3");
-        code.setHintTextColor(Color.parseColor(C_GRAY));
-        code.setTextColor(Color.parseColor(C_TEXT));
-        android.graphics.drawable.GradientDrawable inputBg = rounded(C_INPUT, 8);
-        inputBg.setStroke(dp(1), Color.parseColor(C_GRAY));
-        code.setBackground(inputBg);
-        code.setPadding(dp(12), dp(10), dp(12), dp(10));
-        code.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS);
-        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        clp.topMargin = dp(10);
-        code.setLayoutParams(clp);
-        box.addView(code);
-
-        Button byCode = themedBtn("Подключиться по коду", C_BLUE);
-        byCode.setOnClickListener(v -> pairByCode(code.getText().toString().trim()));
-        box.addView(byCode);
 
         // сюда pair() пишет ход сопряжения («Сопряжение…», ошибки)
         pairStatus = themedText("", "#fbbf24", 13);

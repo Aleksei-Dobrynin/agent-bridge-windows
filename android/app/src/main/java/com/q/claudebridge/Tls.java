@@ -57,34 +57,6 @@ public final class Tls {
         };
     }
 
-    /**
-     * Клиент для первичного (ручного) сопряжения: доверяет любому серту (TOFU),
-     * но ЗАПИСЫВАЕТ отпечаток фактически предъявленного сертификата в seen.
-     * Пиннить надо именно его, а не значение из тела ответа /pair (иначе MITM
-     * подсунет свой серт и «подтвердит» собственный отпечаток).
-     */
-    public static OkHttpClient capturingClient(java.util.concurrent.atomic.AtomicReference<String> seen) {
-        try {
-            X509TrustManager tm = new X509TrustManager() {
-                @Override public void checkClientTrusted(X509Certificate[] c, String a) { }
-                @Override public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
-                @Override
-                public void checkServerTrusted(X509Certificate[] chain, String a) {
-                    if (chain != null && chain.length > 0) seen.set(fingerprint(chain[0]));
-                }
-            };
-            SSLContext ctx = SSLContext.getInstance("TLS");
-            ctx.init(null, new TrustManager[]{tm}, null);
-            return new OkHttpClient.Builder()
-                    .sslSocketFactory(ctx.getSocketFactory(), tm)
-                    .hostnameVerifier((h, s) -> true)
-                    .connectTimeout(5, TimeUnit.SECONDS)
-                    .build();
-        } catch (Exception e) {
-            throw new RuntimeException(e);
-        }
-    }
-
     /** Фабрика сырых TLS-сокетов с тем же пиннингом (для локального WS-прокси). */
     public static javax.net.ssl.SSLSocketFactory socketFactory(String fpHex) {
         try {

@@ -9,6 +9,7 @@ const path = require('path');
 const pty = require(path.join(__dirname, 'node_modules', 'node-pty'));
 const K = require('./lib/keeper-channel');
 const { resolveSpawn } = require('./lib/which');
+const W32 = require('./lib/win32-input');
 
 const metaPath = process.argv[2];
 const logsDir = path.join(path.dirname(metaPath), '..', 'logs');
@@ -86,7 +87,8 @@ const srv = net.createServer((sock) => {
     c.on('close', () => clients.delete(c));
     K.send(c, K.fitHello({ t: 'hello', cols: term.cols, rows: term.rows, pid: term.pid }, buffer));
     return (m) => {
-      if (m.t === 'in' && typeof m.d === 'string') term.write(m.d);
+      // D-23.1: одиночный Esc ConPTY теряет после win32-input-mode-ввода — пишем его в этой кодировке
+      if (m.t === 'in' && typeof m.d === 'string') term.write(m.d === '\x1b' ? W32.ESC : m.d);
       else if (m.t === 'resize' && Number.isInteger(m.cols) && Number.isInteger(m.rows) &&
         m.cols > 0 && m.rows > 0 && m.cols <= 1000 && m.rows <= 1000) {
         try { term.resize(m.cols, m.rows); } catch { /* PTY уже закрыт */ }

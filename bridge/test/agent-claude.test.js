@@ -15,6 +15,8 @@ const PR = (extra = {}) => ({ hook_event_name: 'PermissionRequest', tool_name: '
 const okIo = (writes) => ({ write: (d) => { writes.push(d); return true; } });
 const ALL3 = [{ id: 'once', label: 'Да' }, { id: 'always', label: 'Всегда' }, { id: 'reject', label: 'Нет' }];
 const NO_ALWAYS = [{ id: 'once', label: 'Да' }, { id: 'reject', label: 'Нет' }];
+// D-23.1: Esc в кодировке win32-input-mode (нажатие + отпускание)
+const W32_ESC = '\x1b[27;1;27;1;0;1_\x1b[27;1;27;0;0;1_';
 
 test('declaration: options, wheel scroll, hook events, exe via shim', () => {
   const a = mk();
@@ -186,6 +188,20 @@ test('I-3: PostToolUse of an already answered call does not close the next reque
     [{ kind: 'requestClosed', requestId: second }, { kind: 'status', status: 'working' }]);
 });
 
+test('D-23.1: reject key is the win32-input-mode Esc; that input (from the terminal) is a reject too', async () => {
+  const a = mk();
+  const s = sess();
+  const writes = [];
+  const ev = a.onHook(s, PR());
+  const r = await a.reply(s, { requestId: ev[0].requestId }, 'reject', okIo(writes));
+  assert.strictEqual(r.ok, true);
+  assert.deepStrictEqual(writes, [W32_ESC]);
+  a.onHook(s, PR({ tool_input: { command: 'one' } }));
+  a.onHook(s, PR({ tool_input: { command: 'two' } }));
+  assert.deepStrictEqual(kinds(a.onInput(s, W32_ESC)), ['requestClosed', 'status:idle'], 'encoded Esc drops the queue');
+  assert.deepStrictEqual(a.onInput(s, '1'), []);
+});
+
 test('I-3: reject, UserPromptSubmit and Stop drop the queue (turn is over)', async () => {
   const s1 = sess();
   const a = mk();
@@ -299,7 +315,7 @@ test('reply: decision -> key; stale; M-1 invalid decision; M-2 failed write keep
   const s = sess();
   const writes = [];
   const io = okIo(writes);
-  for (const [decision, key, status] of [['once', '1', 'working'], ['always', '2', 'working'], ['reject', '\x1b', 'idle']]) {
+  for (const [decision, key, status] of [['once', '1', 'working'], ['always', '2', 'working'], ['reject', W32_ESC, 'idle']]) {
     const ev = a.onHook(s, PR());
     const r = await a.reply(s, { requestId: ev[0].requestId }, decision, io);
     assert.strictEqual(r.ok, true);

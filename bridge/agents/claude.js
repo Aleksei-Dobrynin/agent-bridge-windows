@@ -8,6 +8,7 @@ const crypto = require('crypto');
 const { npmShimExe } = require('../lib/agent-exe');
 const { findOnPath } = require('../lib/which');
 const { displayText } = require('../lib/display-text');
+const W32 = require('../lib/win32-input');
 
 const EXE_REL = ['node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe'];
 const OPTIONS = Object.freeze([
@@ -18,8 +19,9 @@ const RESUME_FLAGS = new Set(['--resume', '-r', '--continue', '-c']);
 const ONCE = { id: 'once', label: 'Да' };
 const ALWAYS = { id: 'always', label: 'Всегда' };
 const REJECT = { id: 'reject', label: 'Нет' };
-// диалог разрешения: 1 — да, 2 — всегда (текст зависит от команды), Esc — отказ; без Enter
-const KEYS = { once: '1', always: '2', reject: '\x1b' };
+// диалог разрешения: 1 — да, 2 — всегда (текст зависит от команды), Esc — отказ; без Enter.
+// D-23.1: Esc — в кодировке win32-input-mode (одиночный \x1b ConPTY может потерять)
+const KEYS = { once: '1', always: '2', reject: W32.ESC };
 // D-19 п. 4: кнопки — только для диалогов разрешения этих инструментов; в других диалогах
 // (AskUserQuestion, ExitPlanMode) клавиши 1/2 значат другое
 const BUTTON_TOOLS = new Set(['Bash', 'PowerShell', 'Edit', 'MultiEdit', 'Write', 'NotebookEdit',
@@ -209,7 +211,7 @@ function create(id, cfg, opts = {}) {
     if (!r.open) return [];
     // Esc — отказ (ход прерывается, остальные диалоги исчезают); «4» — No в диалоге с пунктом
     // auto mode. «3» в 3-пунктовом диалоге (= No) оставляет working — принято (поправка 8 плана)
-    const reject = data === '\x1b' || data === '4';
+    const reject = data === '\x1b' || data === W32.ESC || data === '4';
     return finish(r, { answered: true, dropQueue: reject, idleStatus: reject ? 'idle' : 'working' });
   }
 

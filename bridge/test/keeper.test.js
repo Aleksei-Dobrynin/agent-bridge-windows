@@ -118,3 +118,53 @@ test('startup failure (command not found) is logged, exit 1', { timeout: 20000 }
   assert.match(fs.readFileSync(log, 'utf8'), /не найдена/);
   assert.strictEqual(fs.existsSync(env.metaPath), false, 'meta removed');
 });
+
+// D-23.1 (B-1): после win32-input-mode-последовательности во вводе ConPTY теряет одиночный Esc
+// (Claude включает \x1b[?9001h, claude-mobile шлёт клавиши в этой кодировке). Keeper пишет
+// одиночный Esc из `in` как Esc в win32-input-mode — он доходит до программы.
+const RAW_ECHO = path.join(__dirname, 'fixtures', 'raw-echo.js');
+const W32_A = '\x1b[65;30;97;1;0;1_\x1b[65;30;97;0;0;1_'; // клавиша «a»
+const got = (s) => (s.match(/\[got [0-9a-f]*\]/g) || []).map((x) => x.slice(5, -1));
+test.after(() => setTimeout(() => process.exit(0), 300).unref()); // node-pty держит цикл событий
+
+test('D-23.1: ConPTY loses a lone Esc after win32-input-mode input (bug reproduced with node-pty)', { timeout: 30000 }, async () => {
+  const pty = require(path.join(__dirname, '..', 'node_modules', 'node-pty'));
+  const term = pty.spawn(process.execPath, [RAW_ECHO], { name: 'xterm-256color', cols: 80, rows: 24, cwd: __dirname, env: process.env });
+  let out = '';
+  term.onData((d) => { out += d; });
+  try {
+    assert.ok(await waitFor(() => out.includes('[raw true]')), 'child is in raw mode');
+    term.write(W32_A);
+    assert.ok(await waitFor(() => got(out).includes('61')), 'win32-input key arrives');
+    term.write('\x1b');
+    await sleep(400);
+    term.write('z');
+    assert.ok(await waitFor(() => got(out).includes('7a')), 'marker arrives');
+    assert.deepStrictEqual(got(out), ['61', '7a'], 'the lone Esc is lost (B-1)');
+  } finally {
+    spawnSync('taskkill', ['/PID', String(term.pid), '/T', '/F'], { stdio: 'ignore' });
+  }
+});
+
+test('D-23.1: keeper writes a lone Esc as win32-input-mode Esc — the child sees ESC after win32 input', { timeout: 30000 }, async (t) => {
+  const env = setup(t, 's5-test', { args: [RAW_ECHO] });
+  startKeeper(env, env.secret);
+  let ch = null;
+  assert.ok(await waitFor(async () => {
+    ch = await K.connectAuthenticated(env.meta.pipe, env.secret).catch(() => null);
+    return ch;
+  }), 'connected to keeper');
+  const msgs = [];
+  ch.onMessage((m) => msgs.push(m));
+  const screen = () => msgs.map((m) => (m.t === 'out' ? m.d : m.t === 'hello' ? m.buffer : '')).join('');
+  assert.ok(await waitFor(() => screen().includes('[raw true]')), 'child is in raw mode');
+  ch.send({ t: 'in', d: W32_A });
+  assert.ok(await waitFor(() => got(screen()).includes('61')), 'win32-input key arrives');
+  ch.send({ t: 'in', d: '\x1b' });
+  await sleep(400);
+  ch.send({ t: 'in', d: 'z' });
+  assert.ok(await waitFor(() => got(screen()).includes('7a')), 'marker arrives');
+  assert.deepStrictEqual(got(screen()), ['61', '1b', '7a'], 'Esc reaches the child');
+  ch.send({ t: 'kill' });
+  assert.ok(await waitFor(() => msgs.some((m) => m.t === 'exit')), 'exit received');
+});

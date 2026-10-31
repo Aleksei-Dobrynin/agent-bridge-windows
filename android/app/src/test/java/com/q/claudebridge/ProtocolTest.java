@@ -172,4 +172,17 @@ public class ProtocolTest {
         assertEquals(Protocol.Credentials.REPAIR, Protocol.credentials("tok", ""));
         assertEquals(Protocol.Credentials.OK, Protocol.credentials("tok", FP));
     }
+
+    @Test
+    public void revokedByCloseCodeOrHttp401() {
+        // I-1 (финальное ревью): авторизация — до WS-апгрейда, поэтому отозванное/неизвестное
+        // устройство получает HTTP 401 (onFailure), а живое соединение рвётся кодом 4401 (onClosed)
+        assertTrue(Protocol.isRevoked(4401, -1));
+        assertTrue(Protocol.isRevoked(-1, 401));
+        assertFalse(Protocol.isRevoked(1000, -1));
+        assertFalse(Protocol.isRevoked(1006, -1));
+        assertFalse(Protocol.isRevoked(-1, 403));
+        assertFalse(Protocol.isRevoked(-1, 503));
+        assertFalse(Protocol.isRevoked(-1, -1));
+    }
 }

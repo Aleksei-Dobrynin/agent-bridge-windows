@@ -604,6 +604,8 @@ public class BridgeService extends Service {
             @Override
             public void onFailure(WebSocket socket, Throwable t, Response r) {
                 Log.w(TAG, "ws failure: " + t + (r != null ? " http=" + r.code() : ""));
+                // I-1: отозванное/неизвестное устройство отклоняется до апгрейда (HTTP 401)
+                if (Protocol.isRevoked(-1, r != null ? r.code() : -1)) onRevoked();
                 onDown();
             }
 
@@ -614,19 +616,23 @@ public class BridgeService extends Service {
 
             @Override
             public void onClosed(WebSocket socket, int code, String reason) {
-                if (code == 4401) {
-                    // устройство отозвано на этом мосту: убираем его из списка;
-                    // если остались другие ПК — активным станет первый из них
-                    String afp = store.activeFp();
-                    if (afp != null) store.remove(afp);
-                    token = null;
-                    updateStatus(store.active() != null
-                            ? "Доступ отозван, переключаюсь на другой компьютер…"
-                            : "Доступ отозван — откройте приложение для сопряжения");
-                }
+                if (Protocol.isRevoked(code, -1)) onRevoked();
                 onDown();
             }
         });
+    }
+
+    /**
+     * Устройство отозвано на этом мосту (close 4401 или HTTP 401 до апгрейда): убираем ПК
+     * из списка; если остались другие ПК — активным станет первый из них.
+     */
+    private void onRevoked() {
+        String afp = store.activeFp();
+        if (afp != null) store.remove(afp);
+        token = null;
+        updateStatus(store.active() != null
+                ? "Доступ отозван, переключаюсь на другой компьютер…"
+                : "Доступ отозван — откройте приложение для сопряжения");
     }
 
     private void onDown() {

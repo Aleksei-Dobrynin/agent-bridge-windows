@@ -170,5 +170,16 @@ final class Protocol {
         return fp == null || fp.isEmpty() ? Credentials.REPAIR : Credentials.OK;
     }
 
+    // ------------------------------------------------------------ отзыв устройства (I-1)
+
+    /**
+     * Устройство отозвано (или мосту неизвестно). Живое соединение мост рвёт кодом 4401
+     * (onClosed), а новое подключение отклоняет ещё до WS-апгрейда ответом HTTP 401
+     * (OkHttp onFailure с response.code()==401). Отсутствующее значение — -1.
+     */
+    static boolean isRevoked(int closeCode, int httpCode) {
+        return closeCode == 4401 || httpCode == 401;
+    }
+
     private Protocol() { }
 }

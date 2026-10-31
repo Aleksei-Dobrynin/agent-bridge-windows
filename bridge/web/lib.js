@@ -36,11 +36,41 @@
     return { type: 'create', agent: typeof agent === 'string' && agent ? agent : null, options, cwd };
   }
 
+  /** D-22.3: контрольный код — ровно 4 цифры строкой (иное не показываем). */
+  function isCheckCode(c) {
+    return typeof c === 'string' && /^[0-9]{4}$/.test(c);
+  }
+
+  /** M-7: текст ошибки моста для баннера; без текста — общий. */
+  function errorText(m) {
+    return '⚠ ' + (m && typeof m.message === 'string' && m.message ? m.message : 'Ошибка моста');
+  }
+
+  /** M-9: заголовок системного уведомления — имя агента сессии. */
+  function notifyTitle(sessions, id) {
+    const s = Array.isArray(sessions) && id ? sessions.find((x) => x && x.id === id) : null;
+    return s && typeof s.agentName === 'string' && s.agentName ? s.agentName : 'Agent Bridge';
+  }
+
+  /** M-5: множество последних limit ключей (старые вытесняются; повторное добавление освежает). */
+  function boundedSet(limit) {
+    const set = new Set();
+    return {
+      has: (k) => set.has(k),
+      add(k) {
+        set.delete(k);
+        set.add(k);
+        while (set.size > limit) set.delete(set.values().next().value);
+      },
+      size: () => set.size,
+    };
+  }
+
   /** D-13: текст диалога подтверждения операции владельца на телефоне; D-22.3: контрольный код
    *  из 4 цифр человек сверяет с консолью ПК — показывается отдельно и крупно. */
   function confirmPrompt(m) {
     const msg = m && typeof m.message === 'string' && m.message ? m.message : 'Разрешить операцию на ПК?';
-    const code = m && typeof m.checkCode === 'string' && /^\d{4}$/.test(m.checkCode) ? m.checkCode : '';
+    const code = m && isCheckCode(m.checkCode) ? m.checkCode : '';
     return { text: msg + '\n\nЕсли вы этого не запускали — отклоните.', code };
   }
 
@@ -50,7 +80,7 @@
     if (!m) return null;
     if (m.type === 'confirmPending') {
       return '📱 ' + (m.message || 'Подтвердите операцию на телефоне') +
-        (typeof m.checkCode === 'string' && m.checkCode ? ' Код: ' + m.checkCode : '');
+        (isCheckCode(m.checkCode) ? ' Код: ' + m.checkCode : '');
     }
     if (m.type === 'confirmRequired') return '⚠ Операция требует подтверждения в консоли claude-mobile';
     if (m.type !== 'confirmResult') return null;
@@ -84,9 +114,9 @@
    *  подписи — как прислал мост (D-23.6). D-20: после переподключения мост повторяет открытые
    *  запросы — reconnect() забывает прежний список (закрытые за время обрыва уходят), но помнит
    *  requestId, чтобы повтор не сигналил как новый. */
-  function requestStore() {
+  function requestStore({ seenLimit = 500 } = {}) {
     const map = new Map(); // requestId -> { id, requestId, message, title, at, choices, seq }
-    const seen = new Set();
+    const seen = boundedSet(seenLimit); // M-5: память о виденных requestId ограничена
     let seq = 0;
     return {
       /** 'new' | 'replayed' | 'dup' — запрос с кнопками; null — кнопок нет. */
@@ -159,6 +189,6 @@
 
   return {
     filterPaste, scrollSequence, buildCreate, confirmPrompt, confirmStatusText, replayGate,
-    requestStore, buildReply, armGuard,
+    requestStore, buildReply, armGuard, boundedSet, errorText, notifyTitle,
   };
 });

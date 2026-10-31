@@ -172,3 +172,40 @@ test('filterPaste removes all format chars (Cf), line/paragraph separators -> ne
   // обычные не-ASCII символы остаются (эмодзи, кириллица, CJK)
   assert.strictEqual(CB.filterPaste('ок ' + ch(0x1f600) + ' ' + ch(0x4e2d)), 'ок ' + ch(0x1f600) + ' ' + ch(0x4e2d));
 });
+
+test('boundedSet keeps only the last N ids; requestStore seen list is bounded (review M-5)', () => {
+  const s = CB.boundedSet(3);
+  for (const k of ['a', 'b', 'c', 'd']) s.add(k);
+  assert.deepStrictEqual(['a', 'b', 'c', 'd'].map((k) => s.has(k)), [false, true, true, true]);
+  s.add('b'); // повторное добавление освежает
+  s.add('e');
+  assert.deepStrictEqual(['b', 'c', 'd', 'e'].map((k) => s.has(k)), [true, false, true, true]);
+  assert.strictEqual(s.size(), 3);
+  const r = CB.requestStore({ seenLimit: 2 });
+  for (const id of ['req_1', 'req_2', 'req_3']) r.add(REQ({ requestId: id }));
+  r.reconnect();
+  assert.strictEqual(r.add(REQ({ requestId: 'req_3' })), 'replayed');
+  assert.strictEqual(r.add(REQ({ requestId: 'req_1' })), 'new', 'forgotten id');
+  assert.strictEqual(CB.requestStore().add(REQ()), 'new', 'default limit');
+});
+
+test('confirmStatusText shows checkCode only when it is 4 digits (review M-6)', () => {
+  assert.strictEqual(CB.confirmStatusText({ type: 'confirmPending', message: 'Ждём', checkCode: '12345' }), '📱 Ждём');
+  assert.strictEqual(CB.confirmStatusText({ type: 'confirmPending', message: 'Ждём', checkCode: 'x\n1' }), '📱 Ждём');
+  assert.strictEqual(CB.confirmStatusText({ type: 'confirmPending', message: 'Ждём', checkCode: '0001' }), '📱 Ждём Код: 0001');
+});
+
+test('errorText: bridge text or a fallback (review M-7)', () => {
+  assert.strictEqual(CB.errorText({ type: 'error', message: 'нет LAN-адреса' }), '⚠ нет LAN-адреса');
+  assert.strictEqual(CB.errorText({ type: 'error' }), '⚠ Ошибка моста');
+  assert.strictEqual(CB.errorText({ type: 'error', message: '' }), '⚠ Ошибка моста');
+  assert.strictEqual(CB.errorText({ type: 'error', message: { x: 1 } }), '⚠ Ошибка моста');
+});
+
+test('notifyTitle: agent name of the session, fallback "Agent Bridge" (review M-9)', () => {
+  const list = [{ id: 's_a', agentName: 'opencode' }, { id: 's_b' }];
+  assert.strictEqual(CB.notifyTitle(list, 's_a'), 'opencode');
+  assert.strictEqual(CB.notifyTitle(list, 's_b'), 'Agent Bridge');
+  assert.strictEqual(CB.notifyTitle(list, ''), 'Agent Bridge');
+  assert.strictEqual(CB.notifyTitle(null, 's_a'), 'Agent Bridge');
+});

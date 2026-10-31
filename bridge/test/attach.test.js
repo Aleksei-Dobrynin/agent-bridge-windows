@@ -93,8 +93,8 @@ test('server: pairinfo / setInternet from owner need confirmed:true (P-9)', asyn
   const res = await H.request(port, pin, { path: '/pair', method: 'POST', headers: { 'Content-Type': 'application/json' } },
     JSON.stringify({ code: p.code, name: 'тест-телефон' }));
   assert.strictEqual(res.statusCode, 200, res.body);
-  assert.ok(await H.waitFor(() => c.msgs.some((m) => m.type === 'notify' && m.event === 'DevicePaired')));
-  assert.match(c.msgs.find((m) => m.event === 'DevicePaired').message, /тест-телефон/);
+  assert.ok(await H.waitFor(() => c.msgs.some((m) => m.type === 'notify' && m.event === 'info')));
+  assert.match(c.msgs.find((m) => m.type === 'notify' && m.event === 'info').message, /тест-телефон/);
   c.ws.close();
 });
 

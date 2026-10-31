@@ -134,7 +134,17 @@ async function cleanup(home, procs = []) {
 // Мост в изолированном каталоге с конфигом агентов, клиенты с ожиданием сообщений и вывода.
 
 const FAKE_AGENT = path.join(__dirname, '..', 'fixtures', 'fake-agent.js');
-const DEVICE = { id: 'devtest00001', token: 'd'.repeat(48), name: 'Test phone', addedAt: '2026-10-31T00:00:00.000Z' };
+// «LAN-адрес» тестового моста (config.host): мост слушает его и 127.0.0.1, pairinfo выдаёт код
+// с этим адресом — без реальной сети и без подмены интерфейсов (Windows слушает весь 127/8)
+const TEST_LAN_HOST = '127.0.0.2';
+const sha256 = (t) => crypto.createHash('sha256').update(t).digest('hex');
+/** Запись pairings.json для устройства с токеном (D-15 п. 7): только хэш, id — первые 12 hex хэша. */
+function pairingRecord({ token, name = 'Test phone', addedAt = '2026-10-31T00:00:00.000Z', ...rest }) {
+  const tokenHash = sha256(token);
+  return { ...rest, id: tokenHash.slice(0, 12), tokenHash, name, addedAt };
+}
+const DEVICE = { token: 'd'.repeat(48), name: 'Test phone', addedAt: '2026-10-31T00:00:00.000Z' };
+DEVICE.id = sha256(DEVICE.token).slice(0, 12);
 
 function stripAnsi(s) {
   return String(s)
@@ -187,14 +197,17 @@ async function createAndAttach(c, msg) {
 }
 
 /** Мост с заданным конфигом и сопряжёнными устройствами; stop() гасит мост, keeper'ы и каталог. */
-async function startTestBridge({ config = {}, devices = [], prefix = 'cb-it-' } = {}) {
+/** devices — устройства с токеном (в pairings.json попадёт только хэш); rawPairings — содержимое
+ *  pairings.json как есть (например, устаревшие записи с открытым токеном). */
+async function startTestBridge({ config = {}, devices = [], rawPairings = null, prefix = 'cb-it-' } = {}) {
   const home = tempHome(prefix);
   const cwd = fs.realpathSync.native(home);
   const port = pickPort(22000);
   fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({
     port, host: '127.0.0.1', defaultCwd: cwd, projects: [cwd], env: {}, scrollbackBytes: 65536, ...config,
   }));
-  if (devices.length) fs.writeFileSync(path.join(home, 'pairings.json'), JSON.stringify({ devices }));
+  if (rawPairings) fs.writeFileSync(path.join(home, 'pairings.json'), JSON.stringify(rawPairings));
+  else if (devices.length) fs.writeFileSync(path.join(home, 'pairings.json'), JSON.stringify({ devices: devices.map(pairingRecord) }));
   let bridge = startBridge(home, port);
   const all = [bridge]; // все экземпляры моста (restart) — для logs()
   const procs = [bridge.proc];
@@ -247,5 +260,5 @@ async function startTestBridge({ config = {}, devices = [], prefix = 'cb-it-' } 
 
 module.exports = {
   sleep, waitFor, pickPort, tempHome, startBridge, ownerAndPin, request, wsConnect, keeperPids, killTree, cleanup,
-  FAKE_AGENT, DEVICE, stripAnsi, connectClient, createAndAttach, startTestBridge,
+  FAKE_AGENT, DEVICE, TEST_LAN_HOST, pairingRecord, sha256, stripAnsi, connectClient, createAndAttach, startTestBridge,
 };

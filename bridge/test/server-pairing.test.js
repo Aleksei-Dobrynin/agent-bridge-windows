@@ -1,0 +1,67 @@
+'use strict';
+// Задача 14a (D-15 п. 7): токены устройств хранятся в pairings.json только как SHA-256-хэш;
+// /pair отдаёт токен один раз; вход по токену сравнивает хэш; deviceId — первые 12 hex хэша;
+// старые записи с открытым token не поддерживаются (D-9). Уведомление о сопряжении — event:'info'.
+const test = require('node:test');
+const assert = require('node:assert');
+const fs = require('fs');
+const path = require('path');
+const H = require('./helpers/bridge');
+
+const LEGACY = 'e'.repeat(48);
+let b;
+let token; // токен нового устройства — есть только у «телефона» (ответ /pair)
+test.before(async () => {
+  // явный host на loopback-адресе, отличном от 127.0.0.1: pairinfo выдаёт код без реальной LAN
+  b = await H.startTestBridge({ prefix: 'cb-pair-', config: { host: H.TEST_LAN_HOST }, rawPairings: { devices: [
+    { id: 'legacy000001', token: LEGACY, name: 'old phone', addedAt: '2026-01-01T00:00:00.000Z' },
+  ] } });
+});
+test.after(() => b && b.stop());
+
+test('legacy plaintext pairing entry is not accepted (D-9)', async () => {
+  assert.strictEqual(await H.wsConnect(b.port, b.pin, { Authorization: 'Bearer ' + LEGACY }), null);
+  assert.match(b.logs(), /открыт/);
+});
+
+test('/pair stores only the token hash; login with the token works; info notify', { timeout: 60000 }, async () => {
+  const o = await b.connect(b.owner);
+  let at = o.mark();
+  o.send({ type: 'pairinfo', confirmed: true }); // устройств нет — подтверждение консоли (P-9)
+  const p = await o.wait((m) => m.type === 'pairinfo', 5000, at);
+  const res = await H.request(b.port, b.pin, { path: '/pair', method: 'POST', headers: { 'Content-Type': 'application/json' } },
+    JSON.stringify({ code: p.code, name: 'new phone' }));
+  assert.strictEqual(res.statusCode, 200, res.body);
+  ({ token } = JSON.parse(res.body));
+  assert.match(token, /^[0-9a-f]{48}$/);
+
+  const n = await o.wait((m) => m.type === 'notify' && /new phone/.test(m.message || ''), 5000, at);
+  assert.strictEqual(n.event, 'info', 'D-15 п. 1: notify.event ∈ request|done|info');
+
+  const raw = fs.readFileSync(path.join(b.home, 'pairings.json'), 'utf8');
+  assert.ok(!raw.includes(token), 'token is not stored');
+  assert.ok(!raw.includes(LEGACY), 'legacy plaintext entry is not written back');
+  const devs = JSON.parse(raw).devices;
+  assert.strictEqual(devs.length, 1);
+  assert.strictEqual(devs[0].token, undefined);
+  assert.strictEqual(devs[0].tokenHash, H.sha256(token));
+  assert.strictEqual(devs[0].id, H.sha256(token).slice(0, 12));
+  assert.strictEqual(devs[0].name, 'new phone');
+
+  const d = await b.connect(token);
+  await d.wait((m) => m.type === 'sessions');
+  at = o.mark();
+  o.send({ type: 'devices' });
+  const list = await o.wait((m) => m.type === 'devices', 5000, at);
+  assert.deepStrictEqual(list.devices.map((x) => x.id), [devs[0].id]);
+  assert.ok(!JSON.stringify(list).includes('tokenHash'), 'hash is not sent to clients');
+
+  // неверный токен той же длины — отказ
+  assert.strictEqual(await H.wsConnect(b.port, b.pin, { Authorization: 'Bearer ' + 'f'.repeat(48) }), null);
+});
+
+test('after a bridge restart the paired device still logs in (hash read from file)', { timeout: 60000 }, async () => {
+  await b.restart();
+  const d = await b.connect(token);
+  await d.wait((m) => m.type === 'sessions');
+});

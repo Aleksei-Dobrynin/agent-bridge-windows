@@ -147,11 +147,26 @@ function regenPairCode() {
   return pairState;
 }
 
-// Публичный id устройства — хэш токена: по нему можно ссылаться, не раскрывая токен
-function deviceIdOf(token) {
-  return crypto.createHash('sha256').update(token).digest('hex').slice(0, 12);
+// D-15 п. 7: токен устройства хранится только как SHA-256-хэш (tokenHash) — агент той же учётки,
+// прочитав pairings.json, не получит токен телефона (и не подтвердит запрос D-13 «сам себе»).
+// Публичный id устройства — первые 12 hex хэша: по нему можно ссылаться, не раскрывая токен.
+const TOKEN_HASH_RE = /^[0-9a-f]{64}$/;
+function tokenHashOf(token) {
+  return crypto.createHash('sha256').update(token).digest('hex');
 }
-for (const d of pairings.devices) if (!d.id) d.id = deviceIdOf(d.token);
+{
+  // D-9: записи с открытым token (до хэширования) не поддерживаются — пропускаем (при следующем
+  // сохранении они исчезнут из файла); id всегда выводится из хэша, а не берётся из файла
+  const ok = pairings.devices.filter((d) => d && typeof d === 'object' && typeof d.tokenHash === 'string' &&
+    TOKEN_HASH_RE.test(d.tokenHash));
+  const skipped = pairings.devices.length - ok.length;
+  if (skipped) {
+    console.error(`  pairings.json: пропущено устаревших записей устройств (открытый токен или нет tokenHash): ${skipped} — ` +
+      'сопрягите эти устройства заново (claude-mobile --qr)');
+  }
+  for (const d of ok) { delete d.token; d.id = d.tokenHash.slice(0, 12); }
+  pairings.devices = ok;
+}
 
 function savePairings() {
   fs.writeFileSync(DATA.pairings, JSON.stringify(pairings, null, 2));
@@ -170,11 +185,13 @@ function cookieTokenOf(req) {
 function requestToken(req) {
   return bearer(req) || cookieTokenOf(req);
 }
-/** Найти устройство по токену за постоянное время (без ранней утечки по '==='). */
+/** Найти устройство по токену: сравнение SHA-256-хэшей за постоянное время, без раннего выхода. */
 function deviceByToken(t) {
   if (!t) return null;
-  for (const d of pairings.devices) if (T.safeEq(d.token, t)) return d;
-  return null;
+  const h = tokenHashOf(t);
+  let found = null;
+  for (const d of pairings.devices) if (T.safeEq(d.tokenHash, h) && !found) found = d;
+  return found;
 }
 /** Соединение с самого ПК на основной порт (трафик туннеля приходит на другой порт). */
 function ownerSocket(req) {
@@ -871,21 +888,23 @@ function httpHandler(req, res) {
       // Код одноразовый: гасим его сразу, чтобы одним подсмотренным кодом нельзя
       // было сопрячь несколько устройств (и повторно — после отзыва) за 10 минут.
       pairState.expiresAt = 0;
+      // токен уходит телефону один раз (ответ ниже); на диске — только хэш (D-15 п. 7)
       const token = crypto.randomBytes(24).toString('hex');
+      const tokenHash = tokenHashOf(token);
       // Имя устройства уже очищено V.pairBody: управляющие, bidi и zero-width
       // символы вырезаны, длина <= 64 (F13, M-6). Одно значение — для хранения и лога.
       const safeName = p.name || 'устройство';
       pairings.devices.push({
-        id: deviceIdOf(token),
-        token,
+        id: tokenHash.slice(0, 12),
+        tokenHash,
         name: safeName,
         addedAt: new Date().toISOString(),
       });
       savePairings();
       console.log(`\n  Сопряжено новое устройство: ${safeName}`);
-      // уже сопряжённые устройства узнают о новом (D-15 п. 6; запрет — D-13, подплан 2)
+      // уже сопряжённые устройства узнают о новом (D-15 п. 6); формат notify — D-15 п. 1
       broadcast({
-        type: 'notify', id: '', event: 'DevicePaired', message: `Сопряжено новое устройство: ${safeName}`,
+        type: 'notify', id: '', event: 'info', message: `Сопряжено новое устройство: ${safeName}`,
         title: 'Claude Bridge', at: Date.now(),
       });
       res.writeHead(200, { 'Content-Type': 'application/json' });

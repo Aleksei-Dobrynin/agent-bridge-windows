@@ -49,7 +49,7 @@ test('stt without python, busy tunnel port, busy main port, failing create', { t
   }));
   fs.writeFileSync(path.join(home, 'internet.json'), JSON.stringify({ enabled: true }));
   fs.writeFileSync(path.join(home, 'pairings.json'), JSON.stringify({
-    devices: [{ id: 'dev000000001', token: DEVICE, name: 'test', addedAt: new Date().toISOString() }],
+    devices: [H.pairingRecord({ token: DEVICE, name: 'test', addedAt: new Date().toISOString() })],
   }));
 
   const b = H.startBridge(home, port, { CLAUDE_BRIDGE_LISTEN_PORT: undefined });

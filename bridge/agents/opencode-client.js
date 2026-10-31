@@ -224,11 +224,14 @@ class OpencodeClient {
     }
   }
 
+  /** startedAt (performance.now() в момент запроса списка): список отражает события, полученные
+   *  до этого момента; более поздние события подписчик не должен «откатывать» по этому списку. */
   _resync(sids) {
     for (const sid of sids) {
+      const startedAt = performance.now();
       this.listPermissions(sid).then((permissions) => {
         const handler = this.subs.get(sid);
-        if (handler) this._call(handler, { type: 'bridge.resync', data: { sessionID: sid, permissions } });
+        if (handler) this._call(handler, { type: 'bridge.resync', data: { sessionID: sid, startedAt, permissions } });
       }).catch((e) => console.error('[opencode] ресинхронизация:', e.message));
     }
   }

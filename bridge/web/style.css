@@ -165,6 +165,14 @@ dialog .row { display: flex; gap: 8px; margin-top: 10px; }
 dialog .row button { flex: 1; padding: 11px; border: none; border-radius: 8px; font-size: 15px; }
 #createOk { background: #16a34a; color: #fff; }
 #createCancel { background: #475569; color: #e2e8f0; }
+#confirmText { white-space: pre-line; margin-bottom: 8px; }
+#confirmCodeBox.hidden { display: none; }
+#confirmCode {
+  font-size: 40px; font-weight: 700; letter-spacing: 10px; text-align: center;
+  font-variant-numeric: tabular-nums; margin: 6px 0 4px; color: #f8fafc;
+}
+#confirmAllow { background: #16a34a; color: #fff; }
+#confirmDeny { background: #b91c1c; color: #fff; }
 
 #status {
   flex-shrink: 0; font-size: 12px; color: #94a3b8;

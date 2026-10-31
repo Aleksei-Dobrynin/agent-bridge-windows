@@ -538,17 +538,30 @@ function connect() {
       case 'error':
         banner('⚠ ' + m.message);
         break;
+      case 'confirmRequest':
+        onConfirmRequest(m);
+        break;
+      case 'confirmClosed':
+        if (m.confirmId === confirmShown) { confirmShown = null; $('#confirmDialog').close(); }
+        break;
+      case 'confirmPending':
+      case 'confirmRequired':
+      case 'confirmResult':
+        banner(CB.confirmStatusText(m));
+        break;
     }
   };
 
   ws.onclose = () => {
     setStatus('🔴 реконнект…');
+    // ответить без связи нельзя; ожидающее подтверждение мост повторит после переподключения
+    if (confirmShown) { confirmShown = null; $('#confirmDialog').close(); }
     scheduleReconnect();
   };
   ws.onerror = () => ws.close();
 }
 
-const NO_ID_TYPES = ['create', 'list', 'devices'];
+const NO_ID_TYPES = ['create', 'list', 'devices', 'confirm'];
 function send(obj) {
   if (ws && ws.readyState === 1 && (obj.id || NO_ID_TYPES.includes(obj.type))) {
     ws.send(JSON.stringify(obj));
@@ -624,6 +637,38 @@ function onNotify(m) {
   }
   renderTabs();
 }
+
+// ------------------------------------------------------------ подтверждения D-13
+// Веб-интерфейс в WebView телефона — клиент сопряжённого устройства: получает confirmRequest.
+// Браузеру владельца на ПК мост их не шлёт.
+
+let confirmShown = null; // confirmId открытого диалога
+const confirmSeen = new Set(); // повтор после переподключения — без повторного сигнала
+
+function onConfirmRequest(m) {
+  if (typeof m.confirmId !== 'string') return;
+  confirmShown = m.confirmId;
+  const p = CB.confirmPrompt(m);
+  $('#confirmText').textContent = p.text;
+  $('#confirmCode').textContent = p.code;
+  $('#confirmCodeBox').classList.toggle('hidden', !p.code);
+  const d = $('#confirmDialog');
+  if (!d.open) d.showModal();
+  if (confirmSeen.has(m.confirmId)) return;
+  confirmSeen.add(m.confirmId);
+  if (navigator.vibrate) navigator.vibrate([120, 60, 120]);
+  beep();
+}
+
+function answerConfirm(allow) {
+  if (confirmShown) send({ type: 'confirm', confirmId: confirmShown, allow });
+  confirmShown = null;
+  $('#confirmDialog').close();
+}
+$('#confirmAllow').addEventListener('click', () => answerConfirm(true));
+$('#confirmDeny').addEventListener('click', () => answerConfirm(false));
+// Esc / «назад» — отказ, а не «молча закрыть»
+$('#confirmDialog').addEventListener('cancel', (e) => { e.preventDefault(); answerConfirm(false); });
 
 // первый тап: разрешаем звук и спрашиваем разрешение на уведомления
 document.body.addEventListener('pointerdown', function once() {

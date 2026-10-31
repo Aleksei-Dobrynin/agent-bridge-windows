@@ -33,3 +33,27 @@ test('buildCreate: only agent id and ids of enabled options (P-3)', () => {
   assert.deepStrictEqual(CB.buildCreate('', null, 'C:\w'),
     { type: 'create', agent: null, options: {}, cwd: 'C:\w' });
 });
+
+test('confirmPrompt: message, warning and 4-digit check code (D-13, D-22.3)', () => {
+  assert.deepStrictEqual(CB.confirmPrompt({ confirmId: 'cf_1', message: 'Выпустить код?', checkCode: '0427' }),
+    { text: 'Выпустить код?\n\nЕсли вы этого не запускали — отклоните.', code: '0427' });
+  const p = CB.confirmPrompt({ confirmId: 'cf_2' });
+  assert.match(p.text, /^Разрешить операцию на ПК\?/);
+  assert.strictEqual(p.code, '');
+  assert.strictEqual(CB.confirmPrompt({ checkCode: '12a4' }).code, '', 'only 4 digits');
+  assert.strictEqual(CB.confirmPrompt({ checkCode: 1234 }).code, '', 'only a string');
+});
+
+test('confirmStatusText: confirmResult incl. cooldown, confirmPending with code', () => {
+  assert.strictEqual(CB.confirmStatusText({ type: 'confirmResult', allow: false, reason: 'cooldown', retryAfterSec: 42 }),
+    '⏳ Повторить можно через 42 с — после отказа на телефоне действует пауза');
+  assert.strictEqual(CB.confirmStatusText({ type: 'confirmResult', allow: false, reason: 'cooldown', retryAfterSec: 125 }),
+    '⏳ Повторить можно через 3 мин — после отказа на телефоне действует пауза');
+  assert.match(CB.confirmStatusText({ type: 'confirmResult', allow: false, reason: 'denied' }), /Отклонено на телефоне/);
+  assert.match(CB.confirmStatusText({ type: 'confirmResult', allow: false, reason: 'timeout' }), /не ответил/);
+  assert.match(CB.confirmStatusText({ type: 'confirmResult', allow: true, reason: 'allowed' }), /Подтверждено/);
+  assert.strictEqual(CB.confirmStatusText({ type: 'confirmPending', message: 'Подтвердите на телефоне…', checkCode: '0427' }),
+    '📱 Подтвердите на телефоне… Код: 0427');
+  assert.match(CB.confirmStatusText({ type: 'confirmRequired', action: 'pairinfo' }), /claude-mobile/);
+  assert.strictEqual(CB.confirmStatusText({ type: 'output' }), null);
+});

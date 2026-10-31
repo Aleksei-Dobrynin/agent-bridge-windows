@@ -35,5 +35,33 @@
     return { type: 'create', agent: typeof agent === 'string' && agent ? agent : null, options, cwd };
   }
 
-  return { filterPaste, scrollSequence, buildCreate };
+  /** D-13: текст диалога подтверждения операции владельца на телефоне; D-22.3: контрольный код
+   *  из 4 цифр человек сверяет с консолью ПК — показывается отдельно и крупно. */
+  function confirmPrompt(m) {
+    const msg = m && typeof m.message === 'string' && m.message ? m.message : 'Разрешить операцию на ПК?';
+    const code = m && typeof m.checkCode === 'string' && /^\d{4}$/.test(m.checkCode) ? m.checkCode : '';
+    return { text: msg + '\n\nЕсли вы этого не запускали — отклоните.', code };
+  }
+
+  /** Текст баннера для ответов моста на операцию владельца (confirmPending/Required/Result);
+   *  null — не такое сообщение. D-22.3: пауза после отказа — reason 'cooldown', retryAfterSec. */
+  function confirmStatusText(m) {
+    if (!m) return null;
+    if (m.type === 'confirmPending') {
+      return '📱 ' + (m.message || 'Подтвердите операцию на телефоне') +
+        (typeof m.checkCode === 'string' && m.checkCode ? ' Код: ' + m.checkCode : '');
+    }
+    if (m.type === 'confirmRequired') return '⚠ Операция требует подтверждения в консоли claude-mobile';
+    if (m.type !== 'confirmResult') return null;
+    if (m.allow === true) return '✔ Подтверждено на телефоне';
+    if (m.reason === 'cooldown') {
+      const sec = Math.max(1, Math.ceil(Number(m.retryAfterSec) || 0));
+      const wait = sec >= 60 ? Math.ceil(sec / 60) + ' мин' : sec + ' с';
+      return '⏳ Повторить можно через ' + wait + ' — после отказа на телефоне действует пауза';
+    }
+    if (m.reason === 'timeout') return '✖ Телефон не ответил — операция отменена';
+    return '✖ Отклонено на телефоне';
+  }
+
+  return { filterPaste, scrollSequence, buildCreate, confirmPrompt, confirmStatusText };
 });

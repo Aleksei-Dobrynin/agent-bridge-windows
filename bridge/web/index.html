@@ -85,6 +85,19 @@
     </div>
   </dialog>
 
+  <dialog id="confirmDialog">
+    <h3>Подтверждение операции на ПК</h3>
+    <div id="confirmText"></div>
+    <div id="confirmCodeBox" class="hidden">
+      <label>Сверьте код с консолью ПК:</label>
+      <div id="confirmCode"></div>
+    </div>
+    <div class="row">
+      <button id="confirmAllow">Разрешить</button>
+      <button id="confirmDeny">Отклонить</button>
+    </div>
+  </dialog>
+
   <script src="/vendor/xterm.js"></script>
   <script src="lib.js"></script>
   <script src="app.js"></script>

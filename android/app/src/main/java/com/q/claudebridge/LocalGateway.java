@@ -238,7 +238,8 @@ public final class LocalGateway {
     /**
      * Заголовок апгрейда для моста: Origin заменяется фиксированным WEBVIEW_ORIGIN (D-15.12 —
      * если порт 38471 был занят и шлюз взял случайный, allowlist моста иначе ответил бы 403),
-     * перед завершающей пустой строкой добавляется Cookie с токеном.
+     * входящие Cookie и Authorization удаляются (M-3), перед завершающей пустой строкой
+     * добавляется Cookie с токеном.
      */
     static byte[] upgradeHead(byte[] head, String token) {
         String s = new String(head, StandardCharsets.ISO_8859_1);
@@ -249,7 +250,9 @@ public final class LocalGateway {
         for (int i = 1; i < lines.length; i++) {
             int colon = lines[i].indexOf(':');
             String name = colon > 0 ? lines[i].substring(0, colon).trim() : "";
-            if (name.equalsIgnoreCase("Origin")) continue;
+            // M-3: учётные данные к мосту подставляет только шлюз — чужие Cookie/Authorization выкидываем
+            if (name.equalsIgnoreCase("Origin") || name.equalsIgnoreCase("Cookie")
+                    || name.equalsIgnoreCase("Authorization")) continue;
             out.append("\r\n").append(lines[i]);
         }
         out.append("\r\nOrigin: ").append(WEBVIEW_ORIGIN)

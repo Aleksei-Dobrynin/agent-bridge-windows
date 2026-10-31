@@ -50,6 +50,18 @@ public class LocalGatewayTest {
     }
 
     @Test
+    public void incomingCookieAndAuthorizationAreStripped() {
+        // M-3: только наш Cookie с токеном доходит до моста — страница не подсунет свой
+        String out = rewrite(head("Host: x", "Cookie: bridgeToken=evil; a=b", "cookie:bridgeToken=evil2",
+                "Authorization: Bearer evil3", "AUTHORIZATION : x", "X-Cookie-Note: keep"), "ab12");
+        assertFalse(out.contains("evil"));
+        assertEquals(1, count(out.toLowerCase(), "\r\ncookie:"));
+        assertEquals(0, count(out.toLowerCase(), "\r\nauthorization"));
+        assertTrue(out.contains("\r\nCookie: bridgeToken=ab12\r\n"));
+        assertTrue(out.contains("\r\nX-Cookie-Note: keep\r\n"));
+    }
+
+    @Test
     public void originIsAddedWhenAbsentAndTokenIsSanitized() {
         String out = rewrite(head("Host: x"), "ab\r\nX-Evil: 1");
         assertTrue(out.contains("\r\nOrigin: http://127.0.0.1:38471\r\n"));

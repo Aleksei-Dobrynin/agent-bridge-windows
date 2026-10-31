@@ -18,6 +18,9 @@ const KEYS = {
 let ws = null;
 let sessions = [];
 let projects = [];
+let agents = [];          // D-5: [{ id, name, options:[{id,label,type}], scroll }] от моста
+let defaultAgent = null;
+let lastCreate = null;    // последний create — для повтора с force после createConflict
 let current = localStorage.getItem('currentSession') || null;
 let reconnectDelay = 500;
 let audioCtx = null;
@@ -496,6 +499,8 @@ function connect() {
       case 'sessions':
         sessions = m.sessions;
         projects = m.projects || [];
+        agents = Array.isArray(m.agents) ? m.agents : [];
+        defaultAgent = m.defaultAgent || (agents[0] && agents[0].id) || null;
         renderTabs();
         if (current && !sessions.find((s) => s.id === current)) {
           current = sessions.length ? sessions[0].id : null;
@@ -824,39 +829,56 @@ function renderDevices(m) {
 
 // ------------------------------------------------------------ new session dialog
 
+function renderAgentOptions() {
+  const box = $('#agentOpts');
+  box.innerHTML = '';
+  const a = agents.find((x) => x.id === $('#agentSel').value);
+  for (const o of (a && a.options) || []) {
+    if (o.type !== 'bool') continue;
+    const label = document.createElement('label');
+    label.className = 'chk';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.dataset.opt = o.id;
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(' ' + o.label));
+    box.appendChild(label);
+  }
+}
+
 $('#newBtn').addEventListener('click', () => {
-  const sel = $('#projectSel');
-  sel.innerHTML = '';
+  if (!agents.length) { banner('⚠ На ПК нет доступных агентов'); return; }
+  const psel = $('#projectSel');
+  psel.innerHTML = '';
   for (const p of projects) {
     const o = document.createElement('option');
     o.value = p; o.textContent = p;
-    sel.appendChild(o);
+    psel.appendChild(o);
   }
+  const asel = $('#agentSel');
+  asel.innerHTML = '';
+  let remembered = null;
+  try { remembered = localStorage.getItem('lastAgent'); } catch { /* нет хранилища */ }
+  for (const a of agents) {
+    const o = document.createElement('option');
+    o.value = a.id; o.textContent = a.name;
+    asel.appendChild(o);
+  }
+  asel.value = agents.some((a) => a.id === remembered) ? remembered : defaultAgent;
+  renderAgentOptions();
   $('#projectCustom').value = '';
   $('#newDialog').showModal();
 });
+$('#agentSel').addEventListener('change', renderAgentOptions);
 $('#createCancel').addEventListener('click', () => $('#newDialog').close());
 $('#createOk').addEventListener('click', () => {
   const cwd = $('#projectCustom').value.trim() || $('#projectSel').value;
-  const cargs = [];
-  if ($('#optResume').checked) cargs.push('--resume');
-  if ($('#optDanger').checked) cargs.push('--dangerously-skip-permissions');
-  // resume при живой сессии в том же каталоге: если беседа ещё открыта в ней,
-  // claude не сможет продолжить тот же файл и молча создаст КОПИЮ беседы —
-  // так в списке resume появляются дубликаты. Предлагаем вернуться в живую.
-  if (cargs.includes('--resume')) {
-    const norm = (p) => (p || '').replace(/\/+$/, '');
-    const live = sessions.filter((s) => s.alive && norm(s.cwd) === norm(cwd));
-    if (live.length && window.confirm(
-        `В «${cwd}» уже есть живая сессия: ${live[0].title}.\n` +
-        `Если беседа ещё открыта в ней, resume создаст копию беседы.\n\n` +
-        `Открыть живую сессию вместо этого?`)) {
-      $('#newDialog').close();
-      attach(live[0].id, true);
-      return;
-    }
-  }
-  send({ type: 'create', cwd, args: cargs });
+  const checked = [...document.querySelectorAll('#agentOpts input[data-opt]')]
+    .filter((x) => x.checked).map((x) => x.dataset.opt);
+  const msg = CB.buildCreate($('#agentSel').value, checked, cwd);
+  try { if (msg.agent) localStorage.setItem('lastAgent', msg.agent); } catch { /* нет хранилища */ }
+  lastCreate = msg;
+  send(msg);
   $('#newDialog').close();
 });
 

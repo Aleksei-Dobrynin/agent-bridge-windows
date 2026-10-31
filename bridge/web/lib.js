@@ -27,5 +27,13 @@
     return out;
   }
 
-  return { filterPaste, scrollSequence };
+  /** P-3: с устройства уходят только id агента и id включённых опций — команду строит мост.
+   *  Агент не выбран — null: агент по умолчанию (D-22.4). */
+  function buildCreate(agent, checkedOptionIds, cwd) {
+    const options = {};
+    for (const id of checkedOptionIds || []) if (typeof id === 'string' && id) options[id] = true;
+    return { type: 'create', agent: typeof agent === 'string' && agent ? agent : null, options, cwd };
+  }
+
+  return { filterPaste, scrollSequence, buildCreate };
 });

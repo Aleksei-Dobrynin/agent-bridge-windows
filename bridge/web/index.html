@@ -30,7 +30,7 @@
 
   <main id="termwrap">
     <div id="terminal"></div>
-    <div id="placeholder">Нет активной сессии.<br>Нажмите ＋, чтобы запустить Claude Code.</div>
+    <div id="placeholder">Нет активной сессии.<br>Нажмите ＋, чтобы запустить агента.</div>
   </main>
   <button id="toBottom" class="hidden" title="В конец">▼</button>
 
@@ -58,7 +58,7 @@
       <button data-key="ctrlc">^C</button>
     </div>
     <div id="inputrow">
-      <input id="msg" type="text" placeholder="Сообщение для Claude…" autocomplete="off">
+      <input id="msg" type="text" placeholder="Сообщение агенту…" autocomplete="off">
       <button id="send">➤</button>
     </div>
   </footer>
@@ -72,12 +72,13 @@
   </dialog>
 
   <dialog id="newDialog">
-    <h3>Новая сессия Claude Code</h3>
+    <h3>Новая сессия</h3>
+    <label>Агент:</label>
+    <select id="agentSel"></select>
     <label>Каталог проекта:</label>
     <select id="projectSel"></select>
     <input id="projectCustom" type="text" placeholder="…или свой путь">
-    <label class="chk"><input type="checkbox" id="optResume"> --resume (выбрать прошлую сессию)</label>
-    <label class="chk"><input type="checkbox" id="optDanger"> --dangerously-skip-permissions</label>
+    <div id="agentOpts"></div>
     <div class="row">
       <button id="createOk">Запустить</button>
       <button id="createCancel">Отмена</button>

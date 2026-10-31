@@ -23,3 +23,13 @@ test('scrollSequence: SGR wheel or PageUp/PageDown, at most 10 steps', () => {
   assert.strictEqual(CB.scrollSequence('bogus', 1, 1, 1), '\x1b[5~', 'unknown mode -> page keys');
   assert.strictEqual(CB.scrollSequence('wheel', 0, 1, 1), '');
 });
+
+test('buildCreate: only agent id and ids of enabled options (P-3)', () => {
+  assert.deepStrictEqual(CB.buildCreate('claude', ['resume', '', 5], 'C:\w'),
+    { type: 'create', agent: 'claude', options: { resume: true }, cwd: 'C:\w' });
+  assert.deepStrictEqual(CB.buildCreate('opencode', [], 'C:\w'),
+    { type: 'create', agent: 'opencode', options: {}, cwd: 'C:\w' });
+  // поправка 8 / D-22.4: агент не выбран -> null (агент по умолчанию на мосту)
+  assert.deepStrictEqual(CB.buildCreate('', null, 'C:\w'),
+    { type: 'create', agent: null, options: {}, cwd: 'C:\w' });
+});

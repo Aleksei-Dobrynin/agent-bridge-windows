@@ -5,7 +5,7 @@
 # Claude Bridge for Windows
 
 **Mirror coding-agent sessions — [Claude Code](https://claude.com/claude-code), [opencode](https://opencode.ai) or any terminal agent — to your phone and control them from there.**
-No cloud, no middlemen: the phone talks directly to your PC — over the local network, or through a p2p tunnel when you are away.
+No cloud account and no server of your own: on the local network the phone talks to your PC directly, and when you are away — through an encrypted p2p tunnel.
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/PC-Windows%2010%2F11-informational)](#requirements)
@@ -25,7 +25,7 @@ No cloud, no middlemen: the phone talks directly to your PC — over the local n
 
 A bridge (Node.js) on your PC runs agents in Windows pseudo-terminals (ConPTY) and mirrors them to an Android app. The phone shows the same terminal as the PC: you can type, switch and start sessions, answer permission requests with buttons right in the notification, and get notified when the agent is done.
 
-All traffic goes **directly between your devices**: over the office or home Wi-Fi on the local network, otherwise through an encrypted p2p tunnel (iroh/QUIC). Traffic is protected by TLS with certificate pinning; only phones paired via QR have access.
+How traffic flows: on the office or home Wi-Fi — **directly over the local network**; elsewhere — through an iroh/QUIC p2p tunnel that may go through the public Number 0 (n0) relay and discovery servers. Content is end-to-end encrypted (TLS pinned to the bridge certificate plus iroh encryption), but the operator of those servers sees metadata: IP addresses, NodeId, time and traffic volume. Only phones paired via QR have access.
 
 ### Features
 

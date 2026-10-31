@@ -33,11 +33,24 @@ function authHeader(password) {
 }
 
 class OpencodeClient {
-  /** start() — запустить сервис (`opencode service start`), если он не отвечает. */
-  constructor({ file = serviceFilePath(), start = null, timeoutMs = 5000 } = {}) {
+  /** start() — запустить сервис (`opencode service start`), если он не отвечает.
+   *  SSE: backoffMs..maxBackoffMs — пауза перед переподключением (удваивается, сброс после 200);
+   *  idleMs — тишина в потоке, после которой он считается мёртвым (v2.1.4 шлёт `: heartbeat` раз в 15 с). */
+  constructor({ file = serviceFilePath(), start = null, timeoutMs = 5000,
+    backoffMs = 500, maxBackoffMs = 10000, idleMs = 45000 } = {}) {
     this.file = file;
     this.start = start;
     this.timeoutMs = timeoutMs;
+    this.minBackoff = backoffMs;
+    this.maxBackoff = maxBackoffMs;
+    this.idleMs = idleMs;
+    this.subs = new Map();
+    this.sse = null;
+    this.sseOpen = false;
+    this.backoff = backoffMs;
+    this.reconnectTimer = null;
+    this.idleTimer = null;
+    this.closed = false;
   }
 
   info() { return readServiceFile(this.file); }
@@ -108,6 +121,157 @@ class OpencodeClient {
     if (r.status === 404) return 'stale';
     throw new Error(`opencode: ответ на разрешение не принят (HTTP ${r.status})`);
   }
+
+  /** Подписка на события одной сессии. handler(evt) получает события SSE с этим sessionID
+   *  и синтетическое { type:'bridge.resync', data:{ sessionID, permissions } } после (пере)подключения:
+   *  поток общий для всех сессий и пропущенное при обрыве не досылает (живая проба v2.1.4). */
+  subscribe(sid, handler) {
+    this.closed = false;
+    this.subs.set(sid, handler);
+    if (this.sseOpen) this._resync([sid]);
+    else this._ensureSse();
+    return () => {
+      if (this.subs.get(sid) === handler) this.subs.delete(sid);
+      if (!this.subs.size) this._closeSse();
+    };
+  }
+
+  close() {
+    this.closed = true;
+    this.subs.clear();
+    this._closeSse();
+  }
+
+  _ensureSse() {
+    if (this.closed || this.sse || this.reconnectTimer || !this.subs.size) return;
+    const info = this.info();
+    if (!info) { this._scheduleReconnect(); return; }
+    const u = new URL(info.url + '/api/event');
+    const mod = u.protocol === 'https:' ? https : http;
+    const req = mod.request(u, {
+      method: 'GET', agent: false,
+      headers: { Authorization: authHeader(info.password), Accept: 'text/event-stream' },
+    }, (res) => {
+      if (this.sse !== req) { res.resume(); return; }
+      if (res.statusCode !== 200) { res.resume(); this._dropSse(req); return; }
+      this.sseOpen = true;
+      this.backoff = this.minBackoff;
+      this._touch(req);
+      this._resync([...this.subs.keys()]);
+      // Buffer-чанки: парсер сам декодирует UTF-8 потоково (символ может быть разрезан между чанками)
+      const feed = sseParser((evt) => this._dispatch(evt));
+      res.on('data', (chunk) => { this._touch(req); feed(chunk); });
+      // обрыв со стороны сервиса: в зависимости от версии Node — end, error(aborted) или только close;
+      // _dropSse идемпотентен
+      res.on('end', () => this._dropSse(req));
+      res.on('error', () => this._dropSse(req));
+      res.on('close', () => this._dropSse(req));
+    });
+    req.on('error', () => this._dropSse(req));
+    this.sse = req;
+    this._touch(req); // ожидание заголовков ответа тоже ограничено idleMs
+    req.end();
+  }
+
+  /** Сторожевой таймер тишины: любой байт потока (в т.ч. `: heartbeat`) продлевает соединение. */
+  _touch(req) {
+    clearTimeout(this.idleTimer);
+    this.idleTimer = setTimeout(() => this._dropSse(req), this.idleMs);
+    if (this.idleTimer.unref) this.idleTimer.unref();
+  }
+
+  _dropSse(req) {
+    if (this.sse !== req) return;
+    clearTimeout(this.idleTimer);
+    this.idleTimer = null;
+    this.sse = null;
+    this.sseOpen = false;
+    try { req.destroy(); } catch { /* уже закрыт */ }
+    this._scheduleReconnect();
+  }
+
+  _scheduleReconnect() {
+    if (this.closed || this.reconnectTimer || !this.subs.size) return;
+    this.reconnectTimer = setTimeout(() => { this.reconnectTimer = null; this._ensureSse(); }, this.backoff);
+    this.backoff = Math.min(this.backoff * 2, this.maxBackoff);
+  }
+
+  _closeSse() {
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    clearTimeout(this.idleTimer);
+    this.idleTimer = null;
+    const req = this.sse;
+    this.sse = null;
+    this.sseOpen = false;
+    if (req) { try { req.destroy(); } catch { /* уже закрыт */ } }
+  }
+
+  _dispatch(evt) {
+    if (!evt || typeof evt.type !== 'string' || !evt.data || typeof evt.data !== 'object') return;
+    const handler = typeof evt.data.sessionID === 'string' ? this.subs.get(evt.data.sessionID) : null;
+    if (!handler) return;
+    this._call(handler, evt);
+  }
+
+  /** Ошибка обработчика (синхронная или отклонённый промис) не рвёт поток и не мешает другим сессиям. */
+  _call(handler, evt) {
+    try {
+      const r = handler(evt);
+      if (r && typeof r.catch === 'function') r.catch((e) => console.error('[opencode] обработчик события:', e && e.message));
+    } catch (e) {
+      console.error('[opencode] обработчик события:', e && e.message);
+    }
+  }
+
+  _resync(sids) {
+    for (const sid of sids) {
+      this.listPermissions(sid).then((permissions) => {
+        const handler = this.subs.get(sid);
+        if (handler) this._call(handler, { type: 'bridge.resync', data: { sessionID: sid, permissions } });
+      }).catch((e) => console.error('[opencode] ресинхронизация:', e.message));
+    }
+  }
 }
 
-module.exports = { OpencodeClient, serviceFilePath, readServiceFile, authHeader };
+/** Парсер text/event-stream: накапливает строки `data:` до пустой строки, отдаёт JSON.
+ *  Чанки — строки или Buffer (UTF-8 декодируется потоково). Событие длиннее maxEventBytes
+ *  отбрасывается целиком, разбор продолжается со следующего события. */
+function sseParser(onEvent, { maxEventBytes = 8e6 } = {}) {
+  const decoder = new TextDecoder('utf-8');
+  let buf = '';
+  let data = [];
+  let size = 0;
+  let skipping = false;
+  return (chunk) => {
+    buf += typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true });
+    let i;
+    while ((i = buf.indexOf('\n')) >= 0) {
+      let line = buf.slice(0, i);
+      buf = buf.slice(i + 1);
+      if (line.endsWith('\r')) line = line.slice(0, -1);
+      if (line === '') {
+        const text = data.join('\n');
+        const had = data.length;
+        data = [];
+        size = 0;
+        if (skipping) { skipping = false; continue; }
+        if (!had) continue;
+        let evt;
+        try { evt = JSON.parse(text); } catch { continue; }
+        onEvent(evt);
+      } else if (skipping) {
+        // остаток слишком большого события
+      } else if (line.startsWith('data:')) {
+        const part = line.slice(5).replace(/^ /, '');
+        size += part.length + 1;
+        if (size > maxEventBytes) { skipping = true; data = []; size = 0; } else data.push(part);
+      }
+      // `: комментарий` (heartbeat), `event:`, `id:`, `retry:` — не используются
+    }
+    // незавершённая строка тоже ограничена: иначе поток без переводов строк съест память
+    if (buf.length + size > maxEventBytes) { buf = ''; data = []; size = 0; skipping = true; }
+  };
+}
+
+module.exports = { OpencodeClient, serviceFilePath, readServiceFile, authHeader, sseParser };

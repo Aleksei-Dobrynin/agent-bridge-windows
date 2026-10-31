@@ -7,7 +7,7 @@ const path = require('path');
 const http = require('http');
 
 function startFakeOpencode({ password = 'test-pw' } = {}) {
-  const state = { sessions: [], replies: [], perms: new Map(), sse: new Set(), unauthorized: 0, sseConnects: 0 };
+  const state = { sessions: [], replies: [], perms: new Map(), sse: new Set(), unauthorized: 0, sseConnects: 0, sseConnectTimes: [], sseStatus: 200 };
   const expected = 'Basic ' + Buffer.from('opencode:' + password).toString('base64');
 
   function emit(evt) {
@@ -50,10 +50,12 @@ function startFakeOpencode({ password = 'test-pw' } = {}) {
         return json(200, { data: { id } });
       }
       if (req.method === 'GET' && u.pathname === '/api/event') {
-        if (state.sseStatus && state.sseStatus !== 200) { res.writeHead(state.sseStatus); res.end(); state.sseConnects++; return undefined; }
-        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
-        res.write(': connected\n\n');
         state.sseConnects++;
+        state.sseConnectTimes.push(Date.now());
+        if (state.sseStatus !== 200) { res.writeHead(state.sseStatus); res.end(); return undefined; }
+        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
+        // как v2.1.4: первое событие server.connected без sessionID, затем `: heartbeat` каждые 15 с
+        res.write('data: {"id":"evt_fake","type":"server.connected","data":{}}\n\n: heartbeat\n\n');
         state.sse.add(res);
         res.on('close', () => state.sse.delete(res));
         return undefined;

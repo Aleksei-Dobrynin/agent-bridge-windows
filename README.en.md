@@ -1,15 +1,15 @@
 <div align="center">
 
-<img src="assets/hero.jpg" alt="Claude Bridge — control Claude Code from anywhere, no servers" width="820">
+<img src="assets/hero.jpg" alt="Claude Bridge — coding agents on your PC, controlled from your phone" width="820">
 
-# Claude Bridge
+# Claude Bridge for Windows
 
-**Mirror and control your [Claude Code](https://claude.com/claude-code) sessions from your phone.**
-No cloud, no middlemen: the phone talks directly to your PC — over your LAN, or through a p2p tunnel when you're away.
+**Mirror coding-agent sessions — [Claude Code](https://claude.com/claude-code), [opencode](https://opencode.ai) or any terminal agent — to your phone and control them from there.**
+No cloud, no middlemen: the phone talks directly to your PC — over the local network, or through a p2p tunnel when you are away.
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/PC-Linux-informational)](#requirements)
-[![Android](https://img.shields.io/badge/Phone-Android%208%2B-green)](#2-android-app)
+[![Platform](https://img.shields.io/badge/PC-Windows%2010%2F11-informational)](#requirements)
+[![Android](https://img.shields.io/badge/Phone-Android%208%2B-green)](#2-phone-app)
 
 [🇷🇺 Русский](README.md) · 🇬🇧 English
 
@@ -17,46 +17,63 @@ No cloud, no middlemen: the phone talks directly to your PC — over your LAN, o
 
 ---
 
+> **Internal team tool.** A fork of [HelpFreedom/claude-bridge](https://github.com/HelpFreedom/claude-bridge) adapted to Windows and multiple agents. Everyone installs it **on their own personal work computer** and configures it for themselves. Only a Windows host is supported; there is no Linux mode and no compatibility with old app versions.
+>
+> ⚠️ **Not for shared computers.** The security model assumes a PC with **one** user account that only its owner can physically access. Do not install it on multi-user machines, terminal servers or shared test rigs.
+
 ## What it is
 
-`Claude Bridge` runs a lightweight Node.js bridge on your computer that mirrors Claude Code terminal sessions to an Android app. From your phone you see the same terminal as on the PC, type text and commands, switch sessions, answer permission prompts — and get push notifications when Claude is waiting for you or has finished.
+A bridge (Node.js) on your PC runs agents in Windows pseudo-terminals (ConPTY) and mirrors them to an Android app. The phone shows the same terminal as the PC: you can type, switch and start sessions, answer permission requests with buttons right in the notification, and get notified when the agent is done.
 
-All communication is **direct between your own devices**. On WiFi it's your LAN; away from home it's an encrypted p2p tunnel (iroh/QUIC) with no relay servers in between. Traffic is protected by TLS with certificate pinning; access is granted via one-time pairing.
+All traffic goes **directly between your devices**: over the office or home Wi-Fi on the local network, otherwise through an encrypted p2p tunnel (iroh/QUIC). Traffic is protected by TLS with certificate pinning; only phones paired via QR have access.
 
 ### Features
 
-- 📱 **Full terminal on the phone** — xterm.js in a WebView: input, arrows, Esc/Tab/Ctrl-C, touch scroll & selection, clipboard paste.
-- 🔀 **Multiple sessions** — tabs, switching, new sessions (`--resume`, `--dangerously-skip-permissions`), multiple paired PCs.
-- 🔔 **Push notifications from hooks** — "Claude is waiting", "Claude finished", with quick-reply buttons from the notification shade.
-- 🌐 **Works away from home** — if the PC isn't visible on WiFi, a p2p tunnel (iroh) is brought up automatically, LAN always preferred.
-- 🎙️ **Voice input** — dictate messages (faster-whisper on the PC), optional.
-- 🔒 **Privacy & security** — self-signed TLS + fingerprint pinning, QR/code pairing, biometric app lock, `FLAG_SECURE`, tokens only on trusted devices.
-- 💾 **Sessions survive everything** — keeper processes own the PTYs independently of the bridge: restarting the bridge or closing the app doesn't kill Claude's work.
+- 📱 **Full terminal on the phone** — xterm.js: typing, Esc/Tab/Ctrl-C, arrows, finger scrolling and selection, paste (control characters are stripped).
+- 🤖 **Several agents** — Claude Code, opencode and any TUI agent from the config; the agent and its options are chosen per new session.
+- 🔔 **Permission requests on the phone** — "Claude asks for permission — Bash: …" with "Yes / Always: … / No" buttons right in the notification; answering on the PC clears it.
+- ✅ **Confirmation on the phone** — issuing a pairing code and enabling internet access are confirmed on an already paired phone with a check code.
+- 🌐 **Away from the PC's network** — the p2p tunnel (iroh) comes up by itself when the PC is not visible on Wi-Fi.
+- 🎙️ **Voice input** — dictation (faster-whisper on the PC), optional.
+- 💾 **Sessions survive bridge restarts** — each lives in its own keeper process.
 
-> A deep technical description of the architecture lives in [ARCHITECTURE.md](ARCHITECTURE.md) (in Russian).
+> Technical description: [ARCHITECTURE.md](ARCHITECTURE.md) (in Russian).
 
 ---
 
 ## How it works (short)
 
-1. The phone discovers the PC on the network (mDNS/UDP) and connects.
-2. Terminal I/O flows both ways over a WebSocket on top of TLS.
-3. Claude Code hooks turn into push notifications on the phone.
+```
+┌──────────────────── PC (Windows) ─────────────────────┐        ┌────────── Phone (Android) ────────┐
+│                                                       │        │                                   │
+│  claude.exe   (ConPTY) ┐                              │        │   WebView + xterm.js              │
+│  opencode.exe (ConPTY) ┼─ keeper.js (keepers)         │  WSS   │   • terminal, tabs, voice         │
+│  other agent  (ConPTY) ┘   named pipe + handshake     │◀──────▶│   • foreground service            │
+│                                │                      │ TLS +  │   • notifications with buttons    │
+│  Claude hook ┐                 ▼                      │ pinning│                                   │
+│  opencode    ┴──▶ server.js (bridge, port 8790) ──────┼────────┤   Discovery: mDNS + UDP beacon    │
+│  SSE              autostart: Task Scheduler           │        │   Away: p2p tunnel (iroh)         │
+└───────────────────────────────────────────────────────┘        └───────────────────────────────────┘
+```
+
+1. The phone finds the PC on the network (mDNS/UDP beacon) and connects.
+2. Terminal input and output flow both ways over WebSocket on TLS.
+3. Agent events (Claude Code hooks, opencode events) become phone notifications.
 
 ---
 
 ## Requirements
 
-**PC (bridge):**
-- Linux (tested on Debian; expected to work on most distros)
-- [Node.js](https://nodejs.org/) 18+
-- A working [Claude Code](https://claude.com/claude-code) install (`claude` on `PATH`)
-- *(optional)* [Rust](https://rustup.rs/) — to build the p2p tunnel
-- *(optional)* Python 3.11 + [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper) — for voice input
-- *(optional)* Avahi/mDNS — speeds up discovery (there's a UDP beacon fallback)
+**PC:**
+- Windows 10 or 11 (tested on Windows 11 26200), a personal user account (see the warning above)
+- [Node.js](https://nodejs.org/) 20+ (tested on 24.8)
+- At least one agent on `PATH`: [Claude Code](https://claude.com/claude-code) (`claude`, tested 2.1.284) and/or [opencode](https://opencode.ai) (`opencode`, tested v2.1.4)
+- *(optional)* Python 3.11 (`py -3.11`) + [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper) — voice input
+- *(to build from source)* [Rust](https://rustup.rs/), JDK 17, Android SDK — see [Building from source](#building-from-source)
 
-**Phone:**
-- Android 8.0+ (API 26)
+**Phone:** Android 8.0+ (API 26). The "Always" button and confirming from a notification need Android 12+ (older versions confirm in the open app).
+
+**Network:** phone and PC on the same Wi-Fi with the "Private" profile on the PC — or the p2p tunnel.
 
 ---
 
@@ -64,187 +81,176 @@ All communication is **direct between your own devices**. On WiFi it's your LAN;
 
 ### 1. Bridge on the PC
 
-```bash
-git clone https://github.com/HelpFreedom/claude-bridge.git
-cd claude-bridge/bridge
-npm install
-npm start
+```powershell
+git clone https://github.com/Aleksei-Dobrynin/agent-bridge-windows.git
+cd agent-bridge-windows
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Firewall
 ```
 
-On first run the bridge:
-- creates `config.json` from `config.example.json`;
-- generates a self-signed TLS certificate in `bridge/certs/`;
-- prints a **QR code and pairing code** for the phone.
+`install.ps1`:
+- checks Node.js 20+ (required) and whether `claude` and `opencode` are present (if missing — a warning: that agent will be unavailable);
+- installs the bridge dependencies (`npm ci` in `bridge\`); a running bridge is stopped first, and with live sessions the installer refuses (they hold `node-pty` files) — end the sessions or add `-SkipNpm`;
+- creates the data directory `%LOCALAPPDATA%\ClaudeBridge` and `config.json` from `bridge\config.example.json` (an existing config is left alone);
+- puts `claude-mobile.cmd` into `%LOCALAPPDATA%\ClaudeBridge\bin` and adds that directory to the user PATH;
+- adds the bridge hook to `%USERPROFILE%\.claude\settings.json` (backup `settings.json.bak-…`, the last 5 are kept; your hooks and settings are kept);
+- registers the Task Scheduler task `ClaudeBridge` — the bridge starts when you sign in to Windows (no service: agents need your session). If the task cannot be registered, a `ClaudeBridge.lnk` shortcut in the user's Startup folder (`shell:startup`) is created instead; with `-StartupShortcut` — the shortcut right away;
+- with `-Firewall`, adds inbound rules `ClaudeBridge-TCP` (bridge port, 8790) and `ClaudeBridge-UDP` (beacon, 8791) for the "Private" profile only (Windows asks for administrator approval for this step only);
+- starts the bridge and waits until it listens on its port.
 
-Then edit `bridge/config.json` (see [Configuration](#configuration)) and optionally install it as a systemd service (below).
+Running it again is safe — this is also how you update after `git pull`. To see what it would do without changing anything: `.\install.ps1 -DryRun`. Other switches: `-SkipNpm`, `-SkipTask`, `-SkipPath`, `-SkipHook`, `-NoStart`, `-StartupShortcut`, `-StartupDir <dir>`, `-TaskName <name>`; `-DataRoot` and `-SettingsPath` are only for testing the installer on temporary directories (`Get-Help .\install.ps1 -Full`).
 
-#### (Optional) p2p tunnel for access away from home
+> If Windows asks whether `node.exe` may use the network when the bridge first starts, allow it for private networks. If you blocked it before, the `node.exe` block rule overrides allow rules: remove it in "Windows Defender Firewall → Allow an app through firewall…".
 
-The tunnel is a separate Rust binary. Build it and place it next to the bridge:
+### 2. Phone app
 
-```bash
-cd tunnel
-cargo build --release
-mkdir -p ../bridge/bin
-cp target/release/claude-tunnel ../bridge/bin/claude-tunnel
+Download `ClaudeBridge-<version>.apk` and `SHA256SUMS.txt` from [Releases](https://github.com/Aleksei-Dobrynin/agent-bridge-windows/releases) and verify before installing:
+
+```powershell
+Get-FileHash -Algorithm SHA256 .\ClaudeBridge-<version>.apk          # matches SHA256SUMS.txt
+& "$env:LOCALAPPDATA\Android\Sdk\build-tools\34.0.0\apksigner.bat" verify --print-certs .\ClaudeBridge-<version>.apk
 ```
 
-Enable it later from the app (PC menu → "allow over internet") or via `claude-mobile --device` → `i`.
+The APK is signed with the team key. **SHA-256 of the signing certificate:**
 
-#### (Optional) systemd service
-
-Create `~/.config/systemd/user/claude-bridge.service`:
-
-```ini
-[Unit]
-Description=Claude Bridge
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=%h/claude-bridge/bridge
-ExecStart=/usr/bin/node %h/claude-bridge/bridge/server.js
-Restart=on-failure
-RestartSec=3
-# Kill only the bridge itself: session keepers must survive a restart
-KillMode=process
-Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-
-[Install]
-WantedBy=default.target
+```
+{{APK_CERT_SHA256}}
 ```
 
-```bash
-systemctl --user daemon-reload
-systemctl --user enable --now claude-bridge
-```
+If `apksigner` shows a different fingerprint, do not install it. An app signed with another key (for example the old debug one) must be uninstalled first.
 
-### 2. Android app
-
-Easiest: **download the prebuilt APK** from [Releases](https://github.com/HelpFreedom/claude-bridge/releases) and install it (allow installs from unknown sources). The APK is debug-signed.
-
-Or build it yourself:
-
-```bash
-cd android
-./gradlew assembleDebug
-# APK: android/app/build/outputs/apk/debug/app-debug.apk
-```
-
-For the p2p tunnel on the phone you also need the native `libclaudetunnel.so` (aarch64) — see [Building the tunnel for Android](#building-the-tunnel-for-android). Everything except away-from-home access works without it.
+> **Status (2026-10-31):** the signed release is not published yet (the team key is created by the repository owner). The phone tunnel (`libclaudetunnel.so`) is not built yet — an APK without it works over the local network only, not over the internet. The test scenarios on a real phone have not been run yet. Details: [ARCHITECTURE.md, §12](ARCHITECTURE.md#12-известные-ограничения).
 
 ### 3. Pairing
 
-1. Start the bridge on the PC — it shows a QR code (or run `claude-mobile --qr`).
-2. In the app tap **"Add computer" → "Scan QR code"** and point the camera.
-3. Done: the phone remembers the PC and reconnects on its own when you're on the same network.
-
-You can also type a short code manually — the app will then ask you to verify the certificate fingerprint (QR is recommended to prevent tampering).
-
----
-
-## Configuration
-
-`bridge/config.json` (created from `config.example.json`):
-
-| Key | Meaning |
-|-----|---------|
-| `port` | Bridge port (default `8790`). |
-| `host` | Listen interface (`0.0.0.0` = whole LAN). |
-| `claudeCommand` | Command to launch Claude Code (usually `claude`). |
-| `projects` | **Allow-list of directories** where the phone may start sessions. Empty = the phone can't create sessions outside `defaultCwd`. |
-| `defaultCwd` | Default directory for new sessions. |
-| `env` | Extra environment variables for Claude Code sessions (e.g. an API proxy — see below). |
-| `scrollbackBytes` | Terminal scrollback buffer size. |
-| `sttPython` / `sttModel` / `sttLanguage` | Voice input settings (faster-whisper). |
-
-> ⚠️ `config.json` is in `.gitignore`: it holds **your own** paths and environment (different for everyone), so it must not be committed. Edit `config.json` (created from `config.example.json` on first run), not the example.
-
-### Proxy for Claude Code (optional)
-
-If `claude` must reach the Anthropic API through a proxy, put it in `env` — the bridge passes these variables to every session it launches:
-
-```json
-"env": {
-  "HTTP_PROXY":  "http://127.0.0.1:8118",
-  "HTTPS_PROXY": "http://127.0.0.1:10808",
-  "http_proxy":  "http://127.0.0.1:8118",
-  "https_proxy": "http://127.0.0.1:10808",
-  "NO_PROXY":    "127.0.0.1,localhost,192.168.0.0/16",
-  "no_proxy":    "127.0.0.1,localhost,192.168.0.0/16"
-}
-```
-
-Use your own proxy addresses. `NO_PROXY` keeps localhost and the local network unproxied (so the bridge↔phone link stays direct). Alternatively, export these variables in the bridge's own environment (shell or `systemd` unit): the bridge inherits them and passes them on. An explicit `env` entry is more robust.
-
-### Voice input (optional)
-
-```bash
-python3 -m pip install faster-whisper
-```
-
-Set the interpreter (`sttPython`), model (`sttModel`, e.g. `large-v3`) and language (`sttLanguage`) in `config.json`.
+1. In a **new** console window (PATH updated): `claude-mobile --qr`.
+   - First phone: the console asks for `[y/N]` confirmation.
+   - If a phone is already paired: confirm on it (notification "Claude Bridge: нужно подтверждение" — "confirmation needed"), comparing the 4-digit code with the console.
+2. In the app: **"Добавить компьютер" ("Add computer") → "Сканировать QR-код" ("Scan QR code")**. Pairing is QR-only (no manual code entry).
+3. Done: the phone remembers the PC and connects by itself.
 
 ---
 
 ## The `claude-mobile` CLI (on the PC)
 
-A terminal client for the same bridge — handy for managing sessions and devices from the PC itself:
-
 ```
-claude-mobile              # new session in the current directory
-claude-mobile [args…]      # args are passed to claude (--resume, --continue…)
-claude-mobile -l           # list sessions
-claude-mobile -a [id]      # attach to a session
-claude-mobile --device     # trusted devices + p2p access (view/revoke)
-claude-mobile --qr         # show the pairing QR code
-claude-mobile -h           # help
+claude-mobile [args…]              new session of the default agent in the current directory;
+                                   arguments go to the agent (--resume, --continue…)
+claude-mobile --agent <id> [args…] new session of the given agent (claude, opencode, …)
+claude-mobile -l                   list sessions
+claude-mobile -a [id]              attach to a session (without id — the latest live one)
+claude-mobile --device             trusted devices and internet access
+claude-mobile --qr                 pairing QR code for a new device
+claude-mobile --open               open the bridge web UI in the browser (one-time link)
+claude-mobile --rotate-token       reissue the owner token
+claude-mobile -h                   help
 ```
 
-`Ctrl+\` detaches (the session keeps running). To end a session: exit Claude (double `Ctrl+C` or `/exit`) or long-press its tab in the app.
+`Ctrl+\` detaches: the session keeps running, come back with `claude-mobile -a`. On detach the console returns to normal input (modes the agent switched on are reset). To end a session, exit the agent (`/exit`) or long-press its tab in the app.
 
 ---
 
-## Building the tunnel for Android
+## Agents
 
-The native library is cross-compiled for aarch64 via the Android NDK:
+| Agent | How it works | New-session options |
+|---|---|---|
+| `claude` — Claude Code | Permission requests and "done" arrive through the hook installed by `install.ps1`. Answer buttons for Bash, PowerShell, file edits, Web, Read/Glob/Grep, Task and MCP tools. | "Continue conversation (--resume)", "No permission prompts (--dangerously-skip-permissions)" (labels are in Russian in the app) |
+| `opencode` | Through the opencode background service (the bridge runs `opencode service start` itself if the service does not respond); events come from its API, including subagent requests. By default opencode asks nothing. | "Ask permission for commands" |
+| any TUI agent (`generic`) | Terminal mirror only: no notifications, no answer buttons. | — |
 
-```bash
-rustup target add aarch64-linux-android
-export ANDROID_NDK_HOME=$HOME/Android/Sdk/ndk/<version>
-NDK=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
-export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$NDK/aarch64-linux-android26-clang
-export CC_aarch64_linux_android=$NDK/aarch64-linux-android26-clang
-export AR_aarch64_linux_android=$NDK/llvm-ar
+The Claude Code hook also fires in ordinary Claude sessions (not through the bridge): it exits immediately there, but a `node` process starts for every event.
 
-cd tunnel
-cargo build --release --target aarch64-linux-android
-mkdir -p ../android/app/src/main/jniLibs/arm64-v8a
-cp target/aarch64-linux-android/release/claude-tunnel \
-   ../android/app/src/main/jniLibs/arm64-v8a/libclaudetunnel.so
+---
+
+## Configuration
+
+Config: `%LOCALAPPDATA%\ClaudeBridge\config.json` (created from `bridge\config.example.json`; never committed).
+
+| Key | Purpose |
+|---|---|
+| `port` | Bridge port, default `8790` (beacon `port+1`, tunnel entry `port+2`). |
+| `host` | `"auto"` — `127.0.0.1` plus the main LAN adapter address (virtual and VPN adapters are skipped, re-checked every 15 s); or an explicit address. |
+| `defaultAgent` | Default agent (`claude`). |
+| `agents` | Agents: `{ "claude": {}, "opencode": {} }`; your own — `"aider": { "type": "generic", "name": "Aider", "command": "aider", "args": [], "scroll": "pageKeys" }` (`scroll`: `wheel` or `pageKeys`). |
+| `projects` | Directories where the **phone** may start sessions; a path outside the list falls back to `defaultCwd`. |
+| `defaultCwd` | Default directory (`~` and `%VAR%` are expanded). |
+| `env` | Environment variables for all sessions (for example a proxy). |
+| `scrollbackBytes` | Scrollback buffer per session (1 MB in the template; 256 KB without the key). |
+| `maxSessions` | Session limit (default 24). |
+| `sttPython` / `sttPythonArgs` / `sttModel` / `sttLanguage` | Voice input: `py` + `["-3.11"]`, model `large-v3`, language `ru`. |
+
+After editing the config, restart the bridge (sessions survive it):
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" |
+  Where-Object { $_.CommandLine -like '*\bridge\server.js*' } | ForEach-Object { Stop-Process -Id $_.ProcessId }
+Start-ScheduledTask -TaskName ClaudeBridge      # with the Startup shortcut instead: node .\bridge\start-bridge.js
 ```
 
-Then rebuild the APK (`./gradlew assembleDebug`).
+Bridge log: `%LOCALAPPDATA%\ClaudeBridge\logs\bridge.log`.
+
+### Proxy
+
+```json
+"env": {
+  "HTTPS_PROXY": "http://127.0.0.1:10808",
+  "NO_PROXY":    "127.0.0.1,localhost,192.168.0.0/16"
+}
+```
+
+`NO_PROXY` excludes localhost and the local network so the bridge talks to the phone directly.
+
+### Voice input
+
+```powershell
+py -3.11 -m pip install faster-whisper
+```
+
+The model is loaded into memory on first use.
+
+### Internet access (p2p)
+
+Needs `bridge\bin\claude-tunnel.exe` (from the release — check its SHA-256 against `SHA256SUMS.txt` — or built from source, see below) and an APK with `libclaudetunnel.so`. Enable it with `claude-mobile --device` → `i` (confirmed on the phone). If corporate policy forbids firewall rules, the tunnel is the only path.
+
+---
+
+## Uninstalling
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\uninstall.ps1 -Firewall            # keep data
+powershell -ExecutionPolicy Bypass -File .\uninstall.ps1 -Firewall -RemoveData
+```
+
+Removes the scheduled task and the Startup shortcut, stops the bridge, removes the hook from `settings.json` (with a backup), the shim and the PATH entry; `-RemoveData` deletes `%LOCALAPPDATA%\ClaudeBridge` (pairings, certificate, tokens — phones must be paired again) and refuses while sessions are alive. Live sessions keep running until you exit the agent. `-DryRun` only shows the steps; `-StartupShortcut` removes only the shortcut and leaves the task. `bridge\node_modules` and the repository clone are not removed.
 
 ---
 
 ## Security
 
-- **TLS + fingerprint pinning**: the phone trusts only your PC's specific certificate; the fingerprint also serves as the PC's identity.
-- **Pairing**: a one-time 40-bit code with a global attempt limit; the QR path pins the fingerprint before any secret is sent.
-- **Access tokens** are issued only to paired devices; revocation is immediate (drops live connections).
-- **Local access** (`claude-mobile`, hooks) is trusted by same-user UID, not "anyone on loopback".
-- **On the phone**: biometric lock, `FLAG_SECURE` (no previews/screenshots), the token never leaves the native layer.
+- **TLS + pinning**: the phone trusts only your PC's certificate; `claude-mobile` and the hook check the fingerprint too.
+- **QR-only pairing**, one-time code (10 minutes), issued only after a human confirms (console for the first phone, then a paired phone with a check code).
+- **Device tokens** are stored on the PC only as SHA-256; revoking (`claude-mobile --device`) drops connections immediately.
+- **Local access** uses the owner token from `%LOCALAPPDATA%\ClaudeBridge\owner.token`; an agent gets only the narrow hook token of its session; the PC browser signs in with a one-time link (`claude-mobile --open`).
+- **Network**: the bridge listens on `127.0.0.1` and one LAN address; the beacon and mDNS do not reveal the PC name; firewall rules cover the "Private" profile only.
+- **Phone**: biometric lock, `FLAG_SECURE`, answering an agent from a notification requires unlocking (Android 12+).
 
-This project has been through several security reviews; some findings were fixed, others are deliberate trade-offs for its threat model (self-hosting for yourself). Don't treat it as a multi-tenant service.
+Threat model: one user's personal PC. An agent running under your account can technically read the bridge's files; phone confirmation protects against it pairing a device or enabling internet access **by itself** through the bridge API, but not against an agent that edits the bridge's files and restarts it. With the "No permission prompts" option, an agent started from the phone is not limited to the `projects` directories. Details and known limitations: [ARCHITECTURE.md](ARCHITECTURE.md#12-известные-ограничения).
 
 ---
 
-## Contributing
+## Building from source
 
-PRs and issues welcome. Please don't commit personal data (paths, tokens, `config.json`, certificates) — they're already in `.gitignore`.
+```powershell
+cd bridge; npm test                                                     # bridge tests
+powershell -ExecutionPolicy Bypass -File .\tools\release.ps1 -SkipApk   # claude-tunnel.exe (+ libclaudetunnel.so if the NDK is present)
+cd android; .\gradlew.bat assembleDebug                                 # debug APK (JAVA_HOME — JDK 17)
+```
 
-## License
+Release (team key holder): `tools\release.ps1 -KeystorePath <key>` builds into `dist\` the PC and Android tunnel, the signed release APK, `SHA256SUMS.txt` and `RELEASE_NOTES.md`. Requires Rust (targets `x86_64-pc-windows-msvc`, `aarch64-linux-android`), JDK 17, Android SDK (build-tools 34) and NDK 28; without the NDK the Android tunnel step is skipped with a warning.
 
-[GNU General Public License v3.0](LICENSE) © Black Triangle.
-Built in pair with Claude (Anthropic).
+---
+
+## Origin and license
+
+Original project: [HelpFreedom/claude-bridge](https://github.com/HelpFreedom/claude-bridge) (Black Triangle; [video](https://www.youtube.com/watch?v=x_AXmmRxF9E), support the author: https://boosty.to/triangle_black/). Authors: [AUTHORS.md](AUTHORS.md).
+
+[GNU General Public License v3.0](LICENSE). Please do not commit personal data (tokens, certificates, `config.json`, signing keys) — the data directory lives outside the repository, the main patterns are in `.gitignore`.

@@ -5,7 +5,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const T = require('../lib/tokens');
-const { originAllowed } = require('../lib/origin');
+const { originAllowed, WEBVIEW_ORIGIN } = require('../lib/origin');
 
 function tmpFile(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cb-tok-'));
@@ -79,10 +79,20 @@ test('origin allowlist', () => {
   assert.ok(originAllowed(undefined, 8790));
   assert.ok(originAllowed('https://127.0.0.1:8790', 8790));
   assert.ok(originAllowed('https://localhost:8790', 8790));
-  assert.ok(originAllowed('http://127.0.0.1:38471', 8790));
   for (const bad of ['null', 'https://evil.example', 'https://127.0.0.1:8791', 'http://127.0.0.1:8790', '']) {
     assert.strictEqual(originAllowed(bad, 8790), false, bad);
   }
+});
+
+test('origin of the Android WebView is accepted only for devices (m-1)', () => {
+  // http://127.0.0.1:38471 — LocalGateway приложения; только WS-апгрейд устройства, не владелец и не HTTP
+  assert.strictEqual(originAllowed(WEBVIEW_ORIGIN, 8790), false);
+  assert.strictEqual(originAllowed(WEBVIEW_ORIGIN, 8790, { device: false }), false);
+  assert.strictEqual(originAllowed(WEBVIEW_ORIGIN, 8790, { device: true }), true);
+  assert.strictEqual(WEBVIEW_ORIGIN, 'http://127.0.0.1:38471');
+  assert.ok(originAllowed('https://127.0.0.1:8790', 8790, { device: true }));
+  assert.ok(originAllowed(undefined, 8790, { device: true }));
+  assert.strictEqual(originAllowed('https://evil.example', 8790, { device: true }), false);
 });
 
 test('one-time tokens: clear() invalidates all outstanding tokens (M-2)', () => {

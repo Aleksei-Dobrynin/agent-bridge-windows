@@ -1227,9 +1227,12 @@ function handleUpgrade(req, sock, head) {
   let url;
   try { url = new URL(req.url, 'http://x'); } catch { return reject(400); }
   if (url.pathname !== '/ws') return reject(404);
-  if (!originAllowed(req.headers.origin, CONFIG.port)) return reject(403);
+  // Origin WebView допустим только для устройства (m-1): предварительно пропускаем его,
+  // чтобы неизвестный/отозванный токен получил 401 (телефон по нему распознаёт отзыв, I-1)
+  if (!originAllowed(req.headers.origin, CONFIG.port, { device: true })) return reject(403);
   const who = principal(req);
   if (!who) return reject(401);
+  if (!originAllowed(req.headers.origin, CONFIG.port, { device: who !== 'owner' })) return reject(403);
   if (allClients.size + pendingUpgrades >= MAX_WS_CLIENTS) return reject(503);
   // незавершённые апгрейды тоже занимают место (M-9)
   pendingUpgrades++;

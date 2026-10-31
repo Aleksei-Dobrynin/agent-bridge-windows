@@ -160,7 +160,9 @@ Windows-хост; без Linux-режима и обратной совмести
    (`X-Bridge-Session`).
 
 - **Origin** (P-1, второй слой против H-1): WS и HTTP — только с `https://127.0.0.1:<port>`,
-  `https://localhost:<port>`, `http://127.0.0.1:38471` (WebView) или без `Origin` (CLI). Allowlist
+  `https://localhost:<port>` или без `Origin` (CLI). `http://127.0.0.1:38471` (WebView) — только на
+  WS-апгрейде **устройства** (финальное ревью m-1): владельцу (WS и HTTP) и HTTP-запросам — 403;
+  с неизвестным токеном — 401 (`lib/origin.js` `originAllowed(…, { device })`). Allowlist
   `Host` не вводится (D-16.4).
 - **Вход браузера** (L-9, D-16.1, D-18.2): `claude-mobile --open` → одноразовый токен (60 с) →
   `GET /?ott=…` (только loopback, основной порт) → HttpOnly-cookie с браузерным токеном (живёт в

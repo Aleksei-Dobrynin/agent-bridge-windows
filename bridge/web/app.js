@@ -532,6 +532,12 @@ function connect() {
       case 'devices':
         renderDevices(m);
         break;
+      case 'createConflict':
+        onCreateConflict(m);
+        break;
+      case 'error':
+        banner('⚠ ' + m.message);
+        break;
     }
   };
 
@@ -881,5 +887,19 @@ $('#createOk').addEventListener('click', () => {
   send(msg);
   $('#newDialog').close();
 });
+
+// D-7: живую сессию в том же каталоге находит мост (сравнение путей — только на мосту)
+function onCreateConflict(m) {
+  const live = Array.isArray(m.live) ? m.live : [];
+  if (!live.length || !lastCreate) return;
+  if (window.confirm(
+      `В «${m.cwd}» уже есть живая сессия: ${live[0].title}.\n` +
+      `Если беседа ещё открыта в ней, resume создаст копию беседы.\n\n` +
+      `Открыть живую сессию вместо этого?`)) {
+    attach(live[0].id, true);
+  } else {
+    send({ ...lastCreate, force: true });
+  }
+}
 
 connect();

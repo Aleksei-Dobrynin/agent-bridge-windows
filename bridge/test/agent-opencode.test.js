@@ -368,6 +368,6 @@ test('D-23.6: "always" label from save[] (sanitized, length-limited)', () => {
   assert.strictEqual(always(['mkdir *'], 'per_1'), 'Всегда: mkdir *');
   assert.strictEqual(always(['git add *', 'git commit *'], 'per_2'), 'Всегда: git add *, git commit *');
   assert.strictEqual(always([5, ''], 'per_3'), undefined, 'nothing to save -> no "always"');
-  const long = always(['echo ' + 'a'.repeat(80) + '‮\n*'], 'per_4');
-  assert.ok(long.length <= 40 && long.startsWith('Всегда: echo a') && long.endsWith('a *') && !/[‮\n]/.test(long), long);
+  const long = always(['echo ' + 'a'.repeat(80) + '\u202e\n*'], 'per_4');
+  assert.ok(long.length <= 40 && long.startsWith('Всегда: echo a') && long.endsWith('a *') && !/[\u202e\n]/.test(long), long);
 });

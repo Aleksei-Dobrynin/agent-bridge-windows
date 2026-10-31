@@ -41,7 +41,7 @@ test('log: still appends when rotation fails', (t) => {
 });
 
 test('cleanTitle strips bidi / zero-width and cuts by code points', () => {
-  assert.strictEqual(V.cleanTitle('a‮b​c⁦d﻿e‏f'), 'abcdef');
+  assert.strictEqual(V.cleanTitle('a\u202eb\u200bc\u2066d\ufeffe\u200ff'), 'abcdef');
   const emoji = '😀'.repeat(200);
   const r = V.cleanTitle(emoji);
   assert.strictEqual(Array.from(r).length, 120);
@@ -49,10 +49,10 @@ test('cleanTitle strips bidi / zero-width and cuts by code points', () => {
 });
 
 test('pairBody.name is cleaned and limited to 64 code points', () => {
-  const r = V.pairBody({ code: 'ab', name: '‮Phone\x07' + '😀'.repeat(100) });
+  const r = V.pairBody({ code: 'ab', name: '\u202ePhone\x07' + '😀'.repeat(100) });
   assert.strictEqual(r.code, 'AB');
   assert.ok(r.name.startsWith('Phone😀'));
-  assert.ok(!r.name.includes('‮') && !r.name.includes('\x07'));
+  assert.ok(!r.name.includes('\u202e') && !r.name.includes('\x07'));
   assert.strictEqual(Array.from(r.name).length, 64);
   assert.strictEqual(V.pairBody({ code: 'ab', name: 5 }).name, '');
 });

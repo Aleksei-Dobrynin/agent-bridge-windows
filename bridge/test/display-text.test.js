@@ -37,8 +37,8 @@ test('D-23.6: labelText — prefix + sanitized detail, at most 40 UTF-16 units, 
   const { labelText } = require('../lib/display-text');
   assert.strictEqual(labelText('Всегда: ', 'mkdir *'), 'Всегда: mkdir *');
   assert.strictEqual(labelText('Всегда', ''), 'Всегда');
-  assert.strictEqual(labelText('Всегда: ', '  ​\n '), 'Всегда:', 'empty detail -> trimmed prefix');
-  assert.strictEqual(labelText('Всегда: ', 'a‮b\nc'), 'Всегда: ab c');
+  assert.strictEqual(labelText('Всегда: ', '  \u200b\n '), 'Всегда:', 'empty detail -> trimmed prefix');
+  assert.strictEqual(labelText('Всегда: ', 'a\u202eb\nc'), 'Всегда: ab c');
   const long = labelText('Всегда: ', 'x'.repeat(10) + 'y'.repeat(40) + 'END');
   assert.strictEqual(long.length, 40);
   assert.ok(long.startsWith('Всегда: x') && long.endsWith('END') && long.includes('…'), long);

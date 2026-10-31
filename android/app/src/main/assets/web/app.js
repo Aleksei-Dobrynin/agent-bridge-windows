@@ -1,5 +1,5 @@
 'use strict';
-/* global Terminal, FitAddon */
+/* global Terminal, FitAddon, CB */
 
 const $ = (s) => document.querySelector(s);
 const ESC = '\x1b';
@@ -18,6 +18,9 @@ const KEYS = {
 let ws = null;
 let sessions = [];
 let projects = [];
+let agents = [];          // D-5: [{ id, name, options:[{id,label,type}], scroll }] от моста
+let defaultAgent = null;
+let lastCreate = null;    // последний create — для повтора с force после createConflict
 let current = localStorage.getItem('currentSession') || null;
 let reconnectDelay = 500;
 let audioCtx = null;
@@ -33,7 +36,12 @@ const term = new Terminal({
 });
 term.open($('#terminal'));
 
-term.onData((data) => send({ type: 'input', id: current, data }));
+// D-19.1: ответы xterm на запросы терминала из проигрываемого буфера — не ввод человека
+const replay = CB.replayGate();
+term.onData((data) => {
+  if (replay.active()) return;
+  send({ type: 'input', id: current, data });
+});
 
 // Локальный терминал зеркалит фактический размер PTY (сообщает сервер).
 // Свои размеры мы только "предлагаем" — сервер применит их, когда мы печатаем.
@@ -65,21 +73,18 @@ if (window.visualViewport) window.visualViewport.addEventListener('resize', refi
 
 // Прокрутка пальцем.
 // Обычный буфер (bash и т.п.) — листаем scrollback xterm.
-// Альтернативный экран (Claude Code TUI) — шлём приложению события колеса
-// мыши: TUI сам перерисует свою историю, включая восстановленную --resume.
+// Альтернативный экран (TUI агента) — способ объявляет адаптер агента в sessions[].scroll
+// (D-10): системный ConPTY не пересылает включение режима мыши, поэтому
+// term.modes.mouseTrackingMode здесь не годится.
 function sendScroll(lines) {
   if (!current) return;
-  const n = Math.min(Math.abs(lines), 10);
-  const mouse = term.modes.mouseTrackingMode !== 'none';
+  const s = sessions.find((x) => x.id === current);
+  const mode = s && s.scroll === 'wheel' ? 'wheel' : 'pageKeys';
   const col = Math.max(1, Math.round(term.cols / 2));
   const row = Math.max(1, Math.round(term.rows / 2));
-  let data = '';
-  for (let i = 0; i < n; i++) {
-    if (mouse) data += `\x1b[<${lines > 0 ? 64 : 65};${col};${row}M`; // колесо вверх/вниз
-    else data += lines > 0 ? '\x1b[5~' : '\x1b[6~'; // PageUp / PageDown
-  }
+  const data = CB.scrollSequence(mode, lines, col, row);
   // 'scroll' — как input, но не переключает "владельца размера" PTY
-  send({ type: 'scroll', id: current, data });
+  if (data) send({ type: 'scroll', id: current, data });
 }
 
 // ------------------------------------------- выделение текста в терминале
@@ -412,6 +417,15 @@ $('#selCopy').addEventListener('click', () => {
 });
 $('#selCancel').addEventListener('click', clearSel);
 
+function insertAtCursor(inp, text) {
+  const s = inp.selectionStart == null ? inp.value.length : inp.selectionStart;
+  const e = inp.selectionEnd == null ? inp.value.length : inp.selectionEnd;
+  inp.value = inp.value.slice(0, s) + text + inp.value.slice(e);
+  const np = s + text.length;
+  try { inp.setSelectionRange(np, np); } catch { /* не критично */ }
+  inp.focus();
+}
+
 $('#pasteBtn').addEventListener('click', async () => {
   let text = '';
   if (typeof window.AndroidApp !== 'undefined' && window.AndroidApp.pasteText) {
@@ -419,16 +433,29 @@ $('#pasteBtn').addEventListener('click', async () => {
   } else if (navigator.clipboard) {
     try { text = await navigator.clipboard.readText(); } catch { /* нет доступа */ }
   }
+  text = CB.filterPaste(text); // L-10
   if (!text) { banner('📋 Буфер обмена пуст'); return; }
   // вставляем в поле ввода (в позицию курсора) — отправка отдельной кнопкой
-  const inp = $('#msg');
-  const s = inp.selectionStart == null ? inp.value.length : inp.selectionStart;
-  const e = inp.selectionEnd == null ? inp.value.length : inp.selectionEnd;
-  inp.value = inp.value.slice(0, s) + text + inp.value.slice(e);
-  const np = s + text.length;
-  try { inp.setSelectionRange(np, np); } catch { /* не критично */ }
-  inp.focus();
+  insertAtCursor($('#msg'), text);
 });
+
+// L-10: штатная вставка в поле ввода (меню долгого нажатия, Ctrl+V)
+$('#msg').addEventListener('paste', (e) => {
+  const text = e.clipboardData ? e.clipboardData.getData('text/plain') : '';
+  const clean = CB.filterPaste(text);
+  if (clean === text) return;
+  e.preventDefault();
+  insertAtCursor(e.target, clean);
+});
+
+// L-10: вставка прямо в терминал (Ctrl+V / меню браузера на ПК): перехватываем
+// на фазе захвата, до обработчика xterm, и вставляем очищенный текст
+term.element.addEventListener('paste', (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  const clean = CB.filterPaste(e.clipboardData ? e.clipboardData.getData('text/plain') : '');
+  if (clean && current) term.paste(clean);
+}, true);
 
 // Кнопка «в конец»: появляется, когда мы пролистали вверх
 const toBottom = $('#toBottom');
@@ -468,6 +495,10 @@ function connect() {
   ws.onopen = () => {
     reconnectDelay = 500;
     setStatus('🟢'); // в панели показываем только индикатор, чтобы не занимать место
+    // D-20: открытые запросы мост пришлёт заново сразу после sessions
+    requests.reconnect();
+    replying = null;
+    renderRequest();
     if (current) attach(current, false);
   };
 
@@ -477,6 +508,10 @@ function connect() {
       case 'sessions':
         sessions = m.sessions;
         projects = m.projects || [];
+        agents = Array.isArray(m.agents) ? m.agents : [];
+        defaultAgent = m.defaultAgent || (agents[0] && agents[0].id) || null;
+        requests.retain(sessions.filter((s) => s.alive).map((s) => s.id));
+        renderRequest();
         renderTabs();
         if (current && !sessions.find((s) => s.id === current)) {
           current = sessions.length ? sessions[0].id : null;
@@ -491,7 +526,12 @@ function connect() {
       case 'scrollback':
         term.reset();
         if (m.cols && m.rows) term.resize(m.cols, m.rows);
-        term.write(m.data);
+        {
+          // колбэк — после разбора всего буфера; таймер — страховка, чтобы ввод не заблокировался
+          const end = replay.begin();
+          setTimeout(end, 15000);
+          term.write(m.data, end);
+        }
         break;
       case 'resized':
         if (m.id === current) term.resize(m.cols, m.rows);
@@ -505,20 +545,45 @@ function connect() {
       case 'notify':
         onNotify(m);
         break;
+      case 'requestClosed':
+        onRequestClosed(m);
+        break;
+      case 'replyResult':
+        onReplyResult(m);
+        break;
       case 'devices':
         renderDevices(m);
+        break;
+      case 'createConflict':
+        onCreateConflict(m);
+        break;
+      case 'error':
+        banner('⚠ ' + m.message);
+        break;
+      case 'confirmRequest':
+        onConfirmRequest(m);
+        break;
+      case 'confirmClosed':
+        if (m.confirmId === confirmShown) { confirmShown = null; $('#confirmDialog').close(); }
+        break;
+      case 'confirmPending':
+      case 'confirmRequired':
+      case 'confirmResult':
+        banner(CB.confirmStatusText(m));
         break;
     }
   };
 
   ws.onclose = () => {
     setStatus('🔴 реконнект…');
+    // ответить без связи нельзя; ожидающее подтверждение мост повторит после переподключения
+    if (confirmShown) { confirmShown = null; $('#confirmDialog').close(); }
     scheduleReconnect();
   };
   ws.onerror = () => ws.close();
 }
 
-const NO_ID_TYPES = ['create', 'list', 'devices'];
+const NO_ID_TYPES = ['create', 'list', 'devices', 'confirm'];
 function send(obj) {
   if (ws && ws.readyState === 1 && (obj.id || NO_ID_TYPES.includes(obj.type))) {
     ws.send(JSON.stringify(obj));
@@ -536,6 +601,7 @@ function attach(id, save) {
   const v = viewport();
   send({ type: 'attach', id, cols: v.cols, rows: v.rows });
   renderTabs();
+  renderRequest(); // запрос текущей сессии — в приоритете
 }
 
 function renderTabs() {
@@ -578,8 +644,56 @@ function beep() {
   } catch {}
 }
 
+// ---- запросы разрешений агента: кнопки по choices → reply (D-4)
+
+const requests = CB.requestStore();
+let replying = null; // requestId, на который ушёл reply и ещё нет replyResult
+
+function renderRequest() {
+  const bar = $('#reqbar');
+  const r = requests.top(current);
+  if (!r) { bar.classList.add('hidden'); return; }
+  const more = requests.count() > 1 ? ` (+${requests.count() - 1})` : '';
+  const text = $('#reqText');
+  text.textContent = (r.title ? r.title + ': ' : '') + r.message + more;
+  text.onclick = () => { if (r.id !== current) attach(r.id, true); };
+  const box = $('#reqBtns');
+  box.innerHTML = '';
+  for (const c of r.choices) {
+    const b = document.createElement('button');
+    b.textContent = c.label; // подпись — как прислал мост (D-23.6)
+    b.dataset.decision = c.id;
+    b.disabled = replying === r.requestId;
+    b.addEventListener('click', () => {
+      if (replying) return; // двойное нажатие
+      replying = r.requestId;
+      send(CB.buildReply(r, c.id));
+      renderRequest();
+    });
+    box.appendChild(b);
+  }
+  bar.classList.remove('hidden');
+}
+
+function onRequestClosed(m) {
+  if (requests.close(m.id, m.requestId) && replying === m.requestId) replying = null;
+  renderRequest();
+}
+
+function onReplyResult(m) {
+  if (m.requestId === replying) replying = null;
+  if (m.ok) requests.close(m.id, m.requestId);
+  else if (m.error === 'stale') { requests.close(m.id, m.requestId); banner('⚠ Запрос уже закрыт'); }
+  else banner('⚠ Не удалось ответить — попробуйте ещё раз');
+  renderRequest();
+}
+
 function onNotify(m) {
-  const text = `${m.title || m.id}: ${m.message}`;
+  // D-20: повтор открытого запроса (после переподключения) — только кнопки, без сигнала
+  const r = requests.add(m);
+  if (r) renderRequest();
+  if (r === 'dup' || r === 'replayed') return;
+  const text = m.title ? `${m.title}: ${m.message}` : m.message;
   const banner = $('#banner');
   banner.textContent = '🔔 ' + text;
   banner.classList.remove('hidden');
@@ -594,6 +708,38 @@ function onNotify(m) {
   }
   renderTabs();
 }
+
+// ------------------------------------------------------------ подтверждения D-13
+// Веб-интерфейс в WebView телефона — клиент сопряжённого устройства: получает confirmRequest.
+// Браузеру владельца на ПК мост их не шлёт.
+
+let confirmShown = null; // confirmId открытого диалога
+const confirmSeen = new Set(); // повтор после переподключения — без повторного сигнала
+
+function onConfirmRequest(m) {
+  if (typeof m.confirmId !== 'string') return;
+  confirmShown = m.confirmId;
+  const p = CB.confirmPrompt(m);
+  $('#confirmText').textContent = p.text;
+  $('#confirmCode').textContent = p.code;
+  $('#confirmCodeBox').classList.toggle('hidden', !p.code);
+  const d = $('#confirmDialog');
+  if (!d.open) d.showModal();
+  if (confirmSeen.has(m.confirmId)) return;
+  confirmSeen.add(m.confirmId);
+  if (navigator.vibrate) navigator.vibrate([120, 60, 120]);
+  beep();
+}
+
+function answerConfirm(allow) {
+  if (confirmShown) send({ type: 'confirm', confirmId: confirmShown, allow });
+  confirmShown = null;
+  $('#confirmDialog').close();
+}
+$('#confirmAllow').addEventListener('click', () => answerConfirm(true));
+$('#confirmDeny').addEventListener('click', () => answerConfirm(false));
+// Esc / «назад» — отказ, а не «молча закрыть»
+$('#confirmDialog').addEventListener('cancel', (e) => { e.preventDefault(); answerConfirm(false); });
 
 // первый тап: разрешаем звук и спрашиваем разрешение на уведомления
 document.body.addEventListener('pointerdown', function once() {
@@ -805,40 +951,71 @@ function renderDevices(m) {
 
 // ------------------------------------------------------------ new session dialog
 
+function renderAgentOptions() {
+  const box = $('#agentOpts');
+  box.innerHTML = '';
+  const a = agents.find((x) => x.id === $('#agentSel').value);
+  for (const o of (a && a.options) || []) {
+    if (o.type !== 'bool') continue;
+    const label = document.createElement('label');
+    label.className = 'chk';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.dataset.opt = o.id;
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(' ' + o.label));
+    box.appendChild(label);
+  }
+}
+
 $('#newBtn').addEventListener('click', () => {
-  const sel = $('#projectSel');
-  sel.innerHTML = '';
+  if (!agents.length) { banner('⚠ На ПК нет доступных агентов'); return; }
+  const psel = $('#projectSel');
+  psel.innerHTML = '';
   for (const p of projects) {
     const o = document.createElement('option');
     o.value = p; o.textContent = p;
-    sel.appendChild(o);
+    psel.appendChild(o);
   }
+  const asel = $('#agentSel');
+  asel.innerHTML = '';
+  let remembered = null;
+  try { remembered = localStorage.getItem('lastAgent'); } catch { /* нет хранилища */ }
+  for (const a of agents) {
+    const o = document.createElement('option');
+    o.value = a.id; o.textContent = a.name;
+    asel.appendChild(o);
+  }
+  asel.value = agents.some((a) => a.id === remembered) ? remembered : defaultAgent;
+  renderAgentOptions();
   $('#projectCustom').value = '';
   $('#newDialog').showModal();
 });
+$('#agentSel').addEventListener('change', renderAgentOptions);
 $('#createCancel').addEventListener('click', () => $('#newDialog').close());
 $('#createOk').addEventListener('click', () => {
   const cwd = $('#projectCustom').value.trim() || $('#projectSel').value;
-  const cargs = [];
-  if ($('#optResume').checked) cargs.push('--resume');
-  if ($('#optDanger').checked) cargs.push('--dangerously-skip-permissions');
-  // resume при живой сессии в том же каталоге: если беседа ещё открыта в ней,
-  // claude не сможет продолжить тот же файл и молча создаст КОПИЮ беседы —
-  // так в списке resume появляются дубликаты. Предлагаем вернуться в живую.
-  if (cargs.includes('--resume')) {
-    const norm = (p) => (p || '').replace(/\/+$/, '');
-    const live = sessions.filter((s) => s.alive && norm(s.cwd) === norm(cwd));
-    if (live.length && window.confirm(
-        `В «${cwd}» уже есть живая сессия: ${live[0].title}.\n` +
-        `Если беседа ещё открыта в ней, resume создаст копию беседы.\n\n` +
-        `Открыть живую сессию вместо этого?`)) {
-      $('#newDialog').close();
-      attach(live[0].id, true);
-      return;
-    }
-  }
-  send({ type: 'create', cwd, args: cargs });
+  const checked = [...document.querySelectorAll('#agentOpts input[data-opt]')]
+    .filter((x) => x.checked).map((x) => x.dataset.opt);
+  const msg = CB.buildCreate($('#agentSel').value, checked, cwd);
+  try { if (msg.agent) localStorage.setItem('lastAgent', msg.agent); } catch { /* нет хранилища */ }
+  lastCreate = msg;
+  send(msg);
   $('#newDialog').close();
 });
+
+// D-7: живую сессию в том же каталоге находит мост (сравнение путей — только на мосту)
+function onCreateConflict(m) {
+  const live = Array.isArray(m.live) ? m.live : [];
+  if (!live.length || !lastCreate) return;
+  if (window.confirm(
+      `В «${m.cwd}» уже есть живая сессия: ${live[0].title}.\n` +
+      `Если беседа ещё открыта в ней, resume создаст копию беседы.\n\n` +
+      `Открыть живую сессию вместо этого?`)) {
+    attach(live[0].id, true);
+  } else {
+    send({ ...lastCreate, force: true });
+  }
+}
 
 connect();

@@ -2,9 +2,10 @@
 // Адаптер opencode v2 (D-2, D-12, D-14). Сессия создаётся через API фонового сервиса,
 // keeper запускает TUI `opencode.exe --server <url> --session <id>` с OPENCODE_PASSWORD
 // в окружении (keeper наследует childEnv моста), события — SSE, ответы — через API.
+const os = require('os');
 const { spawn } = require('child_process');
 const { npmShimExe } = require('../lib/agent-exe');
-const { findOnPath } = require('../lib/which');
+const { findOnPath, resolveSpawn } = require('../lib/which');
 const { cleanText, clipMiddle, displayText } = require('../lib/display-text');
 const { OpencodeClient } = require('./opencode-client');
 
@@ -46,7 +47,13 @@ function create(id, cfg, opts = {}) {
     start: () => {
       if (!command) return;
       try {
-        const child = spawn(command, [...prefixArgs, 'service', 'start'], { detached: true, windowsHide: true, stdio: 'ignore' });
+        // M-3: как keeper — через resolveSpawn (.cmd-шим и голое имя из PATH); каталог — домашний,
+        // а не текущий каталог моста
+        const { file, args } = resolveSpawn(command, [...prefixArgs, 'service', 'start']);
+        const verbatim = typeof args === 'string'; // .cmd: одна строка для cmd.exe /s /c
+        const child = spawn(file, verbatim ? [args] : args, {
+          cwd: os.homedir(), detached: true, windowsHide: true, stdio: 'ignore', windowsVerbatimArguments: verbatim,
+        });
         child.on('error', (e) => console.error('[opencode] opencode service start:', e.message));
         child.unref();
       } catch (e) {
@@ -87,6 +94,7 @@ function create(id, cfg, opts = {}) {
       const sid = session && session.agentState && session.agentState.opencodeSessionId;
       if (typeof sid !== 'string') return () => {};
       const known = new Map(); // requestId -> момент, когда запрос стал известен (now())
+      let lastStatusAt = -Infinity; // момент последнего события, влияющего на статус (now())
       const closed = new Set(); // id запросов закрыты навсегда (id не переиспользуются)
       const markClosed = (rid) => {
         known.delete(rid);
@@ -101,6 +109,7 @@ function create(id, cfg, opts = {}) {
       const finished = (message) => [{ kind: 'status', status: 'idle' }, { kind: 'notify', message, done: true }];
       return client.subscribe(sid, (evt) => {
         const d = evt.data || {};
+        if (evt.type !== 'bridge.resync') lastStatusAt = now();
         switch (evt.type) {
           case 'permission.asked':
             if (typeof d.id === 'string' && !known.has(d.id) && !closed.has(d.id)) emit(opened(d));
@@ -136,8 +145,19 @@ function create(id, cfg, opts = {}) {
               listed.add(p.id);
               if (!known.has(p.id) && !closed.has(p.id)) out.push(...opened(p));
             }
+            let closedAny = false;
             for (const [k, at] of [...known]) {
-              if (!listed.has(k) && at < startedAt) { markClosed(k); out.push({ kind: 'requestClosed', requestId: k }); }
+              if (!listed.has(k) && at < startedAt) {
+                markClosed(k);
+                closedAny = true;
+                out.push({ kind: 'requestClosed', requestId: k });
+              }
+            }
+            // M-5: открытых запросов не осталось — статус по списку активных сессий (running);
+            // без него — как в ветке permission.replied. Событие новее запроса списков не откатываем.
+            if (!known.size && lastStatusAt < startedAt) {
+              if (d.running === true || d.running === false) out.push({ kind: 'status', status: d.running ? 'working' : 'idle' });
+              else if (closedAny) out.push({ kind: 'status', status: 'working' });
             }
             if (out.length) emit(out);
             break;

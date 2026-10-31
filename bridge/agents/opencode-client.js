@@ -11,21 +11,30 @@ const https = require('https');
 const LOOPBACK = new Set(['127.0.0.1', 'localhost', '[::1]']);
 const SESSION_ID = /^ses_[A-Za-z0-9_-]{1,128}$/;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const NON_LOOPBACK = 'service.json указывает не на loopback — мост не отправит пароль';
+// M-4: общий предел ожидания сервиса при создании сессии (а не попытки × таймаут запроса)
+const ENSURE_DEADLINE_MS = 25000;
 
 function serviceFilePath(env = process.env) {
   const base = env.XDG_STATE_HOME || path.join(env.USERPROFILE || os.homedir(), '.local', 'state');
   return path.join(base, 'opencode', 'service.json');
 }
 
-/** service.json -> { url, password, pid, version } | null. Пароль не отправляется за пределы loopback. */
-function readServiceFile(file) {
+/** service.json -> { info } | { missing: true } | { refused: текст }. Пароль не отправляется за
+ *  пределы loopback (M-1); url — только origin: путь, query, hash и userinfo отбрасываются (M-2). */
+function parseServiceFile(file) {
   let j;
-  try { j = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
-  if (!j || typeof j.url !== 'string' || typeof j.password !== 'string' || !j.password) return null;
+  try { j = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return { missing: true }; }
+  if (!j || typeof j.url !== 'string' || typeof j.password !== 'string' || !j.password) return { missing: true };
   let u;
-  try { u = new URL(j.url); } catch { return null; }
-  if ((u.protocol !== 'http:' && u.protocol !== 'https:') || !LOOPBACK.has(u.hostname)) return null;
-  return { url: j.url.replace(/\/+$/, ''), password: j.password, pid: j.pid, version: j.version };
+  try { u = new URL(j.url); } catch { return { missing: true }; }
+  if ((u.protocol !== 'http:' && u.protocol !== 'https:') || !LOOPBACK.has(u.hostname)) return { refused: NON_LOOPBACK };
+  return { info: { url: u.origin, password: j.password, pid: j.pid, version: j.version } };
+}
+
+/** service.json -> { url, password, pid, version } | null (нет, битый или не loopback). */
+function readServiceFile(file) {
+  return parseServiceFile(file).info || null;
 }
 
 function authHeader(password) {
@@ -35,12 +44,16 @@ function authHeader(password) {
 class OpencodeClient {
   /** start() — запустить сервис (`opencode service start`), если он не отвечает.
    *  SSE: backoffMs..maxBackoffMs — пауза перед переподключением (удваивается, сброс после 200);
-   *  idleMs — тишина в потоке, после которой он считается мёртвым (v2.1.4 шлёт `: heartbeat` раз в 15 с). */
+   *  idleMs — тишина в потоке, после которой он считается мёртвым (v2.1.4 шлёт `: heartbeat` раз в 15 с).
+   *  Пауза сбрасывается только после первого байта тела потока (M-7): сервис, отвечающий 200 и сразу
+   *  закрывающий поток, не должен вызывать переподключения без паузы. */
   constructor({ file = serviceFilePath(), start = null, timeoutMs = 5000,
-    backoffMs = 500, maxBackoffMs = 10000, idleMs = 45000 } = {}) {
+    backoffMs = 500, maxBackoffMs = 10000, idleMs = 45000, ensureDeadlineMs = ENSURE_DEADLINE_MS } = {}) {
     this.file = file;
     this.start = start;
     this.timeoutMs = timeoutMs;
+    this.ensureDeadlineMs = ensureDeadlineMs;
+    this.ensuring = null;
     this.minBackoff = backoffMs;
     this.maxBackoff = maxBackoffMs;
     this.idleMs = idleMs;
@@ -55,7 +68,7 @@ class OpencodeClient {
 
   info() { return readServiceFile(this.file); }
 
-  request(method, pathname, body, info = this.info()) {
+  request(method, pathname, body, info = this.info(), timeoutMs = this.timeoutMs) {
     return new Promise((resolve, reject) => {
       if (!info) { reject(new Error('сервис opencode не найден (service.json)')); return; }
       const u = new URL(info.url + pathname);
@@ -63,7 +76,7 @@ class OpencodeClient {
       const data = body == null ? null : Buffer.from(JSON.stringify(body));
       const headers = { Authorization: authHeader(info.password), Accept: 'application/json' };
       if (data) { headers['Content-Type'] = 'application/json'; headers['Content-Length'] = data.length; }
-      const req = mod.request(u, { method, agent: false, timeout: this.timeoutMs, headers }, (res) => {
+      const req = mod.request(u, { method, agent: false, timeout: timeoutMs, headers }, (res) => {
         let s = '';
         res.setEncoding('utf8');
         res.on('data', (d) => { s += d; if (s.length > 4e6) req.destroy(new Error('opencode: слишком большой ответ')); });
@@ -80,17 +93,36 @@ class OpencodeClient {
     });
   }
 
-  async alive(info = this.info()) {
+  async alive(info = this.info(), timeoutMs = this.timeoutMs) {
     if (!info) return false;
-    try { return (await this.request('GET', '/api/info', null, info)).status === 200; } catch { return false; }
+    try { return (await this.request('GET', '/api/info', null, info, timeoutMs)).status === 200; } catch { return false; }
   }
 
-  async ensure({ attempts = 40, delayMs = 500 } = {}) {
-    if (await this.alive()) return this.info();
+  /** Сервис отвечает -> info; иначе запустить и ждать не дольше deadlineMs (M-4). Параллельные
+   *  вызовы (несколько сессий создаются разом) делят одну попытку и один запуск сервиса.
+   *  service.json не на loopback -> отказ без запуска (M-1). */
+  ensure({ deadlineMs = this.ensureDeadlineMs, delayMs = 500 } = {}) {
+    if (this.ensuring) return this.ensuring;
+    const p = this._ensure(deadlineMs, delayMs).finally(() => { if (this.ensuring === p) this.ensuring = null; });
+    this.ensuring = p;
+    return p;
+  }
+
+  async _ensure(deadlineMs, delayMs) {
+    const end = Date.now() + deadlineMs;
+    const left = () => Math.max(end - Date.now(), 1);
+    const check = async () => {
+      const st = parseServiceFile(this.file);
+      if (st.refused) throw new Error(st.refused);
+      return st.info && await this.alive(st.info, Math.min(this.timeoutMs, left())) ? st.info : null;
+    };
+    let info = await check();
+    if (info) return info;
     if (typeof this.start === 'function') this.start();
-    for (let i = 0; i < attempts; i++) {
-      await sleep(delayMs);
-      if (await this.alive()) return this.info();
+    while (Date.now() < end) {
+      await sleep(Math.min(delayMs, left()));
+      info = await check();
+      if (info) return info;
     }
     throw new Error('сервис opencode не отвечает (opencode service start)');
   }
@@ -106,25 +138,43 @@ class OpencodeClient {
     return id;
   }
 
+  /** Ожидающие запросы сессии. Неожиданная форма ответа — ошибка (M-6): ресинхронизация по
+   *  «пустому» списку закрыла бы все открытые запросы. */
   async listPermissions(sid) {
     const r = await this.request('GET', `/api/session/${encodeURIComponent(sid)}/permission`);
     if (r.status !== 200) throw new Error(`opencode: список разрешений недоступен (HTTP ${r.status})`);
-    const arr = Array.isArray(r.json) ? r.json : (r.json && Array.isArray(r.json.data) ? r.json.data : []);
+    const arr = Array.isArray(r.json) ? r.json : (r.json && Array.isArray(r.json.data) ? r.json.data : null);
+    if (!arr) throw new Error('opencode: неожиданный ответ на список разрешений');
     return arr.filter((p) => p && typeof p.id === 'string');
   }
 
-  /** 'ok' — принят (204), 'stale' — запроса уже нет (404 PermissionNotFoundError). */
+  /** Сессии, которые сейчас выполняются (GET /api/session/active, OpenAPI v2.1.4:
+   *  data: { ses_…: { type: 'running' } }; отсутствующие в ответе — неактивны). */
+  async activeSessions() {
+    const r = await this.request('GET', '/api/session/active');
+    const data = r.json && r.json.data;
+    if (r.status !== 200 || !data || typeof data !== 'object' || Array.isArray(data)) {
+      throw new Error(`opencode: неожиданный ответ на список активных сессий (HTTP ${r.status})`);
+    }
+    return new Set(Object.keys(data));
+  }
+
+  /** 'ok' — принят (204); 'stale' — запроса уже нет (404 PermissionNotFoundError, M-6);
+   *  прочие ответы, в т.ч. 404 SessionNotFoundError, — ошибка. */
   async replyPermission(sid, rid, decision) {
     const r = await this.request('POST',
       `/api/session/${encodeURIComponent(sid)}/permission/${encodeURIComponent(rid)}/reply`, { decision });
     if (r.status === 204 || r.status === 200) return 'ok';
-    if (r.status === 404) return 'stale';
-    throw new Error(`opencode: ответ на разрешение не принят (HTTP ${r.status})`);
+    const tag = r.json && (r.json._tag || r.json.name);
+    if (r.status === 404 && tag === 'PermissionNotFoundError') return 'stale';
+    throw new Error(`opencode: ответ на разрешение не принят (HTTP ${r.status}${typeof tag === 'string' ? ' ' + tag : ''})`);
   }
 
   /** Подписка на события одной сессии. handler(evt) получает события SSE с этим sessionID
-   *  и синтетическое { type:'bridge.resync', data:{ sessionID, permissions } } после (пере)подключения:
-   *  поток общий для всех сессий и пропущенное при обрыве не досылает (живая проба v2.1.4). */
+   *  и синтетическое { type:'bridge.resync', data:{ sessionID, startedAt, permissions, running } }
+   *  после (пере)подключения: поток общий для всех сессий и пропущенное при обрыве не досылает
+   *  (живая проба v2.1.4). startedAt — performance.now() в момент запроса списков; running —
+   *  выполняется ли сессия (true/false) или undefined, если список активных сессий недоступен. */
   subscribe(sid, handler) {
     this.closed = false;
     this.subs.set(sid, handler);
@@ -155,12 +205,17 @@ class OpencodeClient {
       if (this.sse !== req) { res.resume(); return; }
       if (res.statusCode !== 200) { res.resume(); this._dropSse(req); return; }
       this.sseOpen = true;
-      this.backoff = this.minBackoff;
       this._touch(req);
       this._resync([...this.subs.keys()]);
       // Buffer-чанки: парсер сам декодирует UTF-8 потоково (символ может быть разрезан между чанками)
       const feed = sseParser((evt) => this._dispatch(evt));
-      res.on('data', (chunk) => { this._touch(req); feed(chunk); });
+      let gotData = false;
+      res.on('data', (chunk) => {
+        // M-7: пауза переподключения сбрасывается по первому байту потока, а не по HTTP 200
+        if (!gotData) { gotData = true; this.backoff = this.minBackoff; }
+        this._touch(req);
+        feed(chunk);
+      });
       // обрыв со стороны сервиса: в зависимости от версии Node — end, error(aborted) или только close;
       // _dropSse идемпотентен
       res.on('end', () => this._dropSse(req));
@@ -229,9 +284,14 @@ class OpencodeClient {
   _resync(sids) {
     for (const sid of sids) {
       const startedAt = performance.now();
-      this.listPermissions(sid).then((permissions) => {
+      // M-5: выполняется ли сессия — чтобы после ресинхронизации статус не остался устаревшим;
+      // недоступный список активных сессий ресинхронизацию разрешений не отменяет
+      const running = this.activeSessions().then((set) => set.has(sid), () => undefined);
+      Promise.all([this.listPermissions(sid), running]).then(([permissions, run]) => {
         const handler = this.subs.get(sid);
-        if (handler) this._call(handler, { type: 'bridge.resync', data: { sessionID: sid, startedAt, permissions } });
+        if (handler) {
+          this._call(handler, { type: 'bridge.resync', data: { sessionID: sid, startedAt, permissions, running: run } });
+        }
       }).catch((e) => console.error('[opencode] ресинхронизация:', e.message));
     }
   }

@@ -193,3 +193,77 @@ test('service start failure (missing exe) does not crash the bridge', async () =
   }
   await assert.rejects(a.client.ensure({ attempts: 1, delayMs: 10 }), /не отвечает/);
 });
+
+test('M-3: service start goes through resolveSpawn (.cmd shim and bare name), cwd = home directory', async () => {
+  const dir = tmp();
+  const shim = path.join(dir, 'oc-fake.cmd');
+  const marker = path.join(dir, 'marker.txt');
+  fs.writeFileSync(shim, '@echo off\r\necho %*> "%~dp0marker.txt"\r\ncd>> "%~dp0marker.txt"\r\n');
+  const run = async (command) => {
+    try { fs.unlinkSync(marker); } catch { /* нет */ }
+    const a = oc.create('opencode', { command, prefixArgs: ['--pre'], serviceFile: path.join(dir, 'none.json') });
+    a.client.start();
+    const end = Date.now() + 10000;
+    while (!fs.existsSync(marker) || fs.readFileSync(marker, 'utf8').split(/\r?\n/).filter(Boolean).length < 2) {
+      if (Date.now() > end) throw new Error('shim did not run: ' + command);
+      await sleep(50);
+    }
+    return fs.readFileSync(marker, 'utf8').split(/\r?\n/).filter(Boolean);
+  };
+  let lines = await run(shim);
+  assert.deepStrictEqual(lines, ['"--pre" "service" "start"', os.homedir()]);
+  const oldPath = process.env.PATH;
+  process.env.PATH = dir + ';' + oldPath;
+  try {
+    lines = await run('oc-fake');
+  } finally {
+    process.env.PATH = oldPath;
+  }
+  assert.deepStrictEqual(lines, ['"--pre" "service" "start"', os.homedir()]);
+});
+
+test('M-5: resync sets the status when no known requests remain', () => {
+  const stub = stubClient();
+  let clock = 0;
+  const a = oc.create('opencode', { command: process.execPath }, { opencodeClient: stub, now: () => clock });
+  const ev = [];
+  a.subscribe({ id: 's1', agentState: { opencodeSessionId: 'ses_x' } }, (e) => ev.push(...e));
+  const h = stub.handler;
+  const statuses = () => ev.filter((e) => e.kind === 'status').map((e) => e.status);
+  const resync = (startedAt, permissions, running) =>
+    h({ type: 'bridge.resync', data: { sessionID: 'ses_x', startedAt, permissions, running } });
+
+  // после рестарта моста: запросов нет, сессия не выполняется -> idle; выполняется -> working
+  clock = 1;
+  resync(1, [], false);
+  assert.deepStrictEqual(statuses(), ['idle']);
+  ev.length = 0;
+  resync(2, [], true);
+  assert.deepStrictEqual(statuses(), ['working']);
+
+  // ресинхронизация закрыла последний запрос: статус по running, без него — как permission.replied
+  ev.length = 0;
+  clock = 10;
+  h({ type: 'permission.asked', data: { id: 'per_1', sessionID: 'ses_x', action: 'shell', resources: ['a'] } });
+  ev.length = 0;
+  resync(20, [], undefined);
+  assert.deepStrictEqual(ev, [{ kind: 'requestClosed', requestId: 'per_1' }, { kind: 'status', status: 'working' }]);
+
+  // открытый запрос остаётся -> статус не трогаем (waiting)
+  clock = 30;
+  h({ type: 'permission.asked', data: { id: 'per_2', sessionID: 'ses_x', action: 'shell', resources: ['b'] } });
+  ev.length = 0;
+  resync(40, [{ id: 'per_2', action: 'shell' }], false);
+  assert.deepStrictEqual(ev, []);
+  h({ type: 'permission.replied', data: { sessionID: 'ses_x', requestID: 'per_2' } });
+
+  // событие выполнения пришло позже запроса списков: устаревший running его не откатывает
+  clock = 50;
+  h({ type: 'session.execution.started', data: { sessionID: 'ses_x' } });
+  ev.length = 0;
+  resync(45, [], false);
+  assert.deepStrictEqual(statuses(), [], 'stale running=false does not override a newer execution event');
+  // ничего не известно (running недоступен, ничего не закрыто) — статус не трогаем
+  resync(60, [], undefined);
+  assert.deepStrictEqual(statuses(), []);
+});

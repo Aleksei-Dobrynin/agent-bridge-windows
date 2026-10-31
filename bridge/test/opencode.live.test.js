@@ -23,6 +23,7 @@ test('live opencode service: ensure, session, SSE, permission asked -> reply -> 
     const client = a.client;
     const spec = await a.spawnSpec({ cwd: os.tmpdir(), title: 'claude-bridge live test', options: { askShell: true }, rawArgs: [] });
     const sid = spec.state.opencodeSessionId;
+    let del = null;
     try {
       assert.match(sid, /^ses_/);
       assert.match(spec.args[spec.args.indexOf('--server') + 1], /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])/);
@@ -31,8 +32,7 @@ test('live opencode service: ensure, session, SSE, permission asked -> reply -> 
 
       const ev = [];
       const un = a.subscribe({ id: 'live', agentState: spec.state, runtime: {} }, (e) => ev.push(...e));
-      await sleep(1500); // поток открыт, ресинхронизация прошла
-      assert.strictEqual(client.sseOpen, true, 'SSE 200');
+      await waitUntil(() => client.sseOpen, 10000); // поток открыт (SSE 200)
 
       const created = await client.request('POST', `/api/session/${sid}/permission`,
         { action: 'shell', resources: ['echo claude-bridge-live'], save: ['echo *'] });
@@ -57,8 +57,9 @@ test('live opencode service: ensure, session, SSE, permission asked -> reply -> 
       assert.deepStrictEqual(await client.listPermissions(sid), []);
       un();
     } finally {
-      const del = await client.request('DELETE', `/api/session/${sid}`).catch((e) => ({ status: e.message }));
+      // только уборка: assert в finally заменил бы исходную ошибку теста
+      del = await client.request('DELETE', `/api/session/${sid}`).catch((e) => ({ status: e.message }));
       client.close();
-      assert.strictEqual(del.status, 204, 'тестовая сессия удалена');
     }
+    assert.strictEqual(del.status, 204, 'тестовая сессия удалена');
   });

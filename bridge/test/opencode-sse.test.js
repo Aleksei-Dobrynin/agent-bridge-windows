@@ -202,3 +202,37 @@ test('service file changes between reconnects are picked up (service restarted)'
   c.close();
   await fake2.close();
 });
+
+test('M-7: 200 without a single byte does not reset the reconnect backoff', async () => {
+  const fake = await mkFake();
+  fake.state.sseEmpty = true;
+  const c = mkClient({ file: fake.writeServiceFile(tmp()), backoffMs: 40, maxBackoffMs: 400 });
+  const got = [];
+  c.subscribe('ses_a', (e) => got.push(e));
+  await waitUntil(() => fake.state.sseConnects >= 5, 5000);
+  const t = fake.state.sseConnectTimes;
+  const gaps = t.slice(1).map((x, i) => x - t[i]);
+  assert.ok(gaps[0] >= 30, `first gap ${gaps[0]}`);
+  assert.ok(gaps[3] >= gaps[0] * 4, `gaps grow although every response was 200: ${gaps}`);
+  fake.state.sseEmpty = false;
+  await waitUntil(() => got.some((e) => e.type === 'bridge.resync'), 3000);
+  await waitUntil(() => c.backoff === 40, 3000);
+  c.close();
+  await fake.close();
+});
+
+test('M-5: resync carries running from /api/session/active and startedAt', async () => {
+  const fake = await mkFake();
+  fake.state.active.add('ses_a');
+  const c = mkClient({ file: fake.writeServiceFile(tmp()), backoffMs: 30 });
+  const a = [];
+  const b = [];
+  c.subscribe('ses_a', (e) => a.push(e));
+  c.subscribe('ses_b', (e) => b.push(e));
+  await waitUntil(() => a.some((e) => e.type === 'bridge.resync') && b.some((e) => e.type === 'bridge.resync'));
+  assert.strictEqual(a.find((e) => e.type === 'bridge.resync').data.running, true);
+  assert.strictEqual(b.find((e) => e.type === 'bridge.resync').data.running, false);
+  assert.strictEqual(typeof a.find((e) => e.type === 'bridge.resync').data.startedAt, 'number');
+  c.close();
+  await fake.close();
+});

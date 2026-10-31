@@ -1,5 +1,5 @@
 'use strict';
-/* global Terminal, FitAddon */
+/* global Terminal, FitAddon, CB */
 
 const $ = (s) => document.querySelector(s);
 const ESC = '\x1b';
@@ -412,6 +412,15 @@ $('#selCopy').addEventListener('click', () => {
 });
 $('#selCancel').addEventListener('click', clearSel);
 
+function insertAtCursor(inp, text) {
+  const s = inp.selectionStart == null ? inp.value.length : inp.selectionStart;
+  const e = inp.selectionEnd == null ? inp.value.length : inp.selectionEnd;
+  inp.value = inp.value.slice(0, s) + text + inp.value.slice(e);
+  const np = s + text.length;
+  try { inp.setSelectionRange(np, np); } catch { /* не критично */ }
+  inp.focus();
+}
+
 $('#pasteBtn').addEventListener('click', async () => {
   let text = '';
   if (typeof window.AndroidApp !== 'undefined' && window.AndroidApp.pasteText) {
@@ -419,16 +428,29 @@ $('#pasteBtn').addEventListener('click', async () => {
   } else if (navigator.clipboard) {
     try { text = await navigator.clipboard.readText(); } catch { /* нет доступа */ }
   }
+  text = CB.filterPaste(text); // L-10
   if (!text) { banner('📋 Буфер обмена пуст'); return; }
   // вставляем в поле ввода (в позицию курсора) — отправка отдельной кнопкой
-  const inp = $('#msg');
-  const s = inp.selectionStart == null ? inp.value.length : inp.selectionStart;
-  const e = inp.selectionEnd == null ? inp.value.length : inp.selectionEnd;
-  inp.value = inp.value.slice(0, s) + text + inp.value.slice(e);
-  const np = s + text.length;
-  try { inp.setSelectionRange(np, np); } catch { /* не критично */ }
-  inp.focus();
+  insertAtCursor($('#msg'), text);
 });
+
+// L-10: штатная вставка в поле ввода (меню долгого нажатия, Ctrl+V)
+$('#msg').addEventListener('paste', (e) => {
+  const text = e.clipboardData ? e.clipboardData.getData('text/plain') : '';
+  const clean = CB.filterPaste(text);
+  if (clean === text) return;
+  e.preventDefault();
+  insertAtCursor(e.target, clean);
+});
+
+// L-10: вставка прямо в терминал (Ctrl+V / меню браузера на ПК): перехватываем
+// на фазе захвата, до обработчика xterm, и вставляем очищенный текст
+term.element.addEventListener('paste', (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  const clean = CB.filterPaste(e.clipboardData ? e.clipboardData.getData('text/plain') : '');
+  if (clean && current) term.paste(clean);
+}, true);
 
 // Кнопка «в конец»: появляется, когда мы пролистали вверх
 const toBottom = $('#toBottom');

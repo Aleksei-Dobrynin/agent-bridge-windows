@@ -12,7 +12,7 @@
     return text
       .replace(/\r\n?/g, '\n')
       .replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '')
-      .replace(/[​-‏‪-‮⁦-⁩﻿]/g, '');
+      .replace(/[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, '');
   }
 
   return { filterPaste };

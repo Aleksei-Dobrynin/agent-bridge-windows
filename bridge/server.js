@@ -399,7 +399,7 @@ function connectKeeper(session, retries, state = { deadline: 0, delay: 500 }) {
 
 const BRIDGE_OWN_ENV = ['CLAUDE_BRIDGE_HOME', 'CLAUDE_BRIDGE_LISTEN_PORT', 'CLAUDE_BRIDGE_TEST'];
 
-async function createSession({ cwd, agentId, options, rawArgs, command, title, local }) {
+async function createSession({ cwd, agentId, options, rawArgs, command, title, local, force }) {
   // Произвольную КОМАНДУ и сырые аргументы задаёт только владелец (P-3); устройство —
   // только id агента и id его опций (D-5): командную строку мост строит сам.
   // КАТАЛОГ устройства ограничен разрешёнными проектами (D-7) — после P-3 это граница
@@ -420,6 +420,13 @@ async function createSession({ cwd, agentId, options, rawArgs, command, title, l
     : P.resolveRemoteCwd(cwd, CONFIG.projects, fallback);
   const opts = normalizeOptions(adapter, options);
   const extra = local ? (rawArgs || []) : [];
+  // D-7: resume рядом с живой сессией того же агента в этом каталоге — решает пользователь
+  // (resume открытой беседы создаёт её копию); пути сравнивает мост, клиент получает готовый
+  // признак createConflict и повторяет create с force:true (D-15 п. 2)
+  if (force !== true && adapter.isResumeLike({ options: opts, rawArgs: extra })) {
+    const live = [...sessions.values()].filter((x) => x.alive && x.agent === adapter.id && P.samePath(x.cwd, dir));
+    if (live.length) return { conflict: { cwd: dir, live: live.map((x) => ({ id: x.id, title: x.title })) } };
+  }
   const finalTitle = title || `${path.basename(dir) || dir} · ${adapter.name}`;
   // opencode создаёт сессию в своём сервисе (D-12) — асинхронно
   const spec = await adapter.spawnSpec({ cwd: dir, title: finalTitle, options: opts, rawArgs: extra });
@@ -494,7 +501,7 @@ async function createSession({ cwd, agentId, options, rawArgs, command, title, l
   connectKeeper(session, 20);
   startAgentEvents(session);
   broadcastSessions();
-  return session;
+  return { session };
 }
 
 // Восстановление живых сессий после перезапуска моста: meta-файл + рукопожатие по pipe.
@@ -1212,7 +1219,11 @@ wss.on('connection', (ws, req, who) => {
               m.args.every((a) => typeof a === 'string' && a.length <= 4096) ? m.args : [],
             command: local ? V.str(m.command, 1024) : null,
             local,
-          }).then((created) => wsSend(ws, { type: 'created', id: created.id }))
+            force: m.force === true,
+          }).then((r) => {
+            if (r.conflict) wsSend(ws, { type: 'createConflict', reason: 'resumeLive', ...r.conflict });
+            else wsSend(ws, { type: 'created', id: r.session.id });
+          })
             .catch((e) => {
               console.error('  Не удалось создать сессию:', e && e.message);
               wsSend(ws, { type: 'error',

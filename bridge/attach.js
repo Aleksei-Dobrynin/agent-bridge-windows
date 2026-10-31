@@ -150,11 +150,11 @@ function attach(id) {
 
 let createdAtMs = 0; // когда МЫ создали сессию — для диагностики мгновенной смерти
 
-function doCreate() {
+function doCreate(force) {
   createdAtMs = Date.now();
   const shown = args.length ? 'claude ' + args.join(' ') : 'claude';
   console.log(`Запускаю: ${shown}  (каталог ${process.cwd()})`);
-  send({ type: 'create', cwd: process.cwd(), args });
+  send({ type: 'create', cwd: process.cwd(), args, force: force === true });
 }
 
 /**
@@ -176,7 +176,7 @@ function maybeCreate(sessionsList) {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   rl.question('Всё равно продолжить с resume? [y/N]: ', (ans) => {
     rl.close();
-    if (/^[yд]/i.test(ans.trim())) doCreate();
+    if (/^[yд]/i.test(ans.trim())) doCreate(true);
     else die('Отменено.');
   });
 }
@@ -290,6 +290,21 @@ ws.on('message', (rawMsg) => {
     case 'created':
       attach(m.id);
       break;
+    case 'createConflict': {
+      // D-7: мост сам сравнил каталоги и нашёл живые сессии этого агента
+      const live = Array.isArray(m.live) ? m.live : [];
+      console.log('⚠ В этом каталоге уже есть живые сессии этого агента:');
+      for (const s of live) console.log(`    ${s.id}\t${s.title}`);
+      console.log('Если ваша беседа ещё открыта в одной из них, resume создаст её КОПИЮ.');
+      if (live.length) console.log(`Вернуться в живую сессию: claude-mobile -a ${live[live.length - 1].id}`);
+      if (!process.stdin.isTTY) { die('Отменено (нет интерактивной консоли).', 1); break; }
+      const q = readline.createInterface({ input: process.stdin, output: process.stdout });
+      q.question('Всё равно продолжить с resume? [y/N]: ', (ans) => {
+        q.close();
+        if (/^[yд]/i.test(ans.trim())) doCreate(true); else die('Отменено.');
+      });
+      break;
+    }
     case 'scrollback':
       enterRaw();
       process.stdout.write(m.data);

@@ -46,7 +46,7 @@ public class BridgeService extends Service {
     private static final String TAG = "BridgeService";
     public static final String SERVICE_TYPE = "_claude-bridge._tcp.";
     public static final String ACTION_STATE = "com.q.claudebridge.STATE";
-    public static final String ACTION_INPUT = "com.q.claudebridge.INPUT";
+    public static final String ACTION_REPLY = "com.q.claudebridge.REPLY";
     public static final String ACTION_RECONNECT = "com.q.claudebridge.RECONNECT";
     public static final String ACTION_VISIBILITY = "com.q.claudebridge.VISIBILITY";
     public static final String INTERNAL_PERM = "com.q.claudebridge.permission.INTERNAL";
@@ -86,6 +86,8 @@ public class BridgeService extends Service {
     // нужны, чтобы гасить устаревшие (ответили на ПК, пришло новое событие)
     private final java.util.Map<String, Integer> eventNids = new java.util.HashMap<>();
     private final java.util.Map<String, String> eventKinds = new java.util.HashMap<>();
+    // сессия -> requestId запроса, на который сейчас висят кнопки (D-4)
+    private final java.util.Map<String, String> eventReqs = new java.util.HashMap<>();
 
     private String token = null;
     private String certFp = null;
@@ -183,22 +185,15 @@ public class BridgeService extends Service {
             return stickiness();
         }
 
-        // Быстрый ответ из кнопки уведомления: шлём ввод в PTY, не открывая приложение
-        if (intent != null && ACTION_INPUT.equals(intent.getAction())) {
+        // Быстрый ответ из кнопки уведомления (D-4): решение по requestId, без открытия
+        // приложения. Мост сам переведёт его в клавиши/API и отвергнет устаревший ответ.
+        if (intent != null && ACTION_REPLY.equals(intent.getAction())) {
             String sess = intent.getStringExtra("session");
-            String data = intent.getStringExtra("data");
+            String json = Protocol.replyJson(sess, intent.getStringExtra("requestId"),
+                    intent.getStringExtra("decision"));
             int nid = intent.getIntExtra("nid", -1);
-            if (ws != null && connected && sess != null && data != null) {
-                try {
-                    JSONObject j = new JSONObject();
-                    j.put("type", "input");
-                    j.put("id", sess);
-                    j.put("data", data);
-                    ws.send(j.toString());
-                } catch (Exception e) {
-                    Log.w(TAG, "quick reply failed", e);
-                }
-            }
+            if (json != null && ws != null && connected) ws.send(json);
+            else if (json != null) toast("Нет связи с мостом — ответ не отправлен");
             if (nid >= 0) getSystemService(NotificationManager.class).cancel(nid);
             if (sess != null) cancelEventNotif(sess);
             // тап по залежавшемуся уведомлению не должен воскрешать демона
@@ -505,7 +500,18 @@ public class BridgeService extends Service {
                         showEvent(m.optString("title", "Claude Code"),
                                 m.optString("message", "Событие"),
                                 m.optString("id", ""),
-                                m.optString("event", ""));
+                                m.optString("event", ""),
+                                m.optString("requestId", ""),
+                                Protocol.parseChoices(m.optJSONArray("choices")));
+                    } else if ("requestClosed".equals(type)) {
+                        // ответили на ПК, в другом клиенте или агент ушёл дальше — кнопки неактуальны
+                        cancelRequestNotif(m.optString("id"), m.optString("requestId"));
+                    } else if ("replyResult".equals(type)) {
+                        if (!m.optBoolean("ok")) {
+                            toast("stale".equals(m.optString("error"))
+                                    ? "Запрос уже закрыт — ответ не отправлен"
+                                    : "Ответ не доставлен агенту");
+                        }
                     } else if ("status".equals(type)) {
                         // Claude снова работает (например, ответили на ПК) —
                         // уведомление этой сессии больше не актуально
@@ -814,21 +820,20 @@ public class BridgeService extends Service {
         return s;
     }
 
-    private Notification.Action quickAction(String sessionId, String data, String label,
-                                            int nid, boolean requireAuth) {
+    private Notification.Action replyAction(String sessionId, String requestId, Protocol.Choice c, int nid) {
         Intent i = new Intent(this, BridgeService.class)
-                .setAction(ACTION_INPUT)
+                .setAction(ACTION_REPLY)
                 .putExtra("session", sessionId)
-                .putExtra("data", data)
+                .putExtra("requestId", requestId)
+                .putExtra("decision", c.id)
                 .putExtra("nid", nid);
         PendingIntent pi = PendingIntent.getService(this, reqSeq++, i,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         Notification.Action.Builder ab = new Notification.Action.Builder(
                 android.graphics.drawable.Icon.createWithResource(this, R.drawable.ic_stat),
-                label, pi);
-        // при включённой биометрии нажатие требует разблокировки устройства
-        // (иначе ответ Claude'у можно было бы дать прямо с локскрина)
-        if (requireAuth && Build.VERSION.SDK_INT >= 31) ab.setAuthenticationRequired(true);
+                c.label, pi);
+        // M-4: ответ агенту — только с разблокированного телефона, всегда (не только при биометрии)
+        if (Build.VERSION.SDK_INT >= 31) ab.setAuthenticationRequired(true);
         return ab.build();
     }
 
@@ -839,28 +844,52 @@ public class BridgeService extends Service {
         synchronized (eventNids) {
             nid = eventNids.remove(sessionId);
             eventKinds.remove(sessionId);
+            eventReqs.remove(sessionId);
         }
         if (nid != null) getSystemService(NotificationManager.class).cancel(nid);
     }
 
-    private void showEvent(String title, String message, String sessionId, String event) {
+    /** Убрать уведомление с кнопками, только если оно относится к закрытому запросу. */
+    private void cancelRequestNotif(String sessionId, String requestId) {
+        if (sessionId == null || requestId == null || requestId.isEmpty()) return;
+        boolean match;
+        synchronized (eventNids) { match = requestId.equals(eventReqs.get(sessionId)); }
+        if (match) cancelEventNotif(sessionId);
+    }
+
+    private void toast(String text) {
+        handler.post(() -> android.widget.Toast.makeText(getApplicationContext(), text,
+                android.widget.Toast.LENGTH_LONG).show());
+    }
+
+    private void showEvent(String title, String message, String sessionId, String event,
+                           String requestId, java.util.List<Protocol.Choice> choices) {
         NotificationManager nm = getSystemService(NotificationManager.class);
+        boolean isRequest = "request".equals(event) && Protocol.validSessionId(sessionId)
+                && Protocol.validRequestId(requestId) && !choices.isEmpty();
+        int nid;
         synchronized (eventNids) {
-            // новое событие заменяет прежнее уведомление этой же сессии
+            // новое событие заменяет прежнее уведомление этой же сессии; повтор того же
+            // запроса (D-20: мост заново шлёт открытые запросы переподключившемуся клиенту)
+            // обновляет уведомление на месте, без повторного звука (setOnlyAlertOnce)
             Integer prev = eventNids.remove(sessionId);
-            if (prev != null) { nm.cancel(prev); eventKinds.remove(sessionId); }
-            // «Claude завершил ответ» устаревает, как только пришло любое новое событие
+            boolean same = isRequest && prev != null && requestId.equals(eventReqs.get(sessionId));
+            if (prev != null && !same) nm.cancel(prev);
+            eventKinds.remove(sessionId);
+            eventReqs.remove(sessionId);
+            // «агент завершил ответ» устаревает, как только пришло любое новое событие
             var it = eventNids.entrySet().iterator();
             while (it.hasNext()) {
                 var e = it.next();
-                if ("Stop".equals(eventKinds.get(e.getKey()))) {
+                if ("done".equals(eventKinds.get(e.getKey()))) {
                     nm.cancel(e.getValue());
                     eventKinds.remove(e.getKey());
+                    eventReqs.remove(e.getKey());
                     it.remove();
                 }
             }
+            nid = same ? prev : eventSeq++;
         }
-        int nid = eventSeq++;
         // cbAuth — секрет из приватных prefs: подтверждает, что intent с session
         // создан нами. Чужое приложение (экспортированная MainActivity) его не
         // знает, поэтому не сможет заставить нас переключить сессию (F15).
@@ -877,23 +906,23 @@ public class BridgeService extends Service {
                 .setContentText(message)
                 .setStyle(new Notification.BigTextStyle().bigText(message))
                 .setContentIntent(pi)
+                .setOnlyAlertOnce(true)
                 // при биометрии на локскрине не показываем ничего, иначе только заголовок
                 .setVisibility(biolock ? Notification.VISIBILITY_SECRET : Notification.VISIBILITY_PRIVATE)
                 .setAutoCancel(true);
-        // Claude ждёт ответа — отвечаем прямо из уведомления. Но при включённой
-        // биометрии кнопки НЕ должны срабатывать с локскрина без разблокировки:
-        //  • API ≥ 31: требуем разблокировку на нажатие (setAuthenticationRequired);
-        //  • API < 31 (нельзя защитить кнопку): не показываем кнопки вовсе.
-        if ("Notification".equals(event) && sessionId != null && !sessionId.isEmpty()
-                && (!biolock || Build.VERSION.SDK_INT >= 31)) {
-            b.addAction(quickAction(sessionId, "1", "Да (1)", nid, biolock));
-            b.addAction(quickAction(sessionId, "2", "Всегда (2)", nid, biolock));
-            b.addAction(quickAction(sessionId, "\u001b", "Нет (Esc)", nid, biolock));
+        // Агент ждёт ответа — кнопки по choices от моста (D-4). Нажатие требует
+        // разблокировки (API >= 31); на API < 31 «Всегда» не показываем, а при биометрии
+        // кнопок нет вовсе (M-4). Без choices (generic, D-23.4) — без кнопок.
+        if (isRequest && Protocol.canShowActions(Build.VERSION.SDK_INT, biolock)) {
+            for (Protocol.Choice c : Protocol.visibleChoices(choices, Build.VERSION.SDK_INT)) {
+                b.addAction(replyAction(sessionId, requestId, c, nid));
+            }
         }
         if (sessionId != null && !sessionId.isEmpty()) {
             synchronized (eventNids) {
                 eventNids.put(sessionId, nid);
                 eventKinds.put(sessionId, event);
+                if (isRequest) eventReqs.put(sessionId, requestId);
             }
         }
         nm.notify(nid, b.build());

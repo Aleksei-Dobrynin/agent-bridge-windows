@@ -7,6 +7,15 @@
 /** Esc: нажатие + отпускание. ConPTY принимает эту кодировку и без включённого режима. */
 const ESC = '\x1b[27;1;27;1;0;1_\x1b[27;1;27;0;0;1_';
 
+/** Выключить win32-input-mode консоли: claude-mobile пишет его при отсоединении — агент мог
+ *  включить режим в консоли пользователя через свой вывод (\x1b[?9001h от Claude Code). */
+const MODE_OFF = '\x1b[?9001l';
+
+/** Сброс режимов консоли при отсоединении claude-mobile (D-25 п. 5): кроме win32-input-mode
+ *  агент мог включить отчёт о фокусе (?1004), отслеживание мыши (?1000/?1002/?1003, SGR ?1006)
+ *  и альтернативный экран (?1049) — без сброса они остались бы в консоли пользователя. */
+const CONSOLE_RESET = MODE_OFF + ['1004', '1000', '1002', '1003', '1006', '1049'].map((m) => `\x1b[?${m}l`).join('');
+
 /** Нажатие клавиши с символом 28 (FS) — Ctrl+\ в win32-input-mode. */
 const CTRL_BACKSLASH_PRESS = /\x1b\[\d+;\d+;28;1;\d+;\d+_/;
 
@@ -16,4 +25,4 @@ function isCtrlBackslash(s) {
   return s === '\x1c' || CTRL_BACKSLASH_PRESS.test(s);
 }
 
-module.exports = { ESC, isCtrlBackslash };
+module.exports = { ESC, MODE_OFF, CONSOLE_RESET, isCtrlBackslash };

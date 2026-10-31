@@ -161,7 +161,16 @@ function die(msg, code) {
 }
 
 function cleanup() {
-  if (raw && process.stdin.isTTY) { raw = false; try { process.stdin.setRawMode(false); } catch { /* консоль уже закрыта */ } }
+  if (raw && process.stdin.isTTY) {
+    raw = false;
+    try { process.stdin.setRawMode(false); } catch { /* консоль уже закрыта */ }
+    // агент мог включить в этой консоли win32-input-mode (\x1b[?9001h проходит через наш вывод),
+    // мышь, отчёт о фокусе, альтернативный экран: без сброса следующая программа в консоли
+    // получает клавиши как \x1b[…_ (D-25 п. 5)
+    if (process.stdout.isTTY) {
+      try { process.stdout.write(W32.CONSOLE_RESET); } catch { /* консоль уже закрыта */ }
+    }
+  }
 }
 // любой выход (в т.ч. process.exit из веток ниже) возвращает консоль из raw-режима
 process.on('exit', cleanup);

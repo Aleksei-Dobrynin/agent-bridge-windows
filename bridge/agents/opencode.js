@@ -5,39 +5,27 @@
 const { spawn } = require('child_process');
 const { npmShimExe } = require('../lib/agent-exe');
 const { findOnPath } = require('../lib/which');
+const { cleanText, clipMiddle, displayText } = require('../lib/display-text');
 const { OpencodeClient } = require('./opencode-client');
 
 const EXE_REL = ['node_modules', '@opencode', 'cli', 'bin', 'opencode.exe'];
 const OPTIONS = [{ id: 'askShell', label: 'Спрашивать разрешение на команды', type: 'bool' }];
 const ASK_SHELL = [{ action: 'shell', resource: '*', effect: 'ask' }];
 const DECISIONS = new Set(['once', 'always', 'reject']);
-const MAX_MESSAGE = 400;
 const MAX_CLOSED = 256;
-// управляющие C0/C1, невидимые и bidi-символы (U+200B…U+200F, U+2028…U+202E, U+2060…U+206F, BOM):
-// иначе prompt injection прячет хвост команды — а именно его человек одобряет с телефона (как D-19 п. 2)
-const INVISIBLE_RANGES = [[0x00, 0x1f], [0x7f, 0x9f], [0xad, 0xad], [0x61c, 0x61c], [0x180e, 0x180e],
-  [0x200b, 0x200f], [0x2028, 0x202e], [0x2060, 0x206f], [0xfeff, 0xfeff]];
-const invisible = (ch) => { const c = ch.codePointAt(0); return INVISIBLE_RANGES.some(([lo, hi]) => c >= lo && c <= hi); };
-
-function clean(s) {
-  return String(s).replace(/[\t\r\n\v\f]/g, ' ').replace(/./gsu, (ch) => (invisible(ch) ? '' : ch)).replace(/\s+/g, ' ').trim();
-}
-
-/** Длинное значение — «начало…конец (N симв.)»: хвост команды остаётся виден. */
-function clipMiddle(s, n) {
-  if (s.length <= n) return s;
-  const note = ` (${s.length} симв.)`;
-  const keep = Math.max(n - note.length - 1, 10);
-  const head = Math.ceil(keep / 2);
-  return s.slice(0, head) + '…' + s.slice(s.length - (keep - head)) + note;
-}
+// D-19 п. 2 (общий санитайзер): длинное значение — «начало…конец (N симв.)»
+const ACTION_CLIP = { max: 40, head: 24, tail: 10 };
+const MESSAGE_CLIP = { max: 120, head: 60, tail: 40 };
 
 function describe(p) {
-  const action = typeof p.action === 'string' && clean(p.action) ? clipMiddle(clean(p.action), 40) : 'действие';
-  const res = Array.isArray(p.resources) ? p.resources.filter((x) => typeof x === 'string').map(clean).filter(Boolean) : [];
-  const prefix = `opencode просит разрешение — ${action}`;
-  if (!res.length) return prefix;
-  return prefix + ': ' + clipMiddle(res.join(', '), MAX_MESSAGE - prefix.length - 2);
+  const action = (typeof p.action === 'string' && displayText(p.action, ACTION_CLIP)) || 'действие';
+  const res = Array.isArray(p.resources) ? p.resources.filter((x) => typeof x === 'string').map(cleanText).filter(Boolean) : [];
+  let text = `opencode просит разрешение — ${action}`;
+  if (res.length) text += ': ' + clipMiddle(res.join(', '));
+  // необязательный текст запроса для человека (в v2.1.4 его нет, D-12 «Живая проба»)
+  const message = typeof p.message === 'string' ? displayText(p.message, MESSAGE_CLIP) : '';
+  if (message) text += ' — ' + message;
+  return text;
 }
 
 function choicesFor(p) {

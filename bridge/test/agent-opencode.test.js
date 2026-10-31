@@ -162,6 +162,24 @@ test('request text: invisible/bidi characters removed, whitespace collapsed, lon
   assert.ok(msg.length <= 500, String(msg.length));
 });
 
+test('request text: optional permission message is shown, sanitized and clipped', () => {
+  const stub = stubClient();
+  const a = oc.create('opencode', { command: process.execPath }, { opencodeClient: stub });
+  const ev = [];
+  a.subscribe({ id: 's1', agentState: { opencodeSessionId: 'ses_x' } }, (e) => ev.push(...e));
+  stub.handler({ type: 'permission.asked', data: { id: 'per_1', sessionID: 'ses_x', action: 'shell',
+    resources: ['echo hi'], message: 'Run\u202E the\n\ntests\u200B' } });
+  stub.handler({ type: 'permission.asked', data: { id: 'per_2', sessionID: 'ses_x', action: 'edit',
+    resources: ['a.txt'], message: 42 } });
+  stub.handler({ type: 'permission.asked', data: { id: 'per_3', sessionID: 'ses_x', action: 'shell',
+    resources: ['x'.repeat(600)], message: 'm'.repeat(150) + 'END' + '\n'.repeat(5) } });
+  const msgs = ev.filter((e) => e.kind === 'request').map((e) => e.message);
+  assert.strictEqual(msgs[0], 'opencode просит разрешение — shell: echo hi — Run the tests');
+  assert.strictEqual(msgs[1], 'opencode просит разрешение — edit: a.txt', 'non-string message ignored');
+  assert.match(msgs[2], /END( \(\d+ симв\.\))?$/, 'tail of a long message is visible');
+  assert.ok(msgs[2].length <= 500, String(msgs[2].length));
+});
+
 test('service start failure (missing exe) does not crash the bridge', async () => {
   const a = oc.create('opencode', { command: path.join(tmp(), 'no-opencode.exe'), serviceFile: path.join(tmp(), 'none.json') });
   assert.strictEqual(a.available(), false);

@@ -7,6 +7,7 @@
 const crypto = require('crypto');
 const { npmShimExe } = require('../lib/agent-exe');
 const { findOnPath } = require('../lib/which');
+const { displayText } = require('../lib/display-text');
 
 const EXE_REL = ['node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe'];
 const OPTIONS = Object.freeze([
@@ -28,10 +29,6 @@ const toolHasButtons = (n) => typeof n === 'string' && (BUTTON_TOOLS.has(n) || /
 // после активного ввода относится к уже отвеченному диалогу
 const LATE_NOTIFICATION_MS = 8000;
 const ANSWERED_MAX = 16;
-// D-19 п. 2: длинное значение — начало…конец, чтобы хвост команды был виден
-const TEXT_MAX = 200;
-const HEAD = 100;
-const TAIL = 60;
 
 // D-19 п. 1, M-4: ввод, который не является ответом на диалог. Ввод пассивен, только если
 // целиком состоит из таких последовательностей. Мышь: колесо (бит 64) и движение (бит 32) —
@@ -63,23 +60,12 @@ function isPassiveInput(data) {
   return data.length > 0;
 }
 
-// D-19 п. 2: невидимые/bidi (Cf), разделители строк/абзацев и C0/C1 не попадают в уведомление
-function clip(s) {
-  const t = String(s)
-    .replace(/\p{Cf}/gu, '')
-    .replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  const cps = Array.from(t);
-  if (cps.length <= TEXT_MAX) return t;
-  return cps.slice(0, HEAD).join('') + '…' + cps.slice(-TAIL).join('') + ` (${cps.length} симв.)`;
-}
-
 function describeTool(p) {
   const name = typeof p.tool_name === 'string' && p.tool_name ? p.tool_name : 'инструмент';
   const ti = p.tool_input && typeof p.tool_input === 'object' ? p.tool_input : {};
   const detail = [ti.command, ti.file_path, ti.url, ti.pattern, ti.path].find((v) => typeof v === 'string' && v) || '';
-  return clip(name + (detail ? ': ' + detail : ''));
+  // D-19 п. 2: невидимые/bidi символы и переводы строк не прячут хвост команды
+  return displayText(name + (detail ? ': ' + detail : ''));
 }
 
 function stable(v) {
@@ -162,7 +148,7 @@ function create(id, cfg, opts = {}) {
         return show(r, item);
       }
       case 'Notification': {
-        const msg = typeof p.message === 'string' && p.message ? clip(p.message) : '';
+        const msg = typeof p.message === 'string' && p.message ? displayText(p.message) : '';
         if (p.notification_type === 'permission_prompt') {
           if (r.open || now() - r.lastActiveAt < LATE_NOTIFICATION_MS) return [];
           if (r.sawPermissionRequest) return [{ kind: 'notify', message: msg || 'Claude просит разрешение' }];

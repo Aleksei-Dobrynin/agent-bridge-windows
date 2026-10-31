@@ -10,9 +10,10 @@
   function filterPaste(text) {
     if (typeof text !== 'string') return '';
     return text
-      .replace(/\r\n?/g, '\n')
+      .replace(/\r\n?|[\p{Zl}\p{Zp}]/gu, '\n') // U+2028/U+2029 — тоже перевод строки
       .replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '')
-      .replace(/[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, '');
+      // невидимые символы формата (Cf): bidi, нулевой ширины, мягкий перенос, теги U+E0000…
+      .replace(/\p{Cf}/gu, '');
   }
 
   /** D-10: прокрутка альтернативного экрана способом, который объявил адаптер агента:
@@ -35,11 +36,41 @@
     return { type: 'create', agent: typeof agent === 'string' && agent ? agent : null, options, cwd };
   }
 
+  /** D-22.3: контрольный код — ровно 4 цифры строкой (иное не показываем). */
+  function isCheckCode(c) {
+    return typeof c === 'string' && /^[0-9]{4}$/.test(c);
+  }
+
+  /** M-7: текст ошибки моста для баннера; без текста — общий. */
+  function errorText(m) {
+    return '⚠ ' + (m && typeof m.message === 'string' && m.message ? m.message : 'Ошибка моста');
+  }
+
+  /** M-9: заголовок системного уведомления — имя агента сессии. */
+  function notifyTitle(sessions, id) {
+    const s = Array.isArray(sessions) && id ? sessions.find((x) => x && x.id === id) : null;
+    return s && typeof s.agentName === 'string' && s.agentName ? s.agentName : 'Agent Bridge';
+  }
+
+  /** M-5: множество последних limit ключей (старые вытесняются; повторное добавление освежает). */
+  function boundedSet(limit) {
+    const set = new Set();
+    return {
+      has: (k) => set.has(k),
+      add(k) {
+        set.delete(k);
+        set.add(k);
+        while (set.size > limit) set.delete(set.values().next().value);
+      },
+      size: () => set.size,
+    };
+  }
+
   /** D-13: текст диалога подтверждения операции владельца на телефоне; D-22.3: контрольный код
    *  из 4 цифр человек сверяет с консолью ПК — показывается отдельно и крупно. */
   function confirmPrompt(m) {
     const msg = m && typeof m.message === 'string' && m.message ? m.message : 'Разрешить операцию на ПК?';
-    const code = m && typeof m.checkCode === 'string' && /^\d{4}$/.test(m.checkCode) ? m.checkCode : '';
+    const code = m && isCheckCode(m.checkCode) ? m.checkCode : '';
     return { text: msg + '\n\nЕсли вы этого не запускали — отклоните.', code };
   }
 
@@ -49,7 +80,7 @@
     if (!m) return null;
     if (m.type === 'confirmPending') {
       return '📱 ' + (m.message || 'Подтвердите операцию на телефоне') +
-        (typeof m.checkCode === 'string' && m.checkCode ? ' Код: ' + m.checkCode : '');
+        (isCheckCode(m.checkCode) ? ' Код: ' + m.checkCode : '');
     }
     if (m.type === 'confirmRequired') return '⚠ Операция требует подтверждения в консоли claude-mobile';
     if (m.type !== 'confirmResult') return null;
@@ -83,9 +114,9 @@
    *  подписи — как прислал мост (D-23.6). D-20: после переподключения мост повторяет открытые
    *  запросы — reconnect() забывает прежний список (закрытые за время обрыва уходят), но помнит
    *  requestId, чтобы повтор не сигналил как новый. */
-  function requestStore() {
+  function requestStore({ seenLimit = 500 } = {}) {
     const map = new Map(); // requestId -> { id, requestId, message, title, at, choices, seq }
-    const seen = new Set();
+    const seen = boundedSet(seenLimit); // M-5: память о виденных requestId ограничена
     let seq = 0;
     return {
       /** 'new' | 'replayed' | 'dup' — запрос с кнопками; null — кнопок нет. */
@@ -135,8 +166,29 @@
     return { type: 'reply', id: req.id, requestId: req.requestId, decision };
   }
 
+  /** Защита от «нажатия вслепую» (ревью I-1, I-2): только что показанный элемент (запрос
+   *  разрешения, диалог подтверждения) принимает нажатие не раньше чем через delayMs и только
+   *  для себя — второе касание двойного нажатия не одобрит то, что появилось под пальцем.
+   *  arm(key, now, force) — показан key; true, если вооружено заново (новый key или force). */
+  function armGuard(delayMs) {
+    let armedKey = null;
+    let armedAt = 0;
+    return {
+      arm(key, now, force) {
+        if (key === armedKey && !force) return false;
+        armedKey = key == null ? null : key;
+        armedAt = now;
+        return true;
+      },
+      ready: (now) => armedKey !== null && now - armedAt >= delayMs,
+      accept: (key, now) => armedKey !== null && key === armedKey && now - armedAt >= delayMs,
+      remaining: (now) => (armedKey === null ? 0 : Math.max(0, delayMs - (now - armedAt))),
+      key: () => armedKey,
+    };
+  }
+
   return {
     filterPaste, scrollSequence, buildCreate, confirmPrompt, confirmStatusText, replayGate,
-    requestStore, buildReply,
+    requestStore, buildReply, armGuard, boundedSet, errorText, notifyTitle,
   };
 });

@@ -21,7 +21,10 @@ let projects = [];
 let agents = [];          // D-5: [{ id, name, options:[{id,label,type}], scroll }] от моста
 let defaultAgent = null;
 let lastCreate = null;    // последний create — для повтора с force после createConflict
-let current = localStorage.getItem('currentSession') || null;
+// M-8: localStorage может быть недоступен (приватный режим, запрет хранилища) — без исключений
+function lsGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
+function lsSet(k, v) { try { localStorage.setItem(k, v); } catch { /* нет хранилища */ } }
+let current = lsGet('currentSession') || null;
 let reconnectDelay = 500;
 let audioCtx = null;
 
@@ -558,7 +561,7 @@ function connect() {
         onCreateConflict(m);
         break;
       case 'error':
-        banner('⚠ ' + m.message);
+        banner(CB.errorText(m)); // M-7
         break;
       case 'confirmRequest':
         onConfirmRequest(m);
@@ -578,6 +581,10 @@ function connect() {
     setStatus('🔴 реконнект…');
     // ответить без связи нельзя; ожидающее подтверждение мост повторит после переподключения
     if (confirmShown) { confirmShown = null; $('#confirmDialog').close(); }
+    // M-3: без связи кнопки запроса не работают — прячем; открытые запросы мост повторит (D-20)
+    requests.reconnect();
+    replying = null;
+    renderRequest();
     scheduleReconnect();
   };
   ws.onerror = () => ws.close();
@@ -596,7 +603,7 @@ function setStatus(t) { $('#status').textContent = t; }
 
 function attach(id, save) {
   current = id;
-  if (save) localStorage.setItem('currentSession', id);
+  if (save) lsSet('currentSession', id);
   document.body.classList.add('has-session');
   const v = viewport();
   send({ type: 'attach', id, cols: v.cols, rows: v.rows });
@@ -648,11 +655,16 @@ function beep() {
 
 const requests = CB.requestStore();
 let replying = null; // requestId, на который ушёл reply и ещё нет replyResult
+// I-1: новый запрос под пальцем не одобряется вторым касанием двойного нажатия
+const REQ_ARM_MS = 500;
+const reqArm = CB.armGuard(REQ_ARM_MS);
 
 function renderRequest() {
   const bar = $('#reqbar');
   const r = requests.top(current);
-  if (!r) { bar.classList.add('hidden'); return; }
+  if (!r) { reqArm.arm(null, Date.now()); bar.classList.add('hidden'); return; }
+  if (reqArm.arm(r.requestId, Date.now())) setTimeout(renderRequest, REQ_ARM_MS + 20);
+  const armed = reqArm.ready(Date.now());
   const more = requests.count() > 1 ? ` (+${requests.count() - 1})` : '';
   const text = $('#reqText');
   text.textContent = (r.title ? r.title + ': ' : '') + r.message + more;
@@ -663,9 +675,10 @@ function renderRequest() {
     const b = document.createElement('button');
     b.textContent = c.label; // подпись — как прислал мост (D-23.6)
     b.dataset.decision = c.id;
-    b.disabled = replying === r.requestId;
+    b.disabled = !armed || replying === r.requestId;
     b.addEventListener('click', () => {
       if (replying) return; // двойное нажатие
+      if (!reqArm.accept(r.requestId, Date.now())) return; // I-1: кнопки другого/только что показанного запроса
       replying = r.requestId;
       send(CB.buildReply(r, c.id));
       renderRequest();
@@ -704,7 +717,7 @@ function onNotify(m) {
   beep();
 
   if (window.Notification && Notification.permission === 'granted' && document.hidden) {
-    try { new Notification('Claude Code', { body: text }); } catch {}
+    try { new Notification(CB.notifyTitle(sessions, m.id), { body: text }); } catch {} // M-9
   }
   renderTabs();
 }
@@ -714,7 +727,9 @@ function onNotify(m) {
 // Браузеру владельца на ПК мост их не шлёт.
 
 let confirmShown = null; // confirmId открытого диалога
-const confirmSeen = new Set(); // повтор после переподключения — без повторного сигнала
+const CONFIRM_ARM_MS = 700;
+const confirmArm = CB.armGuard(CONFIRM_ARM_MS);
+const confirmSeen = CB.boundedSet(500); // повтор после переподключения — без сигнала (M-5: последние 500)
 
 function onConfirmRequest(m) {
   if (typeof m.confirmId !== 'string') return;
@@ -724,14 +739,27 @@ function onConfirmRequest(m) {
   $('#confirmCode').textContent = p.code;
   $('#confirmCodeBox').classList.toggle('hidden', !p.code);
   const d = $('#confirmDialog');
-  if (!d.open) d.showModal();
+  const wasOpen = d.open;
+  if (!wasOpen) d.showModal();
+  // I-2: «Разрешить» — не раньше чем через 700 мс после показа или смены запроса; фокус — на «Отклонить»
+  if (confirmArm.arm(m.confirmId, Date.now(), !wasOpen)) {
+    $('#confirmAllow').disabled = true;
+    $('#confirmDeny').focus();
+    setTimeout(updateConfirmAllow, CONFIRM_ARM_MS + 20);
+  }
   if (confirmSeen.has(m.confirmId)) return;
   confirmSeen.add(m.confirmId);
   if (navigator.vibrate) navigator.vibrate([120, 60, 120]);
   beep();
 }
 
+function updateConfirmAllow() {
+  $('#confirmAllow').disabled = !confirmArm.ready(Date.now());
+}
+
 function answerConfirm(allow) {
+  // I-2: одобрение только вооружённого (показанного не менее 700 мс) запроса; отказ — всегда
+  if (allow && !confirmArm.accept(confirmShown, Date.now())) return;
   if (confirmShown) send({ type: 'confirm', confirmId: confirmShown, allow });
   confirmShown = null;
   $('#confirmDialog').close();
@@ -762,7 +790,8 @@ for (const btn of document.querySelectorAll('#keys button')) {
 function sendMessage() {
   const inp = $('#msg');
   if (!current) return;
-  if (inp.value) send({ type: 'input', id: current, data: inp.value });
+  const text = CB.filterPaste(inp.value); // M-2: поле могли заполнить в обход фильтра вставки
+  if (text) send({ type: 'input', id: current, data: text });
   send({ type: 'input', id: current, data: '\r' });
   inp.value = '';
 }
@@ -841,7 +870,7 @@ function voiceTranscribe(mode) {
 window.sttResult = (text) => {
   voice.mic.textContent = '🎤';
   voiceClose();
-  text = (text || '').trim();
+  text = CB.filterPaste(text || '').trim(); // M-2: распознанный текст фильтруется, как вставка
   if (!text) { banner('🎤 Речь не распознана'); return; }
   if (voiceMode === 'send' && current) {
     send({ type: 'input', id: current, data: text });
@@ -979,8 +1008,7 @@ $('#newBtn').addEventListener('click', () => {
   }
   const asel = $('#agentSel');
   asel.innerHTML = '';
-  let remembered = null;
-  try { remembered = localStorage.getItem('lastAgent'); } catch { /* нет хранилища */ }
+  const remembered = lsGet('lastAgent');
   for (const a of agents) {
     const o = document.createElement('option');
     o.value = a.id; o.textContent = a.name;
@@ -998,7 +1026,7 @@ $('#createOk').addEventListener('click', () => {
   const checked = [...document.querySelectorAll('#agentOpts input[data-opt]')]
     .filter((x) => x.checked).map((x) => x.dataset.opt);
   const msg = CB.buildCreate($('#agentSel').value, checked, cwd);
-  try { if (msg.agent) localStorage.setItem('lastAgent', msg.agent); } catch { /* нет хранилища */ }
+  if (msg.agent) lsSet('lastAgent', msg.agent);
   lastCreate = msg;
   send(msg);
   $('#newDialog').close();

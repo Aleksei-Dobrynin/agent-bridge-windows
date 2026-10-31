@@ -737,65 +737,73 @@ token, fp, internet (флаг разрешения p2p), nodeTicket (iroh-адр
 
 ### 7.1 WebSocket клиент ↔ мост (`/ws`, JSON)
 
-**Клиент → мост:** `create` (cwd/command/args/title), `attach` (id/cols/rows),
-`input` (id/data), `scroll` (id/data — не двигает владельца размера), `resize`,
-`kill`, `remove`, `list`, `devices` (только local), `internet`, `registerNode`
-(nodeId), `setInternet` (только local), `pairinfo` (только local), `revokeDevice`
-(только local).
+**Клиент → мост:** `create` (`cwd`, `agent`, `options`, `force`; владельцу также `args`,
+`command`, `title`), `attach` (id/cols/rows), `input`, `scroll` (не двигает владельца размера),
+`resize`, `kill`, `remove`, `list`, `reply` (`id`, `requestId`, `decision`: `once|always|reject`),
+`internet`, `registerNode` (только устройство, свой NodeId), `confirm` (`confirmId`, `allow`;
+только сопряжённое устройство), только владелец: `devices`, `setInternet`, `pairinfo`
+(+`confirmed`), `revokeDevice`, `issueLoginToken`, `rotateOwnerToken`.
 
-**Мост → клиент:** `sessions` (список + projects), `created` (id), `scrollback`
-(данные/размер/alive), `output` (id/data), `resized`, `exit` (id/exitCode),
-`status` (id/status), `notify` (id/event/message/title/at), `devices`,
-`internet` (enabled/available/ticket/nodeId/peers), `pairinfo`, `error`.
+**Мост → клиент:** `sessions` (сессии с `agent`, `scroll`; `agents` с опциями; `projects`),
+`created`, `createConflict` (`live`), `scrollback`, `output`, `resized`, `exit`, `status`,
+`notify` (`event`: `request|done|info`; для `request` — `requestId`, `choices:[{id,label}]`),
+`requestClosed`, `replyResult` (`ok`, `error: stale|failed`), `devices`, `internet`, `pairinfo`,
+`loginToken`, `confirmRequired`, `confirmPending` (`checkCode`), `confirmRequest` (`confirmId`,
+`action`, `checkCode`; устройствам), `confirmResult` (`allow`, `reason`, `retryAfterSec`),
+`confirmClosed`, `error`. Закрытие с кодом 4401 — устройство отозвано / токен владельца перевыпущен.
 
-Ограничение прав: `devices`, `setInternet`, `pairinfo`, `revokeDevice` работают
-только для `ws.deviceId === 'local'` (сам ПК); телефон (`registerNode`) может
-регистрировать только свой NodeId.
+### 7.2 Keeper ↔ мост (named pipe, JSON-строки)
 
-### 7.2 Keeper ↔ мост (unix-сокет, JSON-строки)
-
-Мост→keeper: `in`, `resize`, `kill`. Keeper→мост: `hello`, `out`, `exit`.
+Pipe `\\.\pipe\claude-bridge-<32 hex>`; сначала взаимное HMAC-рукопожатие с секретом сессии (D-11),
+затем мост→keeper: `in`, `resize`, `kill`; keeper→мост: `hello`, `out`, `exit`.
 
 ### 7.3 Сайдкар туннеля → родитель (stdout, JSON-строки)
 
-`ready` (ticket/node_id или port), `conn` (id/remote), `path`
-(id/path/addr/rtt_ms), `close` (id), `id` (node_id), `error` (message).
+`ready` (ticket/node_id или port), `conn` (id/remote), `path` (id/path/addr/rtt_ms), `close` (id),
+`id` (node_id), `error` (message).
 
 ### 7.4 HTTP-эндпоинты моста
 
-`POST /pair` (код → токен, только осн. порт), `POST /stt` (аудио → текст,
-`authed`), `POST /hook` (событие Claude, `isLocal`), `GET /health` (`authed`),
-статика (`authed`).
+`POST /pair` (код → токен; только основной порт, без авторизации), `POST /stt` (владелец или
+устройство), `POST /hook` (токен хука своей сессии), `GET /health` (владелец или устройство),
+`GET /?ott=…` (вход браузера; loopback, основной порт), статика (владелец или устройство).
 
 ### 7.5 UDP-обнаружение
 
-Телефон → broadcast `CLAUDE_BRIDGE?` на `:8791`. Мост → unicast
-`{claudeBridge, port, host, fp}` (только приватным адресам).
+Телефон → broadcast `CLAUDE_BRIDGE?` на `:8791`. Мост → unicast `{claudeBridge, port, fp}`
+(только частным адресам, без имени ПК).
 
 ---
 
 ## 8. Модель безопасности (сводка)
 
+Модель угроз — D-8: личный ПК, одна учётная запись. Вредоносная программа под учётной записью
+владельца — вне модели.
+
 | Угроза | Защита |
-|--------|--------|
-| Перехват трафика (MITM) | TLS с пиннингом SHA-256 отпечатка; hostname-verifier off, доверие только по отпечатку |
-| MITM при ручном сопряжении | Пиннится фактический серт рукопожатия (не из тела ответа) + сверка отпечатка человеком; QR — отпечаток вне канала |
-| Чужой процесс на ПК под видом «локального» | `isLocal` требует loopback + основной порт + совпадение UID через полный 4-кортеж /proc/net/tcp + ESTABLISHED; неопределимый UID → fail-closed |
-| Кража токена через XSS в UI | Токен не попадает в JS: его нативно подставляет ws-прокси; странице — лишь nonce запуска |
-| Чужое приложение на телефоне → мост через прокси | nonce запуска (сверка постоянного времени), известный только нашему WebView |
-| Тайминг-атаки по токену/коду | `crypto.timingSafeEqual` / `MessageDigest.isEqual` |
-| Перебор кода сопряжения | 5 попыток на IP → блок 15 мин; код одноразовый, TTL 10 мин |
-| Запуск claude вне проектов с телефона | `remoteCwd`: realpath + allowlist каталогов; телефон не может задать произвольную команду |
-| Любой узел интернета → порт моста | Туннель fail-closed без allowlist; allowlist NodeId сопряжённых устройств, перепроверка на каждый поток |
-| Кража p2p-ключа / подмена пути | O_NOFOLLOW + операции по fd (без TOCTOU) + fail-closed при неудаче chmod; файл 0600 |
-| DoS/амплификация через туннель | MAX_CONNS=32, MAX_STREAMS=64, таймаут рукопожатия 5 с |
-| Исчерпание ресурсов моста | MAX_SESSIONS, rate-limit создания, лимит очереди STT, загрузка STT на диск с лимитом 20 МБ |
-| UDP-маяк как рефлектор | Ответ только на приватные адреса (RFC1918/link-local/loopback) |
-| Кликджекинг / инъекция скрипта | CSP-заголовок, X-Frame-Options, nosniff; экранирование значений из интентов (JSONObject.quote) |
-| Утечка секретов на диске/в бэкапе | config/pairings/key/iroh.key — 0600, каталоги 0700; allowBackup=false |
-| Доступ к содержимому с локскрина | FLAG_SECURE, биометрия с повторным запросом после гашения экрана, кнопки уведомлений с setAuthenticationRequired, VISIBILITY_SECRET |
-| Подделка broadcast сервис→активность | RECEIVER_NOT_EXPORTED (API≥33) / signature-permission (API<33) |
-| Открытие вредоносной ссылки в WebView | shouldOverrideUrlLoading запирает навигацию на локальный origin; чужие адреса — во внешний браузер |
+|---|---|
+| Перехват трафика (MITM) | TLS с пиннингом SHA-256 отпечатка у телефона, `claude-mobile` и хука (M-8); доверие только по отпечатку, без отпечатка — никому (L-17) |
+| Подмена ПК при сопряжении | Только QR: отпечаток вне канала, код не уходит на адрес из обнаружения (H-2) |
+| Веб-страница в браузере ПК → мост (CSWSH, H-1) | Токен владельца вместо доверия по адресу; allowlist `Origin`; HttpOnly-cookie браузерного токена, вход по одноразовой ссылке |
+| Агент выпускает код сопряжения / включает интернет (M-6) | Подтверждение человеком: консоль для первого телефона, затем только сопряжённый телефон с контрольным кодом и паузой после отказа (D-13, D-22) |
+| Агент «подтверждает сам себе» | Токены устройств на ПК — только SHA-256 (D-15.7); `phoneRequired` закрывает консольный путь навсегда |
+| Агент получает права владельца без чтения файлов | `--open` печатает ссылку и `--qr`/`--device` работают только в интерактивной консоли (D-18.2) |
+| Флаги агента с телефона (M-7) | Телефон передаёт только id опций адаптера (P-3) |
+| Доступ к pipe keeper'а по SMB | Взаимное HMAC-рукопожатие с секретом сессии (D-11) |
+| Скрытый хвост команды в запросе разрешения | Очистка невидимых/bidi символов, «начало…конец» (D-19.2) |
+| Ответ агенту с заблокированного телефона (M-4) | `setAuthenticationRequired(true)` на API ≥ 31; на API < 31 без «Всегда» |
+| Кнопка старого уведомления отвечает новому запросу (C-1) | Значимые поля PendingIntent — в data-URI; уведомления прошлого процесса снимаются |
+| Коллеги в офисной сети (P-7) | Мост слушает loopback и один LAN-адрес; маяк и mDNS без имени ПК; правила брандмауэра только для профиля «Частная» |
+| Тайминг-атаки | Сравнение токенов и кодов за постоянное время |
+| Перебор кода сопряжения | 5 попыток с адреса → блок 15 мин, 50 на код, код одноразовый, 10 мин |
+| Падение моста от некорректного входа (M-2, L-1, L-2, M-3) | Проверка типов всех входов, авторизация до апгрейда WS, `maxPayload`, предел клиентов |
+| Любой узел интернета → порт моста | Туннель fail-closed без allowlist; allowlist NodeId устройств, перепроверка на каждый поток |
+| Кража p2p-ключа подменой пути | Windows: `FILE_FLAG_OPEN_REPARSE_POINT`, отказ от точек повторного анализа; Android: `O_NOFOLLOW` + операции по fd |
+| Секреты в рабочей копии git (M-1) | Каталог данных в `%LOCALAPPDATA%`, `.gitignore` как страховка (в т.ч. `*.jks`, `*.keystore`, `dist/`) |
+| Кража токена через XSS в WebView | Токен подставляет нативный ws-прокси; странице — только nonce запуска |
+| Чужое приложение на телефоне → прокси | nonce запуска, сверка за постоянное время; входящие `Cookie`/`Authorization` выбрасываются |
+| Утечка экрана телефона | `FLAG_SECURE`, биометрия с повторным запросом после гашения экрана, `VISIBILITY_SECRET` |
+| Подмена APK | Release подписан ключом команды; SHA-256 сертификата — в README, SHA-256 артефактов — в `SHA256SUMS.txt`; `debuggable false` (M-5); wrapper Gradle с `distributionSha256Sum` (S-1) |
 
 ---
 
@@ -803,90 +811,159 @@ token, fp, internet (флаг разрешения p2p), nodeTicket (iroh-адр
 
 ### 9.1 Мост (ПК)
 
-```bash
-cd bridge
-npm install
-node server.js          # или systemctl --user restart claude-bridge
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1 [-Firewall]   # установка / обновление
+cd bridge; npm test                                                   # тесты (node:test)
+node server.js                                                        # ручной запуск в консоли (отладка)
 ```
 
-Хук Claude Code (`~/.claude/settings.json` или проектный) должен вызывать
-`bridge/hooks/bridge-hook.sh` на нужных событиях (Notification, Stop,
-UserPromptSubmit, PostToolUse). Клиент на ПК — `claude-mobile` (обёртка над
-`attach.js`).
+Изолированный запуск для тестов: `CLAUDE_BRIDGE_HOME` (каталог данных),
+`CLAUDE_BRIDGE_LISTEN_PORT`, `CLAUDE_BRIDGE_TEST=1` (без mDNS, QR и файлового лога; также
+`CLAUDE_BRIDGE_TEST_COOLDOWN_MS`, `CLAUDE_BRIDGE_TEST_IFACES`, `CLAUDE_BRIDGE_TEST_REPICK_MS`).
 
 ### 9.2 Туннель (Rust)
 
-```bash
-cd tunnel
-# ПК-бинарь (x86_64):
-cargo build --release            # → target/release/claude-tunnel → bridge/bin/claude-tunnel
-# Android (.so, aarch64) через NDK 28.2.13676358:
-CC_aarch64_linux_android=…/aarch64-linux-android26-clang \
-CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=…/aarch64-linux-android26-clang \
-cargo build --release --target aarch64-linux-android
-# → jniLibs/arm64-v8a/libclaudetunnel.so
-```
-
-Замена занятого ПК-бинаря (процесс держит inode) — через `claude-tunnel.new` +
-`mv -f` (атомарная замена, не трогает работающий executable).
+`tools/release.ps1` (`-SkipApk` — без APK): ПК — `cargo build --release --locked` →
+`bridge\bin\claude-tunnel.exe` и `dist\`; Android — NDK 28 (`clang.exe
+--target=aarch64-linux-android26` как компилятор C и компоновщик) →
+`android\app\src\main\jniLibs\arm64-v8a\libclaudetunnel.so`. Без NDK шаг Android пропускается с
+предупреждением (оно же — в `RELEASE_NOTES.md`); `-SkipAndroidTunnel` пропускает его явно. Нужны
+Rust-targets `x86_64-pc-windows-msvc` и `aarch64-linux-android`.
 
 ### 9.3 Приложение (Android)
 
-```bash
+```powershell
 cd android
-./gradlew assembleDebug     # preBuild синхронизирует web-assets и xterm из bridge/
-./gradlew installDebug
+.\gradlew.bat assembleDebug          # preBuild синхронизирует web-assets и xterm из bridge/
+.\gradlew.bat testDebugUnitTest      # JVM-тесты (§5.7)
 ```
 
-Целевое устройство разработки: Xiaomi M2101K6G. adb/gradle — `~/Android/Sdk`.
+Нужен JDK 17 (`JAVA_HOME`) и Android SDK (`android/local.properties`). Wrapper — официальный
+Gradle 8.7 с `distributionSha256Sum`. Release (`assembleRelease`) подписывается ключом команды из
+свойств Gradle `cbReleaseStoreFile` / `cbReleaseKeyAlias` / `cbReleaseStorePassword` /
+`cbReleaseKeyPassword` (передаёт `tools/release.ps1` через `ORG_GRADLE_PROJECT_*`); без них —
+`app-release-unsigned.apk`. `debuggable false` задан явно (M-5).
+
+### 9.4 Релиз
+
+`tools\release.ps1 -KeystorePath <ключ> [-KeyAlias claude-bridge-team]` → `dist\` (каталог
+пересоздаётся, в `.gitignore`): `claude-tunnel.exe`, `libclaudetunnel.so` (при наличии NDK),
+`ClaudeBridge-<versionName>.apk`, `SHA256SUMS.txt`, `RELEASE_NOTES.md` (коммит, версии инструментов,
+SHA-256 файлов и сертификата подписи). Проверки сценария: `aapt dump badging` без
+`application-debuggable`, `apksigner verify --print-certs`. Пароль ключа вводится интерактивно и
+передаётся только процессу Gradle (`--no-daemon`), затем стирается из окружения. Ключ команды и его
+резервная копия — у владельца репозитория, вне репозитория. Канал распространения — GitHub
+Releases форка `Aleksei-Dobrynin/agent-bridge-windows` (D-25.1).
 
 ---
 
-## 10. Раскладка файлов и прав
+## 10. Раскладка файлов
 
-| Путь | Права | Содержимое |
-|------|-------|-----------|
-| `bridge/config.json` | 0600 | конфиг + env сессий |
-| `bridge/pairings.json` | 0600 | токены и NodeId устройств |
-| `bridge/internet.json` | — | флаг интернет-доступа |
-| `bridge/certs/` | 0700 | сертификаты и ключи туннеля |
-| `bridge/certs/key.pem` | 0600 | приватный TLS-ключ |
-| `bridge/certs/iroh.key` | 0600 | ed25519-ключ p2p-личности ПК |
-| `bridge/certs/tunnel-allow.txt` | 0600 | allowlist NodeId устройств |
-| `~/.claude-bridge/sessions/` | 0700 | unix-сокеты и meta живых сессий |
-| `bridge/bin/claude-tunnel` | 0755 | ПК-бинарь туннеля (x86_64) |
-| Android `files/iroh_phone.key` | 0600 | p2p-ключ телефона |
-| Android `jniLibs/…/libclaudetunnel.so` | — | туннель для Android (aarch64) |
+Права — ACL профиля пользователя (D-8); POSIX-режимов на Windows нет.
 
-Порты: **8790** — HTTPS/WSS моста (LAN); **8791** — UDP-маяк; **8792** —
-loopback-вход туннеля; **38471/38472** — локальный шлюз приложения (UI + прокси).
+| Путь | Содержимое |
+|---|---|
+| `%LOCALAPPDATA%\ClaudeBridge\config.json` | конфиг + env сессий |
+| `…\pairings.json` | SHA-256 токенов устройств, имена, NodeId, `phoneRequired` |
+| `…\internet.json` | флаг интернет-доступа |
+| `…\owner.token` | токен владельца |
+| `…\certs\bridge.pfx`, `bridge.pass`, `bridge.cer` | ключ и сертификат TLS, пароль PFX, сертификат (DER) |
+| `…\certs\iroh.key` | ed25519-ключ p2p-личности ПК |
+| `…\certs\tunnel-allow.txt` | allowlist NodeId устройств |
+| `…\sessions\<id>.json` | meta живых сессий: pipe, секрет keeper'а, токен хука, состояние адаптера |
+| `…\logs\bridge.log`, `bridge.log.1` | лог моста (ротация 5 МБ) |
+| `…\logs\keeper-<id>.log` | причина аварийного завершения keeper'а |
+| `…\bin\claude-mobile.cmd` | шим (`install.ps1`), каталог — в PATH пользователя |
+| `%USERPROFILE%\.claude\settings.json` | хук моста (exec-форма); бэкапы `settings.json.bak-*` (5 последних) |
+| `bridge\bin\claude-tunnel.exe` | туннель ПК (собирается из исходников, в `.gitignore`) |
+| `dist\` | артефакты релиза (`tools/release.ps1`, в `.gitignore`) |
+| Задача Планировщика `ClaudeBridge` | автозапуск моста при входе |
+| `shell:startup\ClaudeBridge.lnk` | запасной автозапуск (если задачи нет, D-25.4) |
+| Правила `ClaudeBridge-TCP` / `ClaudeBridge-UDP` | вход TCP 8790 / UDP 8791, профиль «Частная» (по желанию) |
+| Android `files/iroh_phone.key` | p2p-ключ телефона |
+| Android `jniLibs/arm64-v8a/libclaudetunnel.so` | туннель телефона (в `.gitignore`) |
+
+Порты: **8790** — HTTPS/WSS моста; **8791** — UDP-маяк; **8792** — loopback-вход туннеля;
+**38471/38472** — локальный шлюз приложения (UI + прокси).
 
 ---
 
 ## 11. Ключевые сквозные потоки
 
-**Сопряжение по QR:** ПК печатает QR (`--qr`) → телефон сканирует → `POST /pair`
-с пиннингом `expectedFp` → мост выдаёт токен/nodeTicket → сохранение в
-BridgeStore → сервис подключается по WSS.
+**Сопряжение:** `claude-mobile --qr` → мост просит подтверждение (консоль `[y/N]` для первого
+телефона или `confirmRequest` с контрольным кодом на сопряжённом) → `pairinfo` → QR в консоли →
+телефон сканирует → `POST /pair` с пиннингом `fp` → токен (на ПК — только его SHA-256) →
+`BridgeStore` → сервис подключается по WSS; остальным устройствам — уведомление.
 
-**Открытие терминала в приложении:** MainActivity грузит `http://127.0.0.1:38471`
-из assets → app.js зовёт `AndroidApp.wsUrl()` → WebSocket на
-`ws://127.0.0.1:38472/ws?cbnonce=…` → LocalGateway сверяет nonce, подставляет
-токен, открывает TLS к мосту → мост шлёт `sessions`/`scrollback` → xterm рисует.
+**Открытие терминала в приложении:** MainActivity грузит `http://127.0.0.1:38471` → `app.js`
+зовёт `AndroidApp.wsUrl()` → WebSocket на `ws://127.0.0.1:38472/ws?cbnonce=…` → LocalGateway
+сверяет nonce, подставляет токен и `Origin`, открывает TLS к мосту → `sessions`/`scrollback` →
+xterm рисует.
 
-**Уведомление и быстрый ответ:** Claude Code → хук → `POST /hook` → мост
-`broadcast notify` → BridgeService показывает системное уведомление → нажатие
-«Да (1)» → `ACTION_INPUT` → `ws.send input` → keeper → PTY.
+**Запрос разрешения (Claude Code):** диалог в TUI → хук `PermissionRequest` → `POST /hook` →
+адаптер `claude` → `notify{request, choices}` → уведомление с кнопками → «Да» (с разблокировкой) →
+`reply{once}` → адаптер пишет `1` в PTY → `replyResult ok`, `requestClosed`. Для opencode —
+`permission.asked` из SSE → тот же путь → ответ через API сервиса.
 
-**Голос:** долгое нажатие «отправить» → `MediaRecorder` пишет m4a →
-`AndroidSTT.transcribe` → `POST /stt` (токен) → stt.py (whisper) → текст → в поле
-ввода или сразу в Claude.
+**Подтверждение операции владельца:** `claude-mobile --device` → `i` → `setInternet` → мост:
+`confirmPending{checkCode}` в консоль, `confirmRequest{checkCode}` устройствам → человек сверяет код
+и нажимает «Разрешить» → `confirm{allow:true}` → туннель включается, `confirmResult`.
 
-**Уход из дома:** ПК пропал из LAN >15 с → BridgeService поднимает
-`claude-tunnel connect` по сохранённому `nodeTicket` → iroh дозванивается до
-`listen` на ПК (проверка allowlist по NodeId) → телефон подключается к
-`wss://127.0.0.1:<порт туннеля>` → байты идут по QUIC на loopback-порт 8792
-моста. Возврат в LAN → форс-реконнект на прямой путь.
+**Голос:** долгое нажатие «отправить» → `MediaRecorder` → `POST /stt` → `stt.py` → текст в поле или
+сразу агенту.
+
+**Уход из сети ПК:** ПК не виден в LAN > 15 с → BridgeService поднимает `claude-tunnel connect` по
+сохранённому `nodeTicket` → iroh до `listen` на ПК (allowlist NodeId) → `wss://127.0.0.1:<порт
+туннеля>` → QUIC → loopback-порт 8792. Возврат в LAN — переподключение по прямому пути.
+
+**Отсоединение `claude-mobile`:** `Ctrl+\` → пакет не пересылается агенту → `CONSOLE_RESET` в
+консоль (режимы агента выключены, курсор на месте) → выход; сессия живёт в keeper'е.
+
+---
+
+## 12. Известные ограничения
+
+**Модель и поведение:**
+
+- **Граница каталога для устройств (D-21):** сессия устройства с каталогом вне `projects`
+  запускается в `defaultCwd`; настоящая граница возможностей устройства — набор опций адаптера: с
+  опцией `skipPermissions` агент не ограничен своим каталогом.
+- **Подтверждение на телефоне не защищает от агента, который правит файлы моста и перезапускает
+  его (D-22.1):** это эквивалент вредоносной программы под учётной записью пользователя (вне D-8).
+  Агент той же учётной записи может прочитать `owner.token` и meta сессий (D-16.3).
+- **Claude Code (D-23.7):** «готово» может прийти раньше окончания фонового субагента (O-2); после
+  рестарта моста экран TUI может восстановиться только после следующей перерисовки (O-5, гипотеза).
+  После рестарта моста при открытом диалоге разрешения кнопок нет — уведомление информационное
+  (D-23.4).
+- **Веб-клиент, диалог подтверждения (D-22.5):** при двух одновременных подтверждениях владельца
+  диалог показывает последнее (первое вернётся после переподключения).
+- **Веб-клиент, полоса запросов (D-24):** в `#reqbar` видны кнопки одного (верхнего) запроса,
+  остальные — счётчиком «+N»; кнопки активны через 500 мс после смены верхнего запроса.
+- **`generic`** — только зеркало: без статусов, уведомлений и кнопок ответа.
+- **Android < 12 (API < 31):** без кнопки «Всегда»; подтверждение операций владельца — только в
+  открытом приложении (M-4, D-15.10).
+- **Хук Claude Code в пользовательских настройках (P-6)** запускает `node` на каждое событие в
+  каждой сессии Claude на ПК; вне сессий моста хук сразу выходит.
+- **Мост работает только в сеансе пользователя** (задача Планировщика или ярлык автозагрузки, не
+  служба): до входа в Windows мост недоступен.
+- **Брандмауэр:** корпоративные политики могут запрещать правила — тогда остаётся только туннель
+  (P-4). Профиль сети Wi-Fi на ПК должен быть «Частная».
+- **Только Windows-хост (D-9).**
+
+**Состояние проверки и сборки (2026-10-31):**
+
+- **Android-туннель не собран:** `libclaudetunnel.so` требует Android NDK (подплан 4, задача 9 —
+  установка только после явного согласия пользователя). APK без неё работает только по локальной
+  сети; интернет-доступ с телефона недоступен.
+- **Сценарии на телефоне не выполнены:** 16 ручных сценариев подплана 3 (задача 11) — уведомления с
+  кнопками, разблокировка, подтверждения, QR-сопряжение, прокрутка, Origin шлюза и др. — проверены
+  только тестами (JVM, node) и отладочной сборкой, на реальном устройстве не проходились.
+- **Release-APK ключом команды ещё не собран** (подплан 4, задача 10 — у владельца ключа): в README
+  вместо SHA-256 сертификата подписи — заглушка `{{APK_CERT_SHA256}}`; подпись проверена только
+  временным ключом.
+- **Установка на реальном ПК** (подплан 4, задача 16) не выполнялась: мелькание окна консоли при
+  автозапуске и регистрация задачи без прав администратора не проверены (запасные пути — D-25.3,
+  D-25.4).
 
 ---
 

@@ -37,6 +37,9 @@ android {
 dependencies {
     implementation 'com.squareup.okhttp3:okhttp:4.12.0'
     implementation 'com.google.android.gms:play-services-code-scanner:16.1.0'
+    // JVM-тесты чистой логики (Protocol): org.json из android.jar в unit-тестах — заглушки (D-15.8)
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.json:json:20240303'
 }
 
 // Web-интерфейс вкладывается в APK и отдаётся локальным шлюзом:

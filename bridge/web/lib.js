@@ -15,5 +15,17 @@
       .replace(/[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, '');
   }
 
-  return { filterPaste };
+  /** D-10: прокрутка альтернативного экрана способом, который объявил адаптер агента:
+   *  'wheel' — события колеса мыши SGR в центр экрана, иначе PageUp/PageDown. */
+  function scrollSequence(mode, lines, col, row) {
+    const n = Math.min(Math.abs(Math.trunc(lines)), 10);
+    let out = '';
+    for (let i = 0; i < n; i++) {
+      if (mode === 'wheel') out += `\x1b[<${lines > 0 ? 64 : 65};${col};${row}M`;
+      else out += lines > 0 ? '\x1b[5~' : '\x1b[6~';
+    }
+    return out;
+  }
+
+  return { filterPaste, scrollSequence };
 });

@@ -65,21 +65,18 @@ if (window.visualViewport) window.visualViewport.addEventListener('resize', refi
 
 // Прокрутка пальцем.
 // Обычный буфер (bash и т.п.) — листаем scrollback xterm.
-// Альтернативный экран (Claude Code TUI) — шлём приложению события колеса
-// мыши: TUI сам перерисует свою историю, включая восстановленную --resume.
+// Альтернативный экран (TUI агента) — способ объявляет адаптер агента в sessions[].scroll
+// (D-10): системный ConPTY не пересылает включение режима мыши, поэтому
+// term.modes.mouseTrackingMode здесь не годится.
 function sendScroll(lines) {
   if (!current) return;
-  const n = Math.min(Math.abs(lines), 10);
-  const mouse = term.modes.mouseTrackingMode !== 'none';
+  const s = sessions.find((x) => x.id === current);
+  const mode = s && s.scroll === 'wheel' ? 'wheel' : 'pageKeys';
   const col = Math.max(1, Math.round(term.cols / 2));
   const row = Math.max(1, Math.round(term.rows / 2));
-  let data = '';
-  for (let i = 0; i < n; i++) {
-    if (mouse) data += `\x1b[<${lines > 0 ? 64 : 65};${col};${row}M`; // колесо вверх/вниз
-    else data += lines > 0 ? '\x1b[5~' : '\x1b[6~'; // PageUp / PageDown
-  }
+  const data = CB.scrollSequence(mode, lines, col, row);
   // 'scroll' — как input, но не переключает "владельца размера" PTY
-  send({ type: 'scroll', id: current, data });
+  if (data) send({ type: 'scroll', id: current, data });
 }
 
 // ------------------------------------------- выделение текста в терминале

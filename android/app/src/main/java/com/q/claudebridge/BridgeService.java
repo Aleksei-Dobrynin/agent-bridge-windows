@@ -81,14 +81,10 @@ public class BridgeService extends Service {
     private volatile boolean appVisible = false; // активити на экране
     private String lastStatus = "Поиск моста в WiFi-сети…";
     private int retryMs = 2000;
-    private int eventSeq = 100;
-
-    // активные событийные уведомления: сессия -> id уведомления и тип события;
-    // нужны, чтобы гасить устаревшие (ответили на ПК, пришло новое событие)
-    private final java.util.Map<String, Integer> eventNids = new java.util.HashMap<>();
-    private final java.util.Map<String, String> eventKinds = new java.util.HashMap<>();
-    // сессия -> requestId запроса, на который сейчас висят кнопки (D-4)
-    private final java.util.Map<String, String> eventReqs = new java.util.HashMap<>();
+    // активные событийные уведомления: по одному на открытый запрос (D-4, D-23.3) и одно
+    // информационное на сессию; нужны, чтобы гасить устаревшие (ответили на ПК, новое событие).
+    // Он же выдаёт id и уведомлениям-подтверждениям.
+    private final RequestNotifications notifs = new RequestNotifications(100);
     // confirmId -> id уведомления-подтверждения (D-13)
     private final java.util.Map<String, Integer> confirmNids = new java.util.HashMap<>();
 
@@ -198,7 +194,7 @@ public class BridgeService extends Service {
             if (json != null && ws != null && connected) ws.send(json);
             else if (json != null) toast("Нет связи с мостом — ответ не отправлен");
             if (nid >= 0) getSystemService(NotificationManager.class).cancel(nid);
-            if (sess != null) cancelEventNotif(sess);
+            cancelRequestNotif(sess, intent.getStringExtra("requestId"));
             // тап по залежавшемуся уведомлению не должен воскрешать демона
             // в режиме «только при открытом приложении»
             if (!appVisible && "app".equals(bgMode())) stopSelf(startId);
@@ -532,10 +528,10 @@ public class BridgeService extends Service {
                     } else if ("confirmClosed".equals(type)) {
                         cancelConfirm(m.optString("confirmId"));
                     } else if ("status".equals(type)) {
-                        // Claude снова работает (например, ответили на ПК) —
-                        // уведомление этой сессии больше не актуально
+                        // агент снова работает — информационное уведомление сессии больше
+                        // не актуально; уведомления запросов снимает только requestClosed
                         if ("working".equals(m.optString("status"))) {
-                            cancelEventNotif(m.optString("id"));
+                            cancelNotif(notifs.onWorking(m.optString("id")));
                         }
                     } else if ("sessions".equals(type)) {
                         int alive = 0;
@@ -856,24 +852,14 @@ public class BridgeService extends Service {
         return ab.build();
     }
 
-    /** Убрать событийное уведомление сессии (стало неактуальным). */
-    private void cancelEventNotif(String sessionId) {
-        if (sessionId == null || sessionId.isEmpty()) return;
-        Integer nid;
-        synchronized (eventNids) {
-            nid = eventNids.remove(sessionId);
-            eventKinds.remove(sessionId);
-            eventReqs.remove(sessionId);
-        }
+    private void cancelNotif(Integer nid) {
         if (nid != null) getSystemService(NotificationManager.class).cancel(nid);
     }
 
-    /** Убрать уведомление с кнопками, только если оно относится к закрытому запросу. */
+    /** Убрать уведомление именно этого запроса (закрыт или на него ответили). */
     private void cancelRequestNotif(String sessionId, String requestId) {
         if (sessionId == null || requestId == null || requestId.isEmpty()) return;
-        boolean match;
-        synchronized (eventNids) { match = requestId.equals(eventReqs.get(sessionId)); }
-        if (match) cancelEventNotif(sessionId);
+        cancelNotif(notifs.onRequestClosed(sessionId, requestId));
     }
 
     private void toast(String text) {
@@ -886,29 +872,13 @@ public class BridgeService extends Service {
         NotificationManager nm = getSystemService(NotificationManager.class);
         boolean isRequest = "request".equals(event) && Protocol.validSessionId(sessionId)
                 && Protocol.validRequestId(requestId) && !choices.isEmpty();
-        int nid;
-        synchronized (eventNids) {
-            // новое событие заменяет прежнее уведомление этой же сессии; повтор того же
-            // запроса (D-20: мост заново шлёт открытые запросы переподключившемуся клиенту)
-            // обновляет уведомление на месте, без повторного звука (setOnlyAlertOnce)
-            Integer prev = eventNids.remove(sessionId);
-            boolean same = isRequest && prev != null && requestId.equals(eventReqs.get(sessionId));
-            if (prev != null && !same) nm.cancel(prev);
-            eventKinds.remove(sessionId);
-            eventReqs.remove(sessionId);
-            // «агент завершил ответ» устаревает, как только пришло любое новое событие
-            var it = eventNids.entrySet().iterator();
-            while (it.hasNext()) {
-                var e = it.next();
-                if ("done".equals(eventKinds.get(e.getKey()))) {
-                    nm.cancel(e.getValue());
-                    eventKinds.remove(e.getKey());
-                    eventReqs.remove(e.getKey());
-                    it.remove();
-                }
-            }
-            nid = same ? prev : eventSeq++;
-        }
+        // у каждого открытого запроса своё уведомление; повтор того же запроса (D-20: мост
+        // заново шлёт открытые запросы переподключившемуся клиенту) обновляет его на месте,
+        // без повторного звука (setOnlyAlertOnce); прочее событие сессии заменяет прежнее,
+        // «агент завершил ответ» устаревает при любом новом событии
+        RequestNotifications.Placement place = notifs.onEvent(sessionId, event, isRequest ? requestId : null);
+        for (Integer old : place.cancel) nm.cancel(old);
+        int nid = place.nid;
         // cbAuth — секрет из приватных prefs: подтверждает, что intent с session
         // создан нами. Чужое приложение (экспортированная MainActivity) его не
         // знает, поэтому не сможет заставить нас переключить сессию (F15).
@@ -935,13 +905,6 @@ public class BridgeService extends Service {
         if (isRequest && Protocol.canShowActions(Build.VERSION.SDK_INT, biolock)) {
             for (Protocol.Choice c : Protocol.visibleChoices(choices, Build.VERSION.SDK_INT)) {
                 b.addAction(replyAction(sessionId, requestId, c, nid));
-            }
-        }
-        if (sessionId != null && !sessionId.isEmpty()) {
-            synchronized (eventNids) {
-                eventNids.put(sessionId, nid);
-                eventKinds.put(sessionId, event);
-                if (isRequest) eventReqs.put(sessionId, requestId);
             }
         }
         nm.notify(nid, b.build());
@@ -973,7 +936,7 @@ public class BridgeService extends Service {
         synchronized (confirmNids) {
             // повтор того же запроса (рассылка при переподключении) обновляет уведомление на месте
             Integer prev = confirmNids.get(confirmId);
-            nid = prev != null ? prev : eventSeq++;
+            nid = prev != null ? prev : notifs.nextId();
             confirmNids.put(confirmId, nid);
         }
         Intent open = new Intent(this, MainActivity.class)

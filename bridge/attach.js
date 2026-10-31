@@ -1,15 +1,18 @@
 #!/usr/bin/env node
 'use strict';
-// claude-mobile: запустить Claude Code через мост и зеркалировать сессию
-// в этом терминале. Телефон видит ту же сессию и может вмешиваться.
+// claude-mobile: запустить агента (Claude Code, opencode, …) через мост и зеркалировать
+// сессию в этом терминале. Телефон видит ту же сессию и может вмешиваться.
 //
-//   claude-mobile [args…]    новая сессия в текущем каталоге; все аргументы
-//                            передаются claude (--resume, --continue,
-//                            --dangerously-skip-permissions и т.д.)
+//   claude-mobile [args…]    новая сессия агента по умолчанию в текущем каталоге; все
+//                            аргументы передаются самому агенту (--resume, --continue…)
+//   claude-mobile --agent <id> [args…]  новая сессия указанного агента (D-5)
 //   claude-mobile -l         список сессий
 //   claude-mobile -a [id]    подключиться к сессии (без id — к последней живой)
 //   claude-mobile --device   доверенные устройства: просмотр и отзыв
 //   claude-mobile --qr       показать QR-код сопряжения (мост должен работать)
+//
+// Выпуск кода сопряжения и включение интернет-доступа: если уже есть сопряжённый телефон —
+// подтверждение на нём (D-13), иначе — вопрос в этой консоли (P-9).
 //   claude-mobile --open     открыть веб-интерфейс моста в браузере
 //   claude-mobile --rotate-token  перевыпустить токен владельца
 //
@@ -33,20 +36,24 @@ const { buildLoginUrl, openInBrowser } = require('./lib/open-url');
 
 const args = process.argv.slice(2);
 
-const USAGE = `claude-mobile — Claude Code через мост (зеркало на телефон)
+const USAGE = `claude-mobile — агент через мост (зеркало на телефон)
 
-  claude-mobile [args…]     новая сессия в текущем каталоге; аргументы
-                            передаются самому claude (--resume, --continue…)
-  claude-mobile -l          список сессий
-  claude-mobile -a [id]     подключиться к сессии (без id — к последней живой)
-  claude-mobile --device    доверенные устройства: просмотр и отзыв
-  claude-mobile --qr        QR-код сопряжения (подтверждение в консоли)
-  claude-mobile --open      открыть веб-интерфейс моста в браузере (одноразовая ссылка)
-  claude-mobile --rotate-token  перевыпустить токен владельца
-  claude-mobile -h          эта справка
+  claude-mobile [args…]              новая сессия агента по умолчанию в текущем каталоге;
+                                     аргументы передаются самому агенту (--resume, --continue…)
+  claude-mobile --agent <id> [args…] новая сессия указанного агента (claude, opencode, …)
+  claude-mobile -l                   список сессий
+  claude-mobile -a [id]              подключиться к сессии (без id — к последней живой)
+  claude-mobile --device             доверенные устройства и интернет-доступ
+  claude-mobile --qr                 QR-код сопряжения нового устройства
+  claude-mobile --open               открыть веб-интерфейс моста в браузере (одноразовая ссылка)
+  claude-mobile --rotate-token       перевыпустить токен владельца
+  claude-mobile -h                   эта справка
+
+Если уже есть сопряжённый телефон, выпуск кода и включение интернет-доступа
+подтверждаются на нём; иначе — здесь, в консоли.
 
 Ctrl+\\ — отсоединиться: сессия продолжит жить, вернуться — claude-mobile -a.
-Завершить сессию по-настоящему: выйти из claude (Ctrl+C дважды или /exit)
+Завершить сессию по-настоящему: выйти из агента (например, /exit)
 или долгим нажатием на её вкладку в приложении на телефоне.`;
 
 // Частые опечатки в НАШИХ флагах ловим до создания сессии: иначе «claude --l»
@@ -57,7 +64,7 @@ const TYPOS = new Map([
   ['--a', '-a'], ['-attach', '-a'],
   ['-device', '--device'], ['-devices', '--device'],
   ['-qr', '--qr'], ['--h', '-h'], ['-help', '-h'],
-  ['-open', '--open'], ['-rotate-token', '--rotate-token'],
+  ['-open', '--open'], ['-rotate-token', '--rotate-token'], ['-agent', '--agent'],
 ]);
 
 if (args[0] === '-h' || args[0] === '--help') {
@@ -69,6 +76,17 @@ if (TYPOS.has(args[0])) {
   console.error(USAGE);
   process.exit(1);
 }
+// D-5: агент новой сессии; остальные аргументы, как и раньше, уходят самому агенту
+let agentId = null;
+if (args[0] === '--agent') {
+  agentId = args[1];
+  if (!agentId || agentId.startsWith('-')) {
+    console.error('Укажите id агента: claude-mobile --agent <id> [аргументы…]');
+    process.exit(1);
+  }
+  args.splice(0, 2);
+}
+
 // Сопряжение и меню устройств (отзыв, интернет-доступ) — только для человека в
 // интерактивной консоли (P-9); проверяем до подключения к мосту.
 if ((args[0] === '--qr' || args[0] === '--device' || args[0] === '--devices') &&
@@ -139,6 +157,10 @@ process.on('exit', cleanup);
 
 function send(obj) { ws.send(JSON.stringify(obj)); }
 
+// последняя операция, требующая подтверждения (D-13) — для повтора с confirmed:true (P-9)
+let lastSensitive = null;
+function sendSensitive(obj) { lastSensitive = obj; send(obj); }
+
 function attach(id) {
   sid = id;
   send({
@@ -150,35 +172,16 @@ function attach(id) {
 
 let createdAtMs = 0; // когда МЫ создали сессию — для диагностики мгновенной смерти
 
+/**
+ * Создание сессии. Конфликт resume (живая сессия того же агента в этом каталоге — resume
+ * открытой беседы создал бы её КОПИЮ) определяет мост и отвечает createConflict (D-7);
+ * после согласия человека — повтор с force:true.
+ */
 function doCreate(force) {
   createdAtMs = Date.now();
-  const shown = args.length ? 'claude ' + args.join(' ') : 'claude';
+  const shown = (agentId || 'агент по умолчанию') + (args.length ? ' ' + args.join(' ') : '');
   console.log(`Запускаю: ${shown}  (каталог ${process.cwd()})`);
-  send({ type: 'create', cwd: process.cwd(), args, force: force === true });
-}
-
-/**
- * Создание сессии; перед запуском с --resume/--continue предупреждаем о живых
- * сессиях в этом же каталоге: если беседа ещё открыта в одной из них, claude
- * не сможет продолжить тот же файл и молча создаст КОПИЮ беседы (форк) —
- * так появляются дубликаты в списке resume.
- */
-function maybeCreate(sessionsList) {
-  const resumeLike = args.some((a) =>
-    a === '--resume' || a === '-r' || a === '--continue' || a === '-c');
-  const liveHere = sessionsList.filter((s) => s.alive && s.cwd === process.cwd());
-  if (!resumeLike || !liveHere.length) { doCreate(); return; }
-
-  console.log('⚠ В этом каталоге уже есть живые сессии:');
-  for (const s of liveHere) console.log(`    ${s.id}\t${s.title}`);
-  console.log('Если ваша беседа ещё открыта в одной из них, resume создаст её КОПИЮ.');
-  console.log(`Вернуться в живую сессию: claude-mobile -a ${liveHere[liveHere.length - 1].id}`);
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  rl.question('Всё равно продолжить с resume? [y/N]: ', (ans) => {
-    rl.close();
-    if (/^[yд]/i.test(ans.trim())) doCreate(true);
-    else die('Отменено.');
-  });
+  send({ type: 'create', cwd: process.cwd(), ...(agentId ? { agent: agentId } : {}), args, force: force === true });
 }
 
 function enterRaw() {
@@ -199,10 +202,10 @@ function enterRaw() {
 }
 
 /**
- * P-9: подтверждение только живым человеком в интерактивной консоли — агент запускает
- * команды без TTY. От агента, который сам откроет WS с токеном владельца, это НЕ защищает:
- * по D-13 выпуск кода сопряжения и включение интернет-доступа будут подтверждаться на
- * уже сопряжённом телефоне (поток подтверждения — подплан 2: протокол; подплан 3: Android).
+ * P-9: подтверждение живым человеком в интерактивной консоли — агент запускает команды без TTY.
+ * Мост просит его (confirmRequired), только если сопряжённых телефонов нет: от агента, который
+ * сам откроет WS с токеном владельца, консоль не защищает — при сопряжённом телефоне мост
+ * принимает подтверждение только с него (D-13).
  */
 function confirmHuman(question, onYes, iface) {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
@@ -266,13 +269,13 @@ ws.on('message', (rawMsg) => {
         // подтверждение — закрытие соединения мостом с кодом 4401 (обработчик 'close')
         setTimeout(() => die('Мост не подтвердил перевыпуск токена владельца.', 1), 5000);
       } else if (args[0] === '--qr') {
-        // P-9 / D-13: пока — только интерактивная консоль (см. confirmHuman)
-        confirmHuman('Выпустить код сопряжения нового устройства?',
-          () => send({ type: 'pairinfo', confirmed: true }));
+        // D-13: подтверждение — на сопряжённом телефоне (confirmPending) или, если телефонов
+        // нет, здесь в консоли (confirmRequired -> повтор с confirmed:true)
+        sendSensitive({ type: 'pairinfo' });
       } else if (args[0] === '-l' || args[0] === '--list') {
         if (!m.sessions.length) console.log('Сессий нет.');
         for (const s of m.sessions) {
-          console.log(`${s.id}\t${s.alive ? 'жива' : 'завершена'}\t${s.title}\t${s.cwd}`);
+          console.log(`${s.id}\t${s.alive ? 'жива' : 'завершена'}\t${s.agentName || s.agent || '-'}\t${s.title}\t${s.cwd}`);
         }
         process.exit(0);
       } else if (args[0] === '-a' || args[0] === '--attach') {
@@ -282,8 +285,8 @@ ws.on('message', (rawMsg) => {
         if (!target) die('Живых сессий нет. Запустите: claude-mobile', 1);
         else attach(target.id);
       } else {
-        // все остальные аргументы уходят самому claude
-        maybeCreate(m.sessions);
+        // все остальные аргументы уходят самому агенту
+        doCreate(false);
       }
       break;
     }
@@ -315,10 +318,10 @@ ws.on('message', (rawMsg) => {
     case 'exit':
       if (m.id === sid) {
         let msg = `\r\n[сессия завершена, код ${m.exitCode}]`;
-        // сессию создали мы, и claude умер почти сразу с ошибкой —
+        // сессию создали мы, и агент умер почти сразу с ошибкой —
         // почти наверняка он не принял переданные аргументы
         if (createdAtMs && m.exitCode !== 0 && Date.now() - createdAtMs < 15000 && args.length) {
-          msg += `\r\nclaude вышел сразу после старта — возможно, не принял аргументы: claude ${args.join(' ')}`;
+          msg += `\r\nагент вышел сразу после старта — возможно, не принял аргументы: ${args.join(' ')}`;
           msg += '\r\nСправка: claude-mobile -h';
         }
         die(msg, m.exitCode === 0 ? 0 : 1);
@@ -333,6 +336,26 @@ ws.on('message', (rawMsg) => {
     case 'loginToken':
       openLoginUrl(m);
       break;
+    case 'confirmRequired':
+      // D-13: сопряжённых телефонов нет — подтверждает человек в этой консоли (P-9)
+      if (!lastSensitive) break;
+      confirmHuman(m.action === 'pairinfo' ? 'Выпустить код сопряжения нового устройства?' : 'Включить доступ через интернет?',
+        () => {
+          send({ ...lastSensitive, confirmed: true });
+          if (m.action === 'setInternet') setTimeout(() => { send({ type: 'internet' }); send({ type: 'devices' }); }, 400);
+        });
+      break;
+    case 'confirmPending':
+      console.log(typeof m.message === 'string' && m.message ? m.message : 'Подтвердите операцию на сопряжённом телефоне…');
+      break;
+    case 'confirmResult':
+      if (!m.allow) {
+        die(m.reason === 'timeout' ? 'Время подтверждения истекло.' : 'Отклонено на телефоне.', 1);
+      } else if (m.action === 'setInternet') {
+        console.log('Подтверждено на телефоне.');
+        setTimeout(() => { send({ type: 'internet' }); send({ type: 'devices' }); }, 400);
+      }
+      break;
     case 'error': {
       // отказ моста (нет LAN-адреса для QR, предел сессий и т.п.)
       const text = 'Мост: ' + (typeof m.message === 'string' ? m.message : 'ошибка');
@@ -344,7 +367,8 @@ ws.on('message', (rawMsg) => {
       console.log('\nСопряжение нового устройства с Claude Bridge');
       console.log(`Адрес моста: ${m.host}:${m.port}`);
       if (m.internet) console.log(`Доступ через интернет: ${fmtInet(m.internet)}`);
-      console.log(`Код для ручного ввода: ${m.code}  (действует ${m.ttlMin || 10} минут)\n`);
+      // P-7: сопряжение только по QR — код для ручного ввода не печатаем
+      console.log(`Отсканируйте QR в приложении (действует ${m.ttlMin || 10} минут)\n`);
       qrcode.generate(JSON.stringify({ cb: 1, host: m.host, port: m.port, code: m.code, fp: m.fp }),
         { small: true }, (q) => { console.log(q); process.exit(0); });
       break;
@@ -386,12 +410,12 @@ function deviceTui(m) {
     ans = ans.trim();
     if (/^[iи]$/i.test(ans)) {
       const enable = !(inetState && inetState.enabled);
-      // P-9 / D-13: пока — только интерактивная консоль (см. confirmHuman)
-      confirmHuman(enable ? 'Включить доступ через интернет?' : 'Выключить доступ через интернет?', () => {
-        send({ type: 'setInternet', enabled: enable, confirmed: true });
-        // сервер разошлёт свежий internet-статус; перезапрашиваем меню
-        setTimeout(() => { send({ type: 'internet' }); send({ type: 'devices' }); }, 400);
-      }, rl);
+      rl.close(); // подтверждение (консоль или телефон) не должно делить stdin с меню
+      rl = null;
+      // выключение — без подтверждения; включение — телефон (D-13) или консоль (confirmRequired, P-9);
+      // мост разошлёт свежий internet-статус, меню перезапрашиваем
+      sendSensitive({ type: 'setInternet', enabled: enable });
+      if (!enable) setTimeout(() => { send({ type: 'internet' }); send({ type: 'devices' }); }, 400);
       return;
     }
     const n = parseInt(ans, 10);

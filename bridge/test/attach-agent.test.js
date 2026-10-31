@@ -1,0 +1,150 @@
+'use strict';
+// Задача 16: claude-mobile — --agent <id> (D-5), конфликт resume решает мост (D-7, без
+// клиентского дубля), подтверждения D-13 (телефон / консоль), QR без ручного кода (P-7).
+// Интерактивная консоль — настоящий ConPTY (node-pty): --qr требует TTY (D-18 п. 2).
+const test = require('node:test');
+const assert = require('node:assert');
+const path = require('path');
+const { spawn } = require('child_process');
+const pty = require('../node_modules/node-pty');
+const H = require('./helpers/bridge');
+
+test.after(() => setTimeout(() => process.exit(0), 300).unref()); // node-pty держит цикл событий
+
+const { FAKE_AGENT, DEVICE, TEST_LAN_HOST, stripAnsi, createAndAttach } = H;
+const ATTACH = path.join(__dirname, '..', 'attach.js');
+const AGENTS = {
+  defaultAgent: 'echo',
+  agents: {
+    echo: { type: 'generic', name: 'Echo', command: process.execPath, args: [FAKE_AGENT] },
+    claude: { command: process.execPath, prefixArgs: [FAKE_AGENT] },
+  },
+};
+
+let b; // мост с сопряжённым телефоном
+test.before(async () => {
+  b = await H.startTestBridge({ prefix: 'cb-cm-', devices: [DEVICE], config: { host: TEST_LAN_HOST, ...AGENTS } });
+});
+test.after(() => b && b.stop());
+
+/** claude-mobile без консоли (stdin — закрытый pipe). */
+function run(bridge, args) {
+  const p = spawn(process.execPath, [ATTACH, ...args], {
+    env: { ...process.env, CLAUDE_BRIDGE_HOME: bridge.home }, cwd: bridge.cwd, windowsHide: true,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  p.stdin.end();
+  let out = '';
+  let err = '';
+  p.stdout.setEncoding('utf8');
+  p.stderr.setEncoding('utf8');
+  p.stdout.on('data', (d) => { out += d; });
+  p.stderr.on('data', (d) => { err += d; });
+  const done = new Promise((r) => p.on('exit', (code) => r(code)));
+  const t = setTimeout(() => H.killTree(p.pid), 30000);
+  done.then(() => clearTimeout(t));
+  return { p, done, out: () => stripAnsi(out), err: () => err };
+}
+
+/** claude-mobile в интерактивной консоли (ConPTY): write() — ввод человека. */
+function runTty(bridge, args) {
+  const env = { ...process.env, CLAUDE_BRIDGE_HOME: bridge.home };
+  const term = pty.spawn(process.execPath, [ATTACH, ...args], { name: 'xterm', cols: 200, rows: 50, cwd: bridge.cwd, env });
+  let out = '';
+  term.onData((d) => { out += d; });
+  const done = new Promise((r) => term.onExit(({ exitCode }) => r(exitCode)));
+  const t = setTimeout(() => { try { term.kill(); } catch { /* вышел */ } }, 40000);
+  done.then(() => clearTimeout(t));
+  return { term, done, out: () => stripAnsi(out), write: (s) => term.write(s) };
+}
+
+const until = async (fn, ms, what) => assert.ok(await H.waitFor(fn, ms), 'не дождались: ' + what);
+
+test('--agent starts that agent with raw args; -l shows the agent', { timeout: 60000 }, async () => {
+  const a = run(b, ['--agent', 'echo', '--x']);
+  await until(() => /ARGV:\["--x"\]/.test(a.out()), 20000, 'ARGV в выводе: ' + a.out() + a.err());
+  assert.match(a.out(), /Запускаю: echo --x/);
+  H.killTree(a.p.pid);
+  const l = run(b, ['-l']);
+  assert.strictEqual(await l.done, 0, l.err());
+  assert.match(l.out(), /\tжива\tEcho\t/);
+});
+
+test('--agent without id fails; unknown agent -> bridge error', { timeout: 60000 }, async () => {
+  for (const args of [['--agent'], ['--agent', '--resume']]) {
+    const a = run(b, args);
+    assert.strictEqual(await a.done, 1, args.join(' '));
+    assert.match(a.err(), /id агента/);
+  }
+  const u = run(b, ['--agent', 'nope']);
+  assert.strictEqual(await u.done, 1);
+  assert.match(u.err(), /неизвестный агент/);
+});
+
+test('resume next to a live session: the bridge decides (createConflict), no client-side prompt (D-7)', { timeout: 90000 }, async () => {
+  const o = await b.connect(b.owner);
+  const live = await createAndAttach(o, { agent: 'claude', cwd: b.cwd });
+  assert.strictEqual(live.type, 'created');
+  // без консоли — отказ после предупреждения моста
+  const a = run(b, ['--agent', 'claude', '--resume']);
+  assert.strictEqual(await a.done, 1);
+  assert.match(a.out(), /уже есть живые сессии этого агента/);
+  assert.match(a.out(), new RegExp(live.id));
+  assert.match(a.err(), /нет интерактивной консоли/);
+  // в консоли — вопрос; «y» -> create с force, сессия с --resume
+  const t = runTty(b, ['--agent', 'claude', '--resume']);
+  await until(() => /продолжить с resume\? \[y\/N\]/.test(t.out()), 20000, 'вопрос о resume: ' + t.out());
+  t.write('y\r');
+  await until(() => /ARGV:\["--resume"\]/.test(t.out()), 20000, 'сессия с --resume: ' + t.out());
+  // клиент больше не нужен (сессия живёт в keeper'е; её погасит stop() стенда)
+  H.killTree(t.term.pid);
+  await t.done;
+});
+
+test('--qr with a paired phone waits for the phone (D-13); QR has no manual code line (P-7)', { timeout: 60000 }, async () => {
+  const d = await b.connect(DEVICE.token);
+  let atD = d.mark();
+  // отказ на телефоне
+  const no = runTty(b, ['--qr']);
+  let req = await d.wait((m) => m.type === 'confirmRequest', 15000, atD);
+  await until(() => /сопряжённом телефоне/.test(no.out()), 10000, 'подсказка про телефон: ' + no.out());
+  assert.doesNotMatch(no.out(), /\[y\/N\]/, 'no console question when a phone is paired');
+  d.send({ type: 'confirm', confirmId: req.confirmId, allow: false });
+  assert.strictEqual(await no.done, 1);
+  assert.match(no.out(), /Отклонено на телефоне/);
+  // разрешение на телефоне
+  atD = d.mark();
+  const a = runTty(b, ['--qr']);
+  req = await d.wait((m) => m.type === 'confirmRequest', 15000, atD);
+  d.send({ type: 'confirm', confirmId: req.confirmId, allow: true });
+  assert.strictEqual(await a.done, 0, a.out());
+  assert.match(a.out(), /Сопряжение нового устройства/);
+  assert.match(a.out(), new RegExp('Адрес моста: ' + TEST_LAN_HOST.replace(/\./g, '\\.')));
+  assert.doesNotMatch(a.out(), /ручного ввода/);
+});
+
+test('--qr without paired devices: console confirmation (P-9), then QR', { timeout: 90000 }, async () => {
+  const nb = await H.startTestBridge({ prefix: 'cb-cm0-', config: { host: TEST_LAN_HOST, ...AGENTS } });
+  try {
+    const a = runTty(nb, ['--qr']);
+    await until(() => /Выпустить код сопряжения нового устройства\? \[y\/N\]/.test(a.out()), 20000, 'вопрос: ' + a.out());
+    a.write('y\r');
+    assert.strictEqual(await a.done, 0, a.out());
+    assert.match(a.out(), /Сопряжение нового устройства/);
+    assert.doesNotMatch(a.out(), /ручного ввода/);
+  } finally { await nb.stop(); }
+});
+
+test('--device: enabling internet waits for the phone (D-13); denial ends the menu', { timeout: 60000 }, async () => {
+  const d = await b.connect(DEVICE.token);
+  const atD = d.mark();
+  const a = runTty(b, ['--device']);
+  await until(() => /i — вкл\/выкл интернет/.test(a.out()), 20000, 'меню устройств');
+  assert.match(a.out(), /Test phone/);
+  a.write('i\r');
+  const req = await d.wait((m) => m.type === 'confirmRequest' && m.action === 'setInternet', 15000, atD);
+  await until(() => /сопряжённом телефоне/.test(a.out()), 10000, 'подсказка про телефон');
+  d.send({ type: 'confirm', confirmId: req.confirmId, allow: false });
+  assert.strictEqual(await a.done, 1);
+  assert.match(a.out(), /Отклонено на телефоне/);
+});

@@ -303,3 +303,52 @@ test('M-3: spawnSpec failures carry a user-visible message without paths or pass
   assert.match(e4.userMessage, /opencode/);
   noLeak(e4, '127.0.0.1', 'pw-x');
 });
+
+// D-23.3 (B-3): разрешения субагентов (дочерние сессии opencode)
+test('D-23.3: child request -> request with the child session id; reply goes to the child path', async () => {
+  const { fake, a } = await setup();
+  const session = { id: 's1-aaaaaa', agentState: { opencodeSessionId: 'ses_fake1' }, runtime: {} };
+  const ev = [];
+  const un = a.subscribe(session, (e) => ev.push(...e));
+  await waitUntil(() => fake.state.sse.size === 1);
+  await sleep(100);
+  fake.addChild('ses_sub', 'ses_fake1');
+  fake.ask('ses_sub', { id: 'per_s', action: 'shell', resources: ['mkdir oc-sub'], save: ['mkdir *'] });
+  await waitUntil(() => ev.some((e) => e.kind === 'request'));
+  const req = ev.find((e) => e.kind === 'request');
+  assert.strictEqual(req.requestId, 'per_s');
+  assert.strictEqual(req.agentSessionId, 'ses_sub');
+  assert.match(req.message, /субагент.*shell: mkdir oc-sub/);
+  assert.ok(ev.some((e) => e.kind === 'status' && e.status === 'waiting'));
+  const r = await a.reply(session, { requestId: 'per_s', agentSessionId: 'ses_sub' }, 'once');
+  assert.deepStrictEqual(r, { ok: true, events: [{ kind: 'requestClosed', requestId: 'per_s' }] });
+  assert.deepStrictEqual(fake.state.replies, [{ sessionID: 'ses_sub', requestID: 'per_s', decision: 'once' }]);
+  un();
+});
+
+test('D-23.3: child execution events do not change the root status; resync keeps child session ids', () => {
+  const stub = stubClient();
+  const a = oc.create('opencode', { command: process.execPath }, { opencodeClient: stub, now: () => 1 });
+  const ev = [];
+  a.subscribe({ id: 's1', agentState: { opencodeSessionId: 'ses_x' } }, (e) => ev.push(...e));
+  const h = stub.handler;
+  for (const type of ['session.execution.started', 'session.execution.succeeded', 'session.execution.failed',
+    'session.execution.interrupted']) h({ type, data: { sessionID: 'ses_child' } });
+  assert.deepStrictEqual(ev, []);
+  h({ type: 'bridge.resync', data: { sessionID: 'ses_x', startedAt: 5,
+    permissions: [{ id: 'per_c', sessionID: 'ses_child', action: 'shell' }, { id: 'per_r', action: 'shell' }] } });
+  const reqs = ev.filter((e) => e.kind === 'request');
+  assert.deepStrictEqual(reqs.map((e) => [e.requestId, e.agentSessionId]), [['per_c', 'ses_child'], ['per_r', 'ses_x']]);
+  assert.match(reqs[0].message, /субагент/);
+  assert.doesNotMatch(reqs[1].message, /субагент/);
+});
+
+test('D-23.3: reply uses the stored child session id; a malformed one is refused', async () => {
+  const stub = stubClient();
+  const a = oc.create('opencode', { command: process.execPath }, { opencodeClient: stub });
+  const session = { id: 's1', agentState: { opencodeSessionId: 'ses_x' } };
+  assert.strictEqual((await a.reply(session, { requestId: 'per_1', agentSessionId: 'ses_child' }, 'once')).ok, true);
+  assert.strictEqual((await a.reply(session, { requestId: 'per_2' }, 'once')).ok, true);
+  assert.deepStrictEqual(await a.reply(session, { requestId: 'per_3', agentSessionId: '../x' }, 'once'), { ok: false, events: [] });
+  assert.deepStrictEqual(stub.replies, [['ses_child', 'per_1', 'once'], ['ses_x', 'per_2', 'once']]);
+});

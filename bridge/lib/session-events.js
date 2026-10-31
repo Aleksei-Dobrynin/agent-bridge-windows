@@ -35,7 +35,12 @@ function applyEvents(session, events, now = Date.now()) {
     } else if (ev.kind === 'request' && typeof ev.requestId === 'string' && ev.requestId && ev.requestId.length <= 128) {
       const message = String(ev.message || '').slice(0, 500);
       const choices = cleanChoices(ev.choices);
-      session.pending.set(ev.requestId, { requestId: ev.requestId, message, choices, at: now });
+      const pend = { requestId: ev.requestId, message, choices, at: now };
+      // D-23.3: сессия агента, которой адресован ответ (дочерняя сессия opencode); клиентам не уходит
+      if (typeof ev.agentSessionId === 'string' && ev.agentSessionId && ev.agentSessionId.length <= 128) {
+        pend.agentSessionId = ev.agentSessionId;
+      }
+      session.pending.set(ev.requestId, pend);
       session.lastNotify = { event: 'request', message, at: now };
       messages.push({ type: 'notify', id: session.id, event: 'request', requestId: ev.requestId,
         choices, message, title: session.title, at: now });

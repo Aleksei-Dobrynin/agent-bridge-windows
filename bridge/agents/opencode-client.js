@@ -14,6 +14,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const NON_LOOPBACK = 'service.json указывает не на loopback — мост не отправит пароль';
 // M-4: общий предел ожидания сервиса при создании сессии (а не попытки × таймаут запроса)
 const ENSURE_DEADLINE_MS = 25000;
+// D-23.3: субагенты (`task`) работают в дочерних сессиях (session.created с parentID) и спрашивают
+// разрешения со своим sessionID — подписчику корневой сессии передаются только их permission.*
+const CHILD_EVENTS = new Set(['permission.asked', 'permission.replied']);
+const MAX_CHILDREN = 256; // всего известных дочерних сессий (старые вытесняются)
+const CHILD_DEPTH = 4; // глубина поиска дочерних сессий при ресинхронизации
+const CHILD_FANOUT = 32; // дочерних сессий одного уровня, у которых ищутся свои
 
 /** Ошибка с текстом, который можно показать клиенту моста (M-3): без путей, адресов и паролей. */
 function userError(message) {
@@ -65,6 +71,7 @@ class OpencodeClient {
     this.maxBackoff = maxBackoffMs;
     this.idleMs = idleMs;
     this.subs = new Map();
+    this.children = new Map(); // id дочерней сессии -> id корневой (подписанной) сессии (D-23.3)
     this.sse = null;
     this.sseOpen = false;
     this.backoff = backoffMs;
@@ -146,13 +153,26 @@ class OpencodeClient {
   }
 
   /** Ожидающие запросы сессии. Неожиданная форма ответа — ошибка (M-6): ресинхронизация по
-   *  «пустому» списку закрыла бы все открытые запросы. */
+   *  «пустому» списку закрыла бы все открытые запросы. У ошибки HTTP — поле status. */
   async listPermissions(sid) {
     const r = await this.request('GET', `/api/session/${encodeURIComponent(sid)}/permission`);
-    if (r.status !== 200) throw new Error(`opencode: список разрешений недоступен (HTTP ${r.status})`);
+    if (r.status !== 200) {
+      const e = new Error(`opencode: список разрешений недоступен (HTTP ${r.status})`);
+      e.status = r.status;
+      throw e;
+    }
     const arr = Array.isArray(r.json) ? r.json : (r.json && Array.isArray(r.json.data) ? r.json.data : null);
     if (!arr) throw new Error('opencode: неожиданный ответ на список разрешений');
     return arr.filter((p) => p && typeof p.id === 'string');
+  }
+
+  /** Дочерние сессии (D-23.3): GET /api/session?parentID=<sid> (OpenAPI v2.1.4: data: Session.Info[],
+   *  до 50 самых новых). Сессии с другим parentID отбрасываются (сервис, игнорирующий фильтр). */
+  async listChildren(sid) {
+    const r = await this.request('GET', `/api/session?parentID=${encodeURIComponent(sid)}`);
+    const arr = r.json && Array.isArray(r.json.data) ? r.json.data : null;
+    if (r.status !== 200 || !arr) throw new Error(`opencode: список дочерних сессий недоступен (HTTP ${r.status})`);
+    return arr.filter((s) => s && typeof s.id === 'string' && SESSION_ID.test(s.id) && s.parentID === sid).map((s) => s.id);
   }
 
   /** Сессии, которые сейчас выполняются (GET /api/session/active, OpenAPI v2.1.4:
@@ -177,7 +197,8 @@ class OpencodeClient {
     throw new Error(`opencode: ответ на разрешение не принят (HTTP ${r.status}${typeof tag === 'string' ? ' ' + tag : ''})`);
   }
 
-  /** Подписка на события одной сессии. handler(evt) получает события SSE с этим sessionID
+  /** Подписка на события одной сессии. handler(evt) получает события SSE с этим sessionID,
+   *  permission.* её дочерних сессий (субагентов, D-23.3; sessionID — дочерней)
    *  и синтетическое { type:'bridge.resync', data:{ sessionID, startedAt, permissions, running } }
    *  после (пере)подключения: поток общий для всех сессий и пропущенное при обрыве не досылает
    *  (живая проба v2.1.4). startedAt — performance.now() в момент запроса списков; running —
@@ -188,7 +209,10 @@ class OpencodeClient {
     if (this.sseOpen) this._resync([sid]);
     else this._ensureSse();
     return () => {
-      if (this.subs.get(sid) === handler) this.subs.delete(sid);
+      if (this.subs.get(sid) === handler) {
+        this.subs.delete(sid);
+        for (const [child, root] of [...this.children]) if (root === sid) this.children.delete(child);
+      }
       if (!this.subs.size) this._closeSse();
     };
   }
@@ -196,7 +220,48 @@ class OpencodeClient {
   close() {
     this.closed = true;
     this.subs.clear();
+    this.children.clear();
     this._closeSse();
+  }
+
+  /** D-23.3: sid — дочерняя сессия parentID (подписанной или уже известной дочерней) -> запомнить
+   *  её корень. true — сессия стала известной. */
+  _noteChild(sid, parentID) {
+    if (typeof sid !== 'string' || !SESSION_ID.test(sid) || typeof parentID !== 'string') return false;
+    if (this.subs.has(sid) || this.children.has(sid)) return false;
+    const root = this.subs.has(parentID) ? parentID : this.children.get(parentID);
+    if (!root) return false;
+    if (this.children.size >= MAX_CHILDREN) this.children.delete(this.children.keys().next().value);
+    this.children.set(sid, root);
+    return true;
+  }
+
+  /** D-23.3: найти дочерние сессии root (вглубь до CHILD_DEPTH). Сервис без списка по parentID —
+   *  остаются только известные из session.created. */
+  async _discoverChildren(root) {
+    let level = [root];
+    for (let depth = 0; depth < CHILD_DEPTH && level.length; depth++) {
+      const next = [];
+      for (const parent of level) {
+        let ids;
+        try { ids = await this.listChildren(parent); } catch { return; }
+        for (const id of ids) {
+          this._noteChild(id, parent);
+          if (this.children.get(id) === root && next.length < CHILD_FANOUT) next.push(id);
+        }
+      }
+      level = next;
+    }
+  }
+
+  /** Запросы дочерней сессии с её sessionID; удалённая сессия (404) — пусто и забыта. */
+  _childPermissions(child) {
+    return this.listPermissions(child).then(
+      (list) => list.map((p) => ({ ...p, sessionID: child })),
+      (e) => {
+        if (e && e.status === 404) { this.children.delete(child); return []; }
+        throw e;
+      });
   }
 
   _ensureSse() {
@@ -271,9 +336,17 @@ class OpencodeClient {
 
   _dispatch(evt) {
     if (!evt || typeof evt.type !== 'string' || !evt.data || typeof evt.data !== 'object') return;
-    const handler = typeof evt.data.sessionID === 'string' ? this.subs.get(evt.data.sessionID) : null;
-    if (!handler) return;
-    this._call(handler, evt);
+    const sid = evt.data.sessionID;
+    if (typeof sid !== 'string') return;
+    if (evt.type === 'session.created') this._noteChild(sid, evt.data.parentID);
+    else if (evt.type === 'session.deleted') this.children.delete(sid);
+    const own = this.subs.get(sid);
+    if (own) { this._call(own, evt); return; }
+    // D-23.3: дочерняя сессия — корневому подписчику только запросы разрешений (с её sessionID);
+    // её session.execution.* статус корневой не меняют
+    const root = this.children.get(sid);
+    const handler = root && CHILD_EVENTS.has(evt.type) ? this.subs.get(root) : null;
+    if (handler) this._call(handler, evt);
   }
 
   /** Ошибка обработчика (синхронная или отклонённый промис) не рвёт поток и не мешает другим сессиям. */
@@ -294,9 +367,15 @@ class OpencodeClient {
       // M-5: выполняется ли сессия — чтобы после ресинхронизации статус не остался устаревшим;
       // недоступный список активных сессий ресинхронизацию разрешений не отменяет
       const running = this.activeSessions().then((set) => set.has(sid), () => undefined);
-      Promise.all([this.listPermissions(sid), running]).then(([permissions, run]) => {
+      // D-23.3: и запросы дочерних сессий (с их sessionID); сбой списка дочерней сессии, кроме 404, —
+      // сбой всей ресинхронизации (M-6: неполный список закрыл бы её открытые запросы)
+      this._discoverChildren(sid).then(() => {
+        const kids = [...this.children].filter(([, root]) => root === sid).map(([child]) => child);
+        return Promise.all([this.listPermissions(sid), running, ...kids.map((k) => this._childPermissions(k))]);
+      }).then(([own, run, ...childLists]) => {
         const handler = this.subs.get(sid);
         if (handler) {
+          const permissions = own.concat(...childLists);
           this._call(handler, { type: 'bridge.resync', data: { sessionID: sid, startedAt, permissions, running: run } });
         }
       }).catch((e) => console.error('[opencode] ресинхронизация:', e.message));

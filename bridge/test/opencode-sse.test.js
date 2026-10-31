@@ -236,3 +236,83 @@ test('M-5: resync carries running from /api/session/active and startedAt', async
   c.close();
   await fake.close();
 });
+
+// D-23.3 (B-3): субагенты opencode (`task`) работают в дочерних сессиях (session.created с parentID)
+// и спрашивают разрешения со своим sessionID
+test('D-23.3: child sessions (nested too): permission.* go to the root subscriber, other child events do not', async () => {
+  const fake = await mkFake();
+  const c = mkClient({ file: fake.writeServiceFile(tmp()), backoffMs: 50 });
+  const got = [];
+  c.subscribe('ses_a', (e) => got.push(e));
+  await waitUntil(() => got.some((e) => e.type === 'bridge.resync'));
+  fake.addChild('ses_c1', 'ses_a');
+  fake.addChild('ses_c2', 'ses_c1'); // субагент субагента
+  fake.addChild('ses_x1', 'ses_other'); // чужая
+  fake.emit({ type: 'session.execution.started', data: { sessionID: 'ses_c1' } });
+  fake.ask('ses_x1', { id: 'per_x' });
+  fake.ask('ses_c2', { id: 'per_c2' });
+  fake.emit({ type: 'permission.replied', data: { sessionID: 'ses_c1', requestID: 'per_c1', reply: 'once' } });
+  fake.emit({ type: 'session.execution.succeeded', data: { sessionID: 'ses_c2' } });
+  fake.emit({ type: 'session.execution.started', data: { sessionID: 'ses_a' } });
+  await waitUntil(() => got.some((e) => e.type === 'session.execution.started'));
+  const seen = got.filter((e) => e.type !== 'bridge.resync').map((e) => [e.type, e.data.sessionID]);
+  assert.deepStrictEqual(seen, [
+    ['permission.asked', 'ses_c2'],
+    ['permission.replied', 'ses_c1'],
+    ['session.execution.started', 'ses_a'],
+  ]);
+});
+
+test('D-23.3: resync covers children — listed by parentID (nested) and known from session.created', async () => {
+  const fake = await mkFake();
+  const c = mkClient({ file: fake.writeServiceFile(tmp()), backoffMs: 50 });
+  // дочерние сессии существовали до подписки (рестарт моста): находятся списком GET /api/session?parentID=
+  fake.addChild('ses_c1', 'ses_a', { announce: false });
+  fake.addChild('ses_c2', 'ses_c1', { announce: false });
+  fake.addSilently('ses_a', { id: 'per_a' });
+  fake.addSilently('ses_c2', { id: 'per_c2' });
+  const got = [];
+  c.subscribe('ses_a', (e) => got.push(e));
+  await waitUntil(() => got.some((e) => e.type === 'bridge.resync'));
+  const r1 = got.find((e) => e.type === 'bridge.resync').data;
+  assert.deepStrictEqual(r1.permissions.map((p) => [p.id, p.sessionID]).sort(), [['per_a', 'ses_a'], ['per_c2', 'ses_c2']]);
+  assert.ok(fake.state.listQueries.some((q) => /parentID=ses_a/.test(q)), 'children listed by parentID');
+  // найденные списком дочерние сессии — известны: их события идут подписчику
+  fake.ask('ses_c1', { id: 'per_c1' });
+  await waitUntil(() => got.some((e) => e.type === 'permission.asked' && e.data.id === 'per_c1'));
+
+  // сервис без списка по parentID: ресинхронизация — только известных дочерних сессий
+  fake.state.listStatus = 400;
+  fake.addChild('ses_c3', 'ses_a'); // известна по session.created
+  fake.addChild('ses_c4', 'ses_a', { announce: false }); // не известна
+  fake.addSilently('ses_c3', { id: 'per_c3' });
+  fake.addSilently('ses_c4', { id: 'per_c4' });
+  await sleep(100);
+  got.length = 0;
+  fake.dropSse();
+  await waitUntil(() => got.some((e) => e.type === 'bridge.resync'), 5000);
+  const ids = got.find((e) => e.type === 'bridge.resync').data.permissions.map((p) => p.id).sort();
+  assert.deepStrictEqual(ids, ['per_a', 'per_c1', 'per_c2', 'per_c3']);
+
+  // удалённая дочерняя сессия (404) не срывает ресинхронизацию
+  fake.state.deleted.add('ses_c3');
+  got.length = 0;
+  fake.dropSse();
+  await waitUntil(() => got.some((e) => e.type === 'bridge.resync'), 5000);
+  assert.deepStrictEqual(got.find((e) => e.type === 'bridge.resync').data.permissions.map((p) => p.id).sort(),
+    ['per_a', 'per_c1', 'per_c2']);
+});
+
+test('D-23.3: unsubscribing a root forgets its children', async () => {
+  const fake = await mkFake();
+  const c = mkClient({ file: fake.writeServiceFile(tmp()), backoffMs: 50 });
+  const a = [];
+  const unA = c.subscribe('ses_a', (e) => a.push(e));
+  c.subscribe('ses_b', () => {});
+  await waitUntil(() => a.some((e) => e.type === 'bridge.resync'));
+  fake.addChild('ses_c1', 'ses_a');
+  fake.addChild('ses_c2', 'ses_b');
+  await waitUntil(() => c.children.size === 2);
+  unA();
+  assert.deepStrictEqual([...c.children.keys()], ['ses_c2']);
+});

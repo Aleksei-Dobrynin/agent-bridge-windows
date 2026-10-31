@@ -83,3 +83,16 @@ test('lastNotify does not stay a stale request after requests close', () => {
   SE.closeAllRequests(s);
   assert.strictEqual(s.lastNotify, null);
 });
+
+test('D-23.3: agentSessionId of a request is kept in pending only (not sent to clients)', () => {
+  const s = mk();
+  const r = SE.applyEvents(s, [
+    { kind: 'request', requestId: 'per_1', message: 'm', choices: [{ id: 'once', label: 'Да' }], agentSessionId: 'ses_child' },
+    { kind: 'request', requestId: 'per_2', message: 'm', choices: [], agentSessionId: 42 },
+    { kind: 'request', requestId: 'per_3', message: 'm', choices: [], agentSessionId: 'x'.repeat(129) },
+  ], 5);
+  assert.strictEqual(s.pending.get('per_1').agentSessionId, 'ses_child');
+  assert.ok(!('agentSessionId' in s.pending.get('per_2')));
+  assert.ok(!('agentSessionId' in s.pending.get('per_3')));
+  assert.ok(r.messages.every((m) => !('agentSessionId' in m)));
+});

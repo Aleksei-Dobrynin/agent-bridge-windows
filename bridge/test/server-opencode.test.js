@@ -163,6 +163,31 @@ test('M-4: a second reply while the first is in flight -> immediate stale, one c
     [{ sessionID: 'ses_fake1', requestID: 'per_m4', decision: 'once' }]);
 });
 
+test('D-23.3: subagent (child session) request reaches the client; reply goes to the child session', { timeout: 30000 }, async () => {
+  await waitUntil(() => fake.state.sse.size >= 1);
+  const at = c.mark();
+  fake.emit({ type: 'session.execution.started', data: { sessionID: 'ses_fake1' } });
+  await c.wait((m) => m.type === 'status' && m.id === sid && m.status === 'working', 5000, at);
+  fake.addChild('ses_sub1', 'ses_fake1');
+  fake.emit({ type: 'session.execution.started', data: { sessionID: 'ses_sub1' } });
+  fake.ask('ses_sub1', { id: 'per_sub1', action: 'shell', resources: ['mkdir oc-sub'], save: ['mkdir *'] });
+  const n = await c.wait((m) => m.type === 'notify' && m.requestId === 'per_sub1', 5000, at);
+  assert.strictEqual(n.id, sid);
+  assert.ok(!('agentSessionId' in n));
+  await c.wait((m) => m.type === 'status' && m.id === sid && m.status === 'waiting', 5000, at);
+  c.send({ type: 'reply', id: sid, requestId: 'per_sub1', decision: 'once' });
+  const ok = await c.wait((m) => m.type === 'replyResult' && m.requestId === 'per_sub1', 5000, at);
+  assert.strictEqual(ok.ok, true);
+  assert.deepStrictEqual(fake.state.replies.slice(-1), [{ sessionID: 'ses_sub1', requestID: 'per_sub1', decision: 'once' }]);
+  await c.wait((m) => m.type === 'requestClosed' && m.requestId === 'per_sub1', 5000, at);
+  // окончание субагента не завершает ход родителя
+  const at2 = c.mark();
+  fake.emit({ type: 'session.execution.succeeded', data: { sessionID: 'ses_sub1' } });
+  fake.emit({ type: 'session.execution.succeeded', data: { sessionID: 'ses_fake1' } });
+  await c.wait((m) => m.type === 'notify' && m.id === sid && m.event === 'done', 5000, at2);
+  assert.strictEqual(c.msgs.slice(at2).filter((m) => m.type === 'notify' && m.event === 'done').length, 1);
+});
+
 test('M-3: service failure on create is shown to the client (no password / address)', { timeout: 30000 }, async () => {
   fake.state.createStatus = 500;
   try {

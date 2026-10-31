@@ -13,15 +13,17 @@ const EXE_REL = ['node_modules', '@opencode', 'cli', 'bin', 'opencode.exe'];
 const OPTIONS = [{ id: 'askShell', label: 'Спрашивать разрешение на команды', type: 'bool' }];
 const ASK_SHELL = [{ action: 'shell', resource: '*', effect: 'ask' }];
 const DECISIONS = new Set(['once', 'always', 'reject']);
+const SESSION_ID = /^ses_[A-Za-z0-9_-]{1,128}$/;
 const MAX_CLOSED = 256;
 // D-19 п. 2 (общий санитайзер): длинное значение — «начало…конец (N симв.)»
 const ACTION_CLIP = { max: 40, head: 24, tail: 10 };
 const MESSAGE_CLIP = { max: 120, head: 60, tail: 40 };
 
-function describe(p) {
+/** sub — запрос субагента (дочерней сессии, D-23.3). */
+function describe(p, sub = false) {
   const action = (typeof p.action === 'string' && displayText(p.action, ACTION_CLIP)) || 'действие';
   const res = Array.isArray(p.resources) ? p.resources.filter((x) => typeof x === 'string').map(cleanText).filter(Boolean) : [];
-  let text = `opencode просит разрешение — ${action}`;
+  let text = `opencode${sub ? ' (субагент)' : ''} просит разрешение — ${action}`;
   if (res.length) text += ': ' + clipMiddle(res.join(', '));
   // необязательный текст запроса для человека (в v2.1.4 его нет, D-12 «Живая проба»)
   const message = typeof p.message === 'string' ? displayText(p.message, MESSAGE_CLIP) : '';
@@ -111,14 +113,19 @@ function create(id, cfg, opts = {}) {
         closed.add(rid);
         if (closed.size > MAX_CLOSED) closed.delete(closed.values().next().value);
       };
+      // D-23.3: запрос дочерней сессии (субагента) — ответ пойдёт по её пути (agentSessionId в pending)
       const opened = (p) => {
         known.set(p.id, now());
-        return [{ kind: 'request', requestId: p.id, message: describe(p), choices: choicesFor(p) },
-          { kind: 'status', status: 'waiting' }];
+        const target = typeof p.sessionID === 'string' && SESSION_ID.test(p.sessionID) ? p.sessionID : sid;
+        return [{ kind: 'request', requestId: p.id, message: describe(p, target !== sid), choices: choicesFor(p),
+          agentSessionId: target },
+        { kind: 'status', status: 'waiting' }];
       };
       const finished = (message) => [{ kind: 'status', status: 'idle' }, { kind: 'notify', message, done: true }];
       return client.subscribe(sid, (evt) => {
         const d = evt.data || {};
+        // D-23.3: события дочерних сессий, кроме запросов разрешений, статус не меняют
+        if (d.sessionID !== sid && !String(evt.type).startsWith('permission.')) return;
         if (evt.type !== 'bridge.resync') lastStatusAt = now();
         switch (evt.type) {
           case 'permission.asked':
@@ -182,12 +189,15 @@ function create(id, cfg, opts = {}) {
     async reply(session, request, decision) {
       const sid = session && session.agentState && session.agentState.opencodeSessionId;
       const rid = request && request.requestId;
-      if (!DECISIONS.has(decision) || typeof sid !== 'string' || typeof rid !== 'string' || !rid) {
+      // D-23.3: запрос субагента — по пути его (дочерней) сессии
+      const target = request && request.agentSessionId !== undefined ? request.agentSessionId : sid;
+      if (!DECISIONS.has(decision) || typeof sid !== 'string' || typeof rid !== 'string' || !rid ||
+        typeof target !== 'string' || (target !== sid && !SESSION_ID.test(target))) {
         return { ok: false, events: [] };
       }
       let r;
       try {
-        r = await client.replyPermission(sid, rid, decision);
+        r = await client.replyPermission(target, rid, decision);
       } catch (e) {
         console.error('[opencode] ответ на разрешение:', e.message);
         return { ok: false, error: 'failed', events: [] };

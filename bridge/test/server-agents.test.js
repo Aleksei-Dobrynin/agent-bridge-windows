@@ -98,11 +98,11 @@ test('unknown agent and missing owner command are refused (D-5)', async () => {
   assert.match(nocmd.message, /команда не найдена/);
 });
 
-test('M-2: agent present but invalid is refused; absent -> default agent', { timeout: 60000 }, async () => {
+test('M-2: agent present but invalid is refused; absent or null -> default agent (D-22.4)', { timeout: 60000 }, async () => {
   const c = await b.connect(DEVICE.token);
   const o = await b.connect(b.owner);
   // предел 10 create в минуту на клиента — делим попытки между устройством и владельцем
-  for (const [cl, agent] of [[c, null], [c, 42], [c, { id: 'echo' }], [o, ['echo']], [o, ''], [o, 'x'.repeat(33)]]) {
+  for (const [cl, agent] of [[c, 42], [c, { id: 'echo' }], [o, ['echo']], [o, ''], [o, 'x'.repeat(33)]]) {
     const r = await createAndAttach(cl, { agent, cwd: b.cwd });
     assert.strictEqual(r.type, 'error', JSON.stringify(agent));
     assert.match(r.message, /неизвестный агент/, JSON.stringify(agent));
@@ -110,6 +110,9 @@ test('M-2: agent present but invalid is refused; absent -> default agent', { tim
   const r = await createAndAttach(c, { cwd: b.cwd });
   assert.strictEqual(r.type, 'created');
   assert.strictEqual((await listedSession(c, r.id)).agent, 'echo');
+  const rn = await createAndAttach(c, { cwd: b.cwd, agent: null });
+  assert.strictEqual(rn.type, 'created', 'D-22.4: null = not given');
+  assert.strictEqual((await listedSession(c, rn.id)).agent, 'echo');
 });
 
 test('M-7: warning about the ignored claudeCommand/claudeArgs at startup', () => {

@@ -168,3 +168,31 @@ test('C-1 / D-22.2: after the last phone is revoked --qr refuses instead of aski
     assert.doesNotMatch(a.out(), /\[y\/N\]/);
   } finally { await nb.stop(); }
 });
+
+test('m-2: own claude-mobile flags after --agent are refused, not reinterpreted', { timeout: 60000 }, async () => {
+  for (const flag of ['-l', '--list', '-a', '--attach', '--qr', '--device', '--devices', '--open', '--rotate-token', '-h', '--help']) {
+    const a = run(b, ['--agent', 'echo', flag]);
+    assert.strictEqual(await a.done, 1, flag);
+    assert.match(a.err(), /--agent нельзя сочетать/, flag);
+    assert.doesNotMatch(a.out(), /Запускаю|Сессий нет|жива/, flag);
+  }
+});
+
+test('m-3: a refusal or cancel in the console exits with code 1', { timeout: 90000 }, async () => {
+  const nb = await H.startTestBridge({ prefix: 'cb-cm2-', config: { host: TEST_LAN_HOST, ...AGENTS } });
+  try {
+    const a = runTty(nb, ['--qr']);
+    await until(() => /\[y\/N\]/.test(a.out()), 20000, 'вопрос консоли');
+    a.write('n\r');
+    assert.strictEqual(await a.done, 1);
+    assert.match(a.out(), /Отменено/);
+    // отказ продолжить resume рядом с живой сессией
+    const o = await nb.connect(nb.owner);
+    assert.strictEqual((await createAndAttach(o, { agent: 'claude', cwd: nb.cwd })).type, 'created');
+    const r = runTty(nb, ['--agent', 'claude', '--resume']);
+    await until(() => /продолжить с resume\? \[y\/N\]/.test(r.out()), 20000, 'вопрос о resume');
+    r.write('n\r');
+    assert.strictEqual(await r.done, 1);
+    assert.match(r.out(), /Отменено/);
+  } finally { await nb.stop(); }
+});

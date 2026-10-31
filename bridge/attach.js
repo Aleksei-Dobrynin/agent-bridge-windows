@@ -85,12 +85,22 @@ if (args[0] === '--agent') {
     process.exit(1);
   }
   args.splice(0, 2);
+  // m-2: собственные флаги claude-mobile после --agent не переинтерпретируем (иначе
+  // «--agent x -l» молча показал бы список, а «--agent x --qr» выпустил бы код сопряжения)
+  const OWN = new Set(['-l', '--list', '-a', '--attach', '--device', '--devices', '--qr', '--open',
+    '--rotate-token', '-h', '--help']);
+  if (OWN.has(args[0])) {
+    console.error(`--agent нельзя сочетать с ${args[0]}: claude-mobile --agent <id> [аргументы агента…]`);
+    process.exit(1);
+  }
 }
+
+/** m-3: интерактивная консоль — и ввод, и вывод (одна проверка для всех мест). */
+const isTty = () => !!(process.stdin.isTTY && process.stdout.isTTY);
 
 // Сопряжение и меню устройств (отзыв, интернет-доступ) — только для человека в
 // интерактивной консоли (P-9); проверяем до подключения к мосту.
-if ((args[0] === '--qr' || args[0] === '--device' || args[0] === '--devices') &&
-    !(process.stdin.isTTY && process.stdout.isTTY)) {
+if ((args[0] === '--qr' || args[0] === '--device' || args[0] === '--devices') && !isTty()) {
   console.error('Эта операция требует подтверждения в интерактивной консоли.');
   process.exit(1);
 }
@@ -208,14 +218,14 @@ function enterRaw() {
  * принимает подтверждение только с него (D-13).
  */
 function confirmHuman(question, onYes, iface) {
-  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+  if (!isTty()) {
     die('Эта операция требует подтверждения в интерактивной консоли.', 1);
     return;
   }
   const q = iface || readline.createInterface({ input: process.stdin, output: process.stdout });
   q.question(question + ' [y/N]: ', (ans) => {
     if (!iface) q.close();
-    if (/^[yд]/i.test(ans.trim())) onYes(); else die('Отменено.');
+    if (/^[yд]/i.test(ans.trim())) onYes(); else die('Отменено.', 1); // m-3: отказ — код 1
   });
 }
 
@@ -225,7 +235,7 @@ function openLoginUrl(m) {
   if (!url) { die('Мост вернул некорректный токен входа.', 1); return; }
   openInBrowser(url, { onError: (e) => console.error('Не удалось запустить браузер: ' + e.message) });
   console.log('Открываю веб-интерфейс моста (ссылка одноразовая, действует 60 с).');
-  if (process.stdout.isTTY) console.log('Если браузер не открылся: ' + url);
+  if (isTty()) console.log('Если браузер не открылся: ' + url); // D-18 п. 2
   setTimeout(() => process.exit(0), 300);
 }
 
@@ -300,11 +310,11 @@ ws.on('message', (rawMsg) => {
       for (const s of live) console.log(`    ${s.id}\t${s.title}`);
       console.log('Если ваша беседа ещё открыта в одной из них, resume создаст её КОПИЮ.');
       if (live.length) console.log(`Вернуться в живую сессию: claude-mobile -a ${live[live.length - 1].id}`);
-      if (!process.stdin.isTTY) { die('Отменено (нет интерактивной консоли).', 1); break; }
+      if (!isTty()) { die('Отменено (нет интерактивной консоли).', 1); break; }
       const q = readline.createInterface({ input: process.stdin, output: process.stdout });
       q.question('Всё равно продолжить с resume? [y/N]: ', (ans) => {
         q.close();
-        if (/^[yд]/i.test(ans.trim())) doCreate(true); else die('Отменено.');
+        if (/^[yд]/i.test(ans.trim())) doCreate(true); else die('Отменено.', 1);
       });
       break;
     }
@@ -433,7 +443,7 @@ function deviceTui(m) {
         // сервер пришлёт обновлённый список — TUI покажет его снова
       } else {
         console.log('Отменено.');
-        process.exit(0);
+        process.exit(1); // m-3: отказ — код 1
       }
     });
   });

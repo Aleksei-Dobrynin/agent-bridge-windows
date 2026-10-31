@@ -463,6 +463,7 @@ async function createSession({ cwd, agentId, options, rawArgs, command, title, l
     adapter = AGENTS.get(AGENTS.defaultId);
   } else {
     // M-2: указан, но не строка / слишком длинный / неизвестный — отказ, а не тихое умолчание
+    // (agentId === null здесь — недопустимое значение из WS, а не «не указан», см. обработчик create)
     adapter = typeof agentId === 'string' ? AGENTS.get(agentId) : null;
     if (!adapter) throw userError('неизвестный агент');
   }
@@ -1353,8 +1354,9 @@ wss.on('connection', (ws, req, who) => {
           createSession({
             cwd: V.str(m.cwd, 1024),
             title: V.cleanTitle(m.title), // L-8
-            // M-2: undefined — не указан (умолчание); иначе строка до 32 символов, прочее — null (отказ)
-            agentId: m.agent === undefined ? undefined : V.str(m.agent, 32),
+            // D-22.4: undefined и null — агент не указан (умолчание); M-2: иначе строка до 32 символов,
+            // прочее (не строка, длиннее) — null, т.е. отказ «неизвестный агент»
+            agentId: m.agent === undefined || m.agent === null ? undefined : V.str(m.agent, 32),
             options: m.options,
             // P-3: сырые аргументы и своя команда — только владельцу; от устройства игнорируются
             rawArgs: local && Array.isArray(m.args) && m.args.length <= 64 &&

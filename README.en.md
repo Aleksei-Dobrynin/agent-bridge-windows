@@ -119,7 +119,7 @@ The APK is signed with the team key. **SHA-256 of the signing certificate:**
 
 If `apksigner` shows a different fingerprint, do not install it. An app signed with another key (for example the old debug one) must be uninstalled first.
 
-> **Status (2026-10-31):** the signed release is not published yet (the team key is created by the repository owner). The phone tunnel (`libclaudetunnel.so`) is not built yet — an APK without it works over the local network only, not over the internet. The test scenarios on a real phone have not been run yet. Details: [ARCHITECTURE.md, §12](ARCHITECTURE.md#12-известные-ограничения).
+> **Status (2026-10-31):** the signed release is not published yet (the team key is created by the repository owner). The phone tunnel (`libclaudetunnel.so`) is built from source (Android NDK 28), but internet access from a real phone has not been tested yet; an APK without it works over the local network only. The test scenarios on a real phone have not been run yet. Details: [ARCHITECTURE.md, §12](ARCHITECTURE.md#12-известные-ограничения).
 
 ### 3. Pairing
 

@@ -46,6 +46,7 @@ CLAUDE-SECURITY-*/
 SECURITY_AUDIT_*.md
 
 # --- Прочее ---
+dist/
 *.slojka
 .DS_Store
 *.log

@@ -1,0 +1,8 @@
+# Окончания строк для скриптов: gradlew/sh исполняются в POSIX-оболочке (LF), .bat — в cmd (CRLF)
+android/gradlew text eol=lf
+*.sh text eol=lf
+*.bat text eol=crlf
+
+# Сторонние ассеты WebView копирует задача syncVendorAssets из node_modules (LF) —
+# без EOL-преобразований, иначе каждая сборка даёт «изменённые» файлы при core.autocrlf=true
+android/app/src/main/assets/web/vendor/** -text

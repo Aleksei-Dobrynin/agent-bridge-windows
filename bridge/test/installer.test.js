@@ -121,3 +121,58 @@ test('install.ps1 -StartupShortcut creates the autostart shortcut in -StartupDir
   assert.strictEqual(lnk.w.toLowerCase(), path.join(ROOT, 'bridge').toLowerCase());
   assert.strictEqual(lnk.s, 7);
 });
+
+test('uninstall.ps1 reverses install on temp paths; -RemoveData removes the data dir', { timeout: 600000 }, (t) => {
+  const s = sandbox(t, true);
+  const inst = ps('install.ps1', [...s.safe, '-SkipNpm', '-NoStart']);
+  assert.strictEqual(inst.status, 0, inst.out);
+  const shim = path.join(s.data, 'bin', 'claude-mobile.cmd');
+
+  const dry = ps('uninstall.ps1', [...s.safe, '-DryRun', '-RemoveData', '-Firewall']);
+  assert.strictEqual(dry.status, 0, dry.out);
+  assert.match(dry.out, /\[dry-run\] Хук моста будет удалён/);
+  assert.match(dry.out, /\[dry-run\] netsh advfirewall firewall delete rule name=ClaudeBridge-TCP/);
+  assert.ok(fs.existsSync(shim), 'dry run kept the shim');
+  assert.ok(fs.existsSync(path.join(s.data, 'config.json')), 'dry run kept the data');
+
+  const r = ps('uninstall.ps1', s.safe);
+  assert.strictEqual(r.status, 0, r.out);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(s.settings, 'utf8')), USER);
+  assert.ok(!fs.existsSync(shim), 'shim removed');
+  assert.ok(fs.existsSync(path.join(s.data, 'config.json')), 'data kept without -RemoveData');
+
+  const r2 = ps('uninstall.ps1', [...s.safe, '-RemoveData']);
+  assert.strictEqual(r2.status, 0, r2.out);
+  assert.match(r2.out, /Хука моста нет/);
+  assert.ok(!fs.existsSync(s.data), 'data dir removed');
+});
+
+test('uninstall.ps1 refuses a custom -DataRoot without -SkipTask -SkipPath', { timeout: 600000 }, (t) => {
+  const s = sandbox(t, true);
+  const r = ps('uninstall.ps1', ['-DataRoot', s.data, '-SettingsPath', s.settings]);
+  assert.notStrictEqual(r.status, 0);
+  assert.match(r.out, /только для проверки/);
+  const r2 = ps('uninstall.ps1', ['-DataRoot', s.data, '-SettingsPath', s.settings, '-SkipPath', '-StartupShortcut']);
+  assert.notStrictEqual(r2.status, 0);
+  assert.match(r2.out, /только для проверки/);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(s.settings, 'utf8')), USER);
+});
+
+test('uninstall.ps1 -StartupShortcut removes the autostart shortcut from -StartupDir (D-25 item 4)', { timeout: 600000 }, (t) => {
+  const s = sandbox(t, false);
+  fs.mkdirSync(s.startup);
+  const inst = ps('install.ps1', [...s.shortcut, '-SkipNpm', '-NoStart']);
+  assert.strictEqual(inst.status, 0, inst.out);
+  const lnk = path.join(s.startup, 'ClaudeBridge.lnk');
+  assert.ok(fs.existsSync(lnk), 'shortcut installed');
+
+  const dry = ps('uninstall.ps1', [...s.shortcut, '-DryRun']);
+  assert.strictEqual(dry.status, 0, dry.out);
+  assert.match(dry.out, /\[dry-run\] Удаляю ярлык автозагрузки/);
+  assert.ok(fs.existsSync(lnk), 'dry run kept the shortcut');
+
+  const r = ps('uninstall.ps1', s.shortcut);
+  assert.strictEqual(r.status, 0, r.out);
+  assert.doesNotMatch(r.out, /Планировщик/, 'scheduled task untouched');
+  assert.ok(!fs.existsSync(lnk), 'shortcut removed');
+});

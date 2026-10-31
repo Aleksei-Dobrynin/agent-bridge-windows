@@ -55,6 +55,34 @@ test('generic: config args then owner raw args; no events, no replies', async ()
   assert.throws(() => generic.create('x', {}), /command/);
 });
 
+test('M-7: warning when args/prefixArgs are not arrays or contain non-strings', () => {
+  const logged = [];
+  const reg = loadAgents({ agents: {
+    ok: { command: process.execPath, args: ['a'] },
+    nums: { command: process.execPath, args: ['a', 5] },
+    str: { command: process.execPath, args: '--x' },
+    pre: { type: 'claude', command: process.execPath, prefixArgs: [null, 'x'] },
+  } }, { log: (m) => logged.push(m) });
+  assert.deepStrictEqual(reg.list().map((a) => a.id), ['ok', 'nums', 'str', 'pre'], 'agents still load');
+  assert.strictEqual(logged.length, 3, logged.join('\n'));
+  assert.match(logged.join('\n'), /«nums».*args/);
+  assert.match(logged.join('\n'), /«str».*args/);
+  assert.match(logged.join('\n'), /«pre».*prefixArgs/);
+});
+
+test('M-8: list() returns copies — callers cannot mutate adapter options', () => {
+  const reg = loadAgents({ agents: { claude: { command: process.execPath } } }, quiet);
+  const l = reg.list();
+  l[0].options.push({ id: 'evil', type: 'bool' });
+  l[0].options[0].label = 'changed';
+  l[0].name = 'x';
+  const again = reg.list()[0];
+  assert.deepStrictEqual(again.options.map((o) => o.id), ['resume', 'skipPermissions']);
+  assert.notStrictEqual(again.options[0].label, 'changed');
+  assert.strictEqual(reg.get('claude').options[0].label, again.options[0].label);
+  assert.strictEqual(again.name, 'Claude Code');
+});
+
 test('normalizeOptions keeps only declared bool options, strictly true', () => {
   const fake = { options: [{ id: 'resume', type: 'bool' }, { id: 'skip', type: 'bool' }] };
   assert.deepStrictEqual(normalizeOptions(fake, { resume: true, skip: 'yes', other: true }), { resume: true, skip: false });

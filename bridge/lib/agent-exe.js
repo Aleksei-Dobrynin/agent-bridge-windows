@@ -10,7 +10,7 @@ const { findOnPath } = require('./which');
 /** <каталог shim.cmd>\<relParts…>, если такой файл есть; иначе null. */
 function npmShimExe(shim, relParts, find = findOnPath) {
   const cmd = find(shim + '.cmd');
-  if (!cmd) return null;
+  if (!cmd || !path.isAbsolute(cmd)) return null;
   const exe = path.join(path.dirname(cmd), ...relParts);
   try { return fs.statSync(exe).isFile() ? exe : null; } catch { return null; }
 }

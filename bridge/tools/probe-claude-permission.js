@@ -8,6 +8,9 @@
 // Тратит один короткий запрос к модели haiku.
 // Запуск: cd bridge && node tools/probe-claude-permission.js [каталог пробы]
 // (по умолчанию — новый временный каталог; каталог должен быть пустым или отсутствовать)
+// Побочные эффекты вне каталога пробы (их оставляет сам Claude Code): отметка доверия каталогу
+// в %USERPROFILE%\.claude.json, беседа в %USERPROFILE%\.claude\projects\<закодированный путь>\,
+// scratchpad в %TEMP%\claude\<закодированный путь>\. После пробы их можно удалить вручную.
 const fs = require('fs');
 const os = require('os');
 const path = require('path');

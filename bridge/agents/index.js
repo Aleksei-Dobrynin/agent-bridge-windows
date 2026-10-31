@@ -13,11 +13,16 @@
  *       // (keeper наследует childEnv моста); state — сохраняется в meta сессии (переживает рестарт)
  *   isResumeLike({ options, rawArgs }): boolean,      // D-7: предупреждать о живой сессии в каталоге
  *   onHook(session, payload): Event[],               // events:'hook' — POST /hook этой сессии
- *   onInput(session, data): Event[],                 // ввод в PTY с любого клиента
+ *   onInput(session, data): Event[],                 // ввод в PTY с любого клиента: вызывается ТОЛЬКО
+ *       // для WS-сообщений input (не для scroll и не для записей самого адаптера в reply)
  *   subscribe(session, emit): unsubscribe,           // events:'sse'; emit(Event[])
- *   async reply(session, request, decision, io) -> { ok, stale?, events: Event[] },
- *       // decision: 'once' | 'always' | 'reject'; io.write(data) — запись в PTY сессии
+ *   async reply(session, request, decision, io) -> { ok, stale?, error?: 'failed', events: Event[] },
+ *       // decision: 'once' | 'always' | 'reject'; io.write(data) -> boolean — запись в PTY сессии;
+ *       // false (клавиша не дошла, keeper переподключается) -> { ok:false, error:'failed' }, запрос
+ *       // остаётся открытым (D-19 п. 6); stale — запрос уже закрыт; неверное decision -> { ok:false }
  * }
+ * Адаптеры не бросают исключений из onHook/onInput/reply (вход — недоверенный payload);
+ * session.runtime может отсутствовать — адаптер создаёт его сам.
  * Event: { kind:'status', status:'working'|'waiting'|'idle' }
  *      | { kind:'request', requestId, message, choices:[{ id, label }] }
  *      | { kind:'requestClosed', requestId }
@@ -44,6 +49,12 @@ function loadAgents(config, opts = {}) {
       log(`  Агент «${id}»: неизвестный тип ${type} — пропущен`);
       continue;
     }
+    for (const key of ['args', 'prefixArgs']) {
+      const v = cfg[key];
+      if (v !== undefined && (!Array.isArray(v) || v.some((a) => typeof a !== 'string'))) {
+        log(`  Агент «${id}»: ${key} — не массив строк; нестроковые значения отброшены`);
+      }
+    }
     let adapter;
     try {
       adapter = require(TYPES[type]).create(id, cfg, opts);
@@ -60,7 +71,10 @@ function loadAgents(config, opts = {}) {
   return {
     defaultId,
     get: (id) => (typeof id === 'string' ? map.get(id) || null : null),
-    list: () => [...map.values()].map((a) => ({ id: a.id, name: a.name, options: a.options, scroll: a.scroll })),
+    // копии: вызывающий (сериализация в sessions) не может испортить объявление адаптера
+    list: () => [...map.values()].map((a) => ({
+      id: a.id, name: a.name, options: a.options.map((o) => ({ ...o })), scroll: a.scroll,
+    })),
   };
 }
 

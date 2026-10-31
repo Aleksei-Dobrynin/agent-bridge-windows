@@ -46,6 +46,28 @@ test('first shim on PATH wins (PATH order, like findOnPath)', () => {
   }
 });
 
+test('M-6: relative PATH entries are skipped', () => {
+  // на том же диске, что и cwd: path.relative между дисками возвращает абсолютный путь
+  const dir = fs.mkdtempSync(path.join(process.cwd(), '.cb-exe-rel-'));
+  fs.writeFileSync(path.join(dir, 'tool.cmd'), '@echo off');
+  fs.mkdirSync(path.join(dir, ...REL.slice(0, -1)), { recursive: true });
+  fs.writeFileSync(path.join(dir, ...REL), 'MZ');
+  const saved = process.env.PATH;
+  try {
+    process.env.PATH = path.relative(process.cwd(), dir);
+    assert.ok(!path.isAbsolute(process.env.PATH));
+    assert.strictEqual(findOnPath('tool.cmd'), null);
+    assert.strictEqual(npmShimExe('tool', REL), null);
+    // и чужой find, вернувший относительный путь, не принимается
+    assert.strictEqual(npmShimExe('tool', REL, () => path.relative(process.cwd(), path.join(dir, 'tool.cmd'))), null);
+    process.env.PATH = dir;
+    assert.strictEqual(findOnPath('tool.cmd'), path.join(dir, 'tool.cmd'));
+  } finally {
+    process.env.PATH = saved;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('real claude.exe on this machine', { skip: !findOnPath('claude.cmd') && 'claude не установлен' }, () => {
   const exe = npmShimExe('claude', ['node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe']);
   assert.match(exe, /claude\.exe$/i);

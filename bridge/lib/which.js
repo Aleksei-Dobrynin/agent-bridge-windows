@@ -12,7 +12,8 @@ function findOnPath(name) {
   const exts = path.extname(name)
     ? ['']
     : (process.env.PATHEXT || '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean);
-  const dirs = path.isAbsolute(name) ? [''] : (process.env.PATH || '').split(';').filter(Boolean);
+  // относительные элементы PATH пропускаются: они зависят от текущего каталога моста
+  const dirs = path.isAbsolute(name) ? [''] : (process.env.PATH || '').split(';').filter((d) => path.isAbsolute(d));
   for (const d of dirs) {
     for (const e of exts) {
       const p = path.isAbsolute(name) ? name + e : path.join(d, name + e);

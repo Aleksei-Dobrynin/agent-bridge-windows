@@ -89,15 +89,16 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -Firewall
 
 `install.ps1`:
 - checks Node.js 20+ (required) and whether `claude` and `opencode` are present (if missing — a warning: that agent will be unavailable);
-- installs the bridge dependencies (`npm ci` in `bridge\`); a running bridge is stopped first, and with live sessions the installer refuses (they hold `node-pty` files) — end the sessions or add `-SkipNpm`;
+- installs the bridge dependencies (`npm ci` in `bridge\`); a running bridge (the repository's `server.js` process listening on the bridge port) is stopped first, and with live sessions the installer refuses (they hold `node-pty` files) — end the sessions or add `-SkipNpm`;
 - creates the data directory `%LOCALAPPDATA%\ClaudeBridge` and `config.json` from `bridge\config.example.json` (an existing config is left alone);
 - puts `claude-mobile.cmd` into `%LOCALAPPDATA%\ClaudeBridge\bin` and adds that directory to the user PATH;
-- adds the bridge hook to `%USERPROFILE%\.claude\settings.json` (backup `settings.json.bak-…`, the last 5 are kept; your hooks and settings are kept);
-- registers the Task Scheduler task `ClaudeBridge` — the bridge starts when you sign in to Windows (no service: agents need your session). If the task cannot be registered, a `ClaudeBridge.lnk` shortcut in the user's Startup folder (`shell:startup`) is created instead; with `-StartupShortcut` — the shortcut right away;
-- with `-Firewall`, adds inbound rules `ClaudeBridge-TCP` (bridge port, 8790) and `ClaudeBridge-UDP` (beacon, 8791) for the "Private" profile only (Windows asks for administrator approval for this step only);
-- starts the bridge and waits until it listens on its port.
+- adds the bridge hook to `%USERPROFILE%\.claude\settings.json` (backup `settings.json.bak-…`, the last 5 are kept; written via a temporary file with rename retries, so `settings.json` is unchanged on failure; your hooks and settings are kept);
+- registers the Task Scheduler task `ClaudeBridge` — the bridge starts when you sign in to Windows at normal priority (no service: agents need your session). If the task cannot be registered, a `ClaudeBridge.lnk` shortcut in the user's Startup folder (`shell:startup`) is created instead; with `-StartupShortcut` — the shortcut right away;
+- with `-Firewall`, adds inbound rules `ClaudeBridge-TCP` (bridge port, 8790) and `ClaudeBridge-UDP` (beacon, 8791) for the "Private" profile only and only from the local subnet (`remoteip=localsubnet`); Windows asks for administrator approval for this step only, and on error the elevated window waits for Enter instead of closing;
+- starts the bridge and waits until it listens on its port; an already running bridge is restarted (also with `-SkipNpm`), otherwise it would keep the old code (with `-NoStart` only a warning is printed);
+- warns if `node.exe` lives in a temporary directory (`fnm_multishells`, `%TEMP%`): autostart points to that path and will not work after a reboot.
 
-Running it again is safe — this is also how you update after `git pull`. To see what it would do without changing anything: `.\install.ps1 -DryRun`. Other switches: `-SkipNpm`, `-SkipTask`, `-SkipPath`, `-SkipHook`, `-NoStart`, `-StartupShortcut`, `-StartupDir <dir>`, `-TaskName <name>`; `-DataRoot` and `-SettingsPath` are only for testing the installer on temporary directories (`Get-Help .\install.ps1 -Full`).
+Running it again is safe — this is also how you update after `git pull`. To see what it would do without changing anything: `.\install.ps1 -DryRun`. Other switches: `-SkipNpm`, `-SkipTask`, `-SkipPath`, `-SkipHook`, `-NoStart`, `-StartupShortcut`, `-StartupDir <dir>`, `-TaskName <name>`; `-DataRoot` and `-SettingsPath` are only for testing the installer on temporary directories: a non-default `-DataRoot` without `-DryRun` requires a non-default `-SettingsPath`, `-SkipNpm`, `-SkipPath`, `-SkipTask` (or `-StartupShortcut` with a temporary `-StartupDir`) and forbids `-Firewall` (`Get-Help .\install.ps1 -Full`).
 
 > If Windows asks whether `node.exe` may use the network when the bridge first starts, allow it for private networks. If you blocked it before, the `node.exe` block rule overrides allow rules: remove it in "Windows Defender Firewall → Allow an app through firewall…".
 
@@ -220,7 +221,7 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1 -Firewall            # 
 powershell -ExecutionPolicy Bypass -File .\uninstall.ps1 -Firewall -RemoveData
 ```
 
-Removes the scheduled task and the Startup shortcut, stops the bridge, removes the hook from `settings.json` (with a backup), the shim and the PATH entry; `-RemoveData` deletes `%LOCALAPPDATA%\ClaudeBridge` (pairings, certificate, tokens — phones must be paired again) and refuses while sessions are alive. Live sessions keep running until you exit the agent. `-DryRun` only shows the steps; `-StartupShortcut` removes only the shortcut and leaves the task. `bridge\node_modules` and the repository clone are not removed.
+Removes the scheduled task and the Startup shortcut, stops the bridge, removes the hook from `settings.json` (with a backup), the shim and the PATH entry; `-RemoveData` deletes `%LOCALAPPDATA%\ClaudeBridge` (pairings, certificate, tokens — phones must be paired again) only if it is a recognized bridge data directory (not a drive root or a profile folder) and refuses while sessions of that directory are alive. Live sessions keep running until you exit the agent. `-DryRun` only shows the steps; `-StartupShortcut` removes only the shortcut and leaves the task. `bridge\node_modules` and the repository clone are not removed.
 
 ---
 

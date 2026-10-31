@@ -236,7 +236,8 @@ subscribe(), reply()`. События адаптера (`status`, `request`, `re
 форма шла бы через Git Bash) на событиях `PreToolUse`, `PostToolUse`, `PostToolUseFailure`,
 `PermissionRequest`, `PermissionDenied` (`matcher: "*"`), `Notification`, `UserPromptSubmit`, `Stop`;
 слияние с хуками пользователя и бэкап файла (`settings.json.bak-<время>`, хранятся 5 последних;
-запись через временный файл, при сбое `settings.json` не меняется); `install-hooks.js status`
+запись через временный файл с повтором `rename` (EPERM/EBUSY), временный файл убирается; при
+  сбое `settings.json` не меняется); `install-hooks.js status`
 — код 0, если хук установлен. Вне bridge-сессии хук молча выходит; в сессии — `POST /hook` с токеном
 хука и пиннингом сертификата. Хук никогда не мешает Claude: код выхода 0, пустой stdout, ошибки
 проглатываются.
@@ -329,20 +330,28 @@ scrollback. Протокол — JSON-строки после рукопожат
 ### 3.7 Установщик (`install.ps1`, `uninstall.ps1`, `bridge/tools/`)
 
 - `install.ps1`: Node ≥ 20 (обязательно), `claude`/`opencode` (предупреждение); `npm ci` (работающий
-  мост останавливается, при живых keeper'ах — отказ: они держат файлы `node-pty`); каталог данных и
+  мост останавливается, при живых keeper'ах — отказ: они держат файлы `node-pty`; «наш» мост —
+  процесс `server.js` этого репозитория, слушающий порт моста; при сбое WMI/CIM — отказ); каталог данных и
   `config.json`; шим `claude-mobile.cmd` в `<данные>\bin` + каталог в PATH пользователя (реестр
   `HKCU\Environment`, REG_EXPAND_SZ, `WM_SETTINGCHANGE`); хук (`tools/install-hooks.js`); задача
-  Планировщика `ClaudeBridge` (AtLogOn, Interactive, Limited, без ограничения времени работы);
+  Планировщика `ClaudeBridge` (AtLogOn, Interactive, Limited, без ограничения времени работы,
+  приоритет 4 — обычный, D-26.3);
   не удалось зарегистрировать или `-StartupShortcut` — ярлык в `shell:startup` (`-StartupDir`,
   D-25.4); `-Firewall` — правила `ClaudeBridge-TCP`/`ClaudeBridge-UDP` (порт моста из `config.json`
-  и порт+1, профиль «Частная», `tools/firewall.ps1` с повышением прав через UAC только для этого
-  шага); запуск моста и ожидание порта до 30 с. `-DryRun` ничего не меняет.
+  и порт+1, профиль «Частная», `remoteip=localsubnet`, D-26.2; `tools/firewall.ps1` с повышением
+  прав через UAC только для этого шага и `-PauseOnError` — окно с ошибкой ждёт Enter; ошибка —
+  предупреждение, не отказ установки); запуск моста и ожидание порта до 30 с; работающий мост
+  перезапускается и с `-SkipNpm` (без `-NoStart`); предупреждение, если `node.exe` из
+  `fnm_multishells` или `%TEMP%` (автозапуск после перезагрузки не сработает). `-DryRun` ничего не меняет.
 - `uninstall.ps1` — обратные шаги (задача и ярлык, процесс моста, хук, PATH и шим, `-Firewall`);
-  каталог данных — только с `-RemoveData` (при живых keeper'ах — отказ); живые сессии не
-  завершаются.
-- Защита проверок: нестандартный `-DataRoot` без `-DryRun` принимается только вместе с `-SkipPath` и
-  `-SkipTask` (или `-StartupShortcut` с нестандартным `-StartupDir`); мост тогда не запускается и
-  чужие процессы не затрагиваются.
+  каталог данных — только с `-RemoveData`, только распознанный каталог данных моста (не корень
+  диска и не каталог профиля; имя `ClaudeBridge` либо `config.json` + `certs\`/`sessions\`) и
+  только без живых keeper'ов этого каталога (проверка до любых изменений); живые сессии не
+  завершаются; порт моста для удаления не нужен (правила брандмауэра — по имени).
+- Защита проверок (D-26.4): нестандартный `-DataRoot` без `-DryRun` принимается только вместе с
+  `-SkipPath`, `-SkipTask` (или `-StartupShortcut` с нестандартным `-StartupDir`), нестандартным
+  `-SettingsPath` и `-SkipNpm` (в `uninstall.ps1` шага npm нет), и без `-Firewall`; мост тогда не
+  запускается и чужие процессы не затрагиваются.
 - Чистые функции — `tools/install-lib.ps1` (проверки `tools/test-install-lib.ps1`, запуск из
   `test/install-lib.test.js`, там же проверка UTF-8 BOM у всех `.ps1`); сценарии проверяются только
   на временных каталогах (`test/installer.test.js`).

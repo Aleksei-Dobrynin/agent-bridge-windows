@@ -28,7 +28,8 @@
  *      | { kind:'requestClosed', requestId }
  *      | { kind:'notify', message, done?: true }      // done — «агент закончил ответ»
  * session (как его видит адаптер): { id, cwd, title, agentState, runtime }
- *   agentState — из spawnSpec().state, хранится в meta-файле; runtime — объект в памяти моста.
+ *   agentState — из spawnSpec().state, хранится в meta-файле; onHook может его дополнить — мост
+ *   перепишет meta, если agentState изменился (M-6); runtime — объект в памяти моста.
  * Отличия от наброска P-2: spawnSpec асинхронный (opencode создаёт сессию через API), без helpers
  * (D-12: сервис opencode общий), добавлены title/state, onInput, isResumeLike, Event.notify.done.
  */
@@ -38,8 +39,11 @@ const ID_RE = /^[a-z][a-z0-9-]{0,31}$/;
 
 function loadAgents(config, opts = {}) {
   const log = opts.log || ((...a) => console.log(...a));
-  const src = config && config.agents && typeof config.agents === 'object' && !Array.isArray(config.agents)
-    ? config.agents : DEFAULT_AGENTS;
+  const given = config && Object.prototype.hasOwnProperty.call(config, 'agents') && config.agents !== undefined;
+  const isObj = given && config.agents && typeof config.agents === 'object' && !Array.isArray(config.agents);
+  // M-8: ключ agents есть, но это не объект — сказать, а не молча взять умолчание
+  if (given && !isObj) log('  Конфиг: agents — не объект {id: {...}}; используются агенты по умолчанию (claude, opencode)');
+  const src = isObj ? config.agents : DEFAULT_AGENTS;
   const map = new Map();
   for (const [id, raw] of Object.entries(src)) {
     if (!ID_RE.test(id)) { log(`  Агент «${id}»: недопустимый id — пропущен`); continue; }
@@ -62,12 +66,24 @@ function loadAgents(config, opts = {}) {
       log(`  Агент «${id}»: ${e.message} — пропущен`);
       continue;
     }
-    if (!adapter.available()) { log(`  Агент «${id}» недоступен: исполняемый файл не найден`); continue; }
+    if (!adapter.available()) {
+      // M-8: какую команду искали; null — автопоиск (npm-шим / PATH) ничего не нашёл
+      const what = typeof adapter.command === 'string' && adapter.command ? adapter.command : `${type} (автопоиск npm-шима и PATH)`;
+      log(`  Агент «${id}» недоступен: исполняемый файл не найден: ${what}`);
+      continue;
+    }
     map.set(id, adapter);
   }
   const ids = [...map.keys()];
-  const defaultId = config && typeof config.defaultAgent === 'string' && map.has(config.defaultAgent)
-    ? config.defaultAgent : (ids[0] || null);
+  const wanted = config && config.defaultAgent !== undefined ? config.defaultAgent : undefined;
+  const defaultId = typeof wanted === 'string' && map.has(wanted) ? wanted : (ids[0] || null);
+  // M-8: настроенный агент по умолчанию недоступен — какой используется вместо него
+  if (wanted !== undefined && defaultId !== wanted) {
+    log(`  Агент по умолчанию «${String(wanted).slice(0, 40)}» недоступен — ` +
+      (defaultId ? `используется «${defaultId}»` : 'нет доступных агентов'));
+  } else if (!defaultId) {
+    log('  нет доступных агентов');
+  }
   return {
     defaultId,
     get: (id) => (typeof id === 'string' ? map.get(id) || null : null),

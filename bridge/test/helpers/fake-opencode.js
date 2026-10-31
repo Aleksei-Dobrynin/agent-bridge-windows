@@ -8,7 +8,7 @@ const http = require('http');
 
 function startFakeOpencode({ password = 'test-pw' } = {}) {
   const state = { sessions: [], replies: [], perms: new Map(), sse: new Set(), unauthorized: 0, sseConnects: 0, sseConnectTimes: [], sseStatus: 200,
-    sseEmpty: false, active: new Set() };
+    sseEmpty: false, active: new Set(), createStatus: 200, replyDelayMs: 0 };
   const expected = 'Basic ' + Buffer.from('opencode:' + password).toString('base64');
 
   function emit(evt) {
@@ -46,6 +46,7 @@ function startFakeOpencode({ password = 'test-pw' } = {}) {
       let m;
       if (req.method === 'GET' && u.pathname === '/api/info') return json(200, { data: { pid: process.pid, version: 'fake' } });
       if (req.method === 'POST' && u.pathname === '/api/session') {
+        if (state.createStatus !== 200) return json(state.createStatus, { name: 'Error' });
         const id = 'ses_fake' + (state.sessions.length + 1);
         state.sessions.push({ id, body: JSON.parse(body || '{}') });
         return json(200, { data: { id } });
@@ -71,6 +72,13 @@ function startFakeOpencode({ password = 'test-pw' } = {}) {
         return json(200, { data: state.perms.get(m[1]) || [] });
       }
       if (req.method === 'POST' && (m = u.pathname.match(/^\/api\/session\/([^/]+)\/permission\/([^/]+)\/reply$/))) {
+        // медленный сервис (M-4): ответ — через replyDelayMs
+        if (state.replyDelayMs > 0) { const mm = m; setTimeout(() => replyPermission(mm), state.replyDelayMs); return undefined; }
+        return replyPermission(m);
+      }
+      return json(404, { name: 'NotFound' });
+
+      function replyPermission(m) {
         const list = state.perms.get(m[1]) || [];
         const i = list.findIndex((p) => p.id === m[2]);
         if (i < 0) return json(404, { _tag: 'PermissionNotFoundError', requestID: m[2], message: 'not found' });
@@ -83,7 +91,6 @@ function startFakeOpencode({ password = 'test-pw' } = {}) {
         emit({ type: 'permission.replied', data: { sessionID: m[1], requestID: m[2], reply: decision } });
         return undefined;
       }
-      return json(404, { name: 'NotFound' });
     });
   });
 

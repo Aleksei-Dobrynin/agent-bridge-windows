@@ -37,6 +37,11 @@ if (!fs.existsSync(DATA.config)) {
   console.log('  Создан ' + DATA.config + ' — отредактируйте его при необходимости');
 }
 const CONFIG = JSON.parse(fs.readFileSync(DATA.config, 'utf8'));
+// M-7: старые ключи (D-9, D-15 п. 4) больше не читаются — сказать, а не молча игнорировать
+if (CONFIG.claudeCommand !== undefined || CONFIG.claudeArgs !== undefined) {
+  console.error('  Конфиг: claudeCommand/claudeArgs больше не используются — задайте агентов в agents ' +
+    '(см. config.example.json); ключи проигнорированы');
+}
 // Переопределение порта моста — CLAUDE_BRIDGE_LISTEN_PORT. CLAUDE_BRIDGE_PORT мост
 // НЕ читает: это имя экспортируется агенту для хука (M-11).
 // Порт: целое 1..65533 (port+1 — маяк, port+2 — туннель); числовая строка приводится (M-7).
@@ -268,16 +273,17 @@ function makeSession(meta) {
   };
 }
 
+/** Сообщение keeper'у; false — канала нет (keeper переподключается), сообщение не ушло. */
 function keeperSend(session, obj) {
-  if (session.channel) session.channel.send(obj);
+  const ch = session.channel;
+  if (!session.alive || !ch || !ch.socket || ch.socket.destroyed || !ch.socket.writable) return false;
+  ch.send(obj);
+  return true;
 }
 
 /** Ввод в PTY для адаптера (reply): false — канала к keeper'у нет, клавиша не дойдёт (D-19 п. 6). */
 function keeperWrite(session, data) {
-  const ch = session.channel;
-  if (!session.alive || !ch || !ch.socket || ch.socket.destroyed || !ch.socket.writable) return false;
-  ch.send({ t: 'in', d: data });
-  return true;
+  return keeperSend(session, { t: 'in', d: data });
 }
 
 /** Вызов адаптера: исключение адаптера не роняет мост и не ломает сессию (контракт P-2). */
@@ -296,6 +302,21 @@ function emitEvents(session, events) {
   const r = SE.applyEvents(session, events);
   for (const msg of r.messages) broadcast(msg);
   if (r.sessionsChanged) broadcastSessions();
+}
+
+/** M-6: состояние адаптера (agentState) изменилось — переписать его в meta, чтобы оно пережило
+ *  рестарт моста. Только существующий meta (keeper удаляет его при выходе агента); tmp + rename. */
+function persistAgentState(session) {
+  const file = path.join(SESS_DIR, session.id + '.json');
+  try {
+    const meta = JSON.parse(fs.readFileSync(file, 'utf8'));
+    meta.agentState = session.agentState;
+    fs.writeFileSync(file + '.tmp', JSON.stringify(meta));
+    fs.renameSync(file + '.tmp', file);
+  } catch (e) {
+    try { fs.unlinkSync(file + '.tmp'); } catch { /* не создан */ }
+    if (e.code !== 'ENOENT') console.error(`  Сессия ${session.id}: не удалось сохранить состояние агента: ${e.message}`);
+  }
 }
 
 function startAgentEvents(session) {
@@ -410,9 +431,14 @@ async function createSession({ cwd, agentId, options, rawArgs, command, title, l
     if (!findOnPath(command)) throw userError('команда не найдена: ' + command);
     adapter = generic.create('custom', { name: path.basename(command), command, args: [] });
     custom = true;
+  } else if (agentId === undefined) {
+    // агент не указан — агент по умолчанию (D-5)
+    if (!AGENTS.defaultId) throw userError('нет доступных агентов');
+    adapter = AGENTS.get(AGENTS.defaultId);
   } else {
-    adapter = AGENTS.get(agentId || AGENTS.defaultId);
-    if (!adapter) throw userError('неизвестный агент: ' + String(agentId || '(нет агента по умолчанию)'));
+    // M-2: указан, но не строка / слишком длинный / неизвестный — отказ, а не тихое умолчание
+    adapter = typeof agentId === 'string' ? AGENTS.get(agentId) : null;
+    if (!adapter) throw userError('неизвестный агент');
   }
   const fallback = P.canonicalDir(CONFIG.defaultCwd) || CONFIG.defaultCwd;
   const dir = local
@@ -430,6 +456,9 @@ async function createSession({ cwd, agentId, options, rawArgs, command, title, l
   const finalTitle = title || `${path.basename(dir) || dir} · ${adapter.name}`;
   // opencode создаёт сессию в своём сервисе (D-12) — асинхронно
   const spec = await adapter.spawnSpec({ cwd: dir, title: finalTitle, options: opts, rawArgs: extra });
+  // M-1: если создание ниже не удастся (предел сессий, запись meta, запуск keeper'а), сессия,
+  // уже созданная адаптером во внешнем сервисе (opencode), остаётся там без TUI — принято
+  // (D-15 п. 11: сессии opencode мост не удаляет, это история пользователя).
   if (sessions.size >= MAX_SESSIONS) throw userError('достигнут предел числа сессий');
   const id = 's' + (++seq) + '-' + crypto.randomBytes(3).toString('hex');
 
@@ -937,7 +966,9 @@ function httpHandler(req, res) {
       // применяется ДО ответа хуку (поправка 8): Claude Code ждёт окончания хука, поэтому
       // PermissionRequest, пришедший следом за PreToolUse, не обгонит его.
       if (s.adapter.events === 'hook' && sessions.get(s.id) === s) {
+        const stateBefore = JSON.stringify(s.agentState);
         emitEvents(s, adapterCall(s, 'onHook', () => s.adapter.onHook(s, payload), []));
+        if (JSON.stringify(s.agentState) !== stateBefore) persistAgentState(s);
       }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end('{"ok":true}');
@@ -1220,7 +1251,8 @@ wss.on('connection', (ws, req, who) => {
           createSession({
             cwd: V.str(m.cwd, 1024),
             title: V.cleanTitle(m.title), // L-8
-            agentId: V.str(m.agent, 32),
+            // M-2: undefined — не указан (умолчание); иначе строка до 32 символов, прочее — null (отказ)
+            agentId: m.agent === undefined ? undefined : V.str(m.agent, 32),
             options: m.options,
             // P-3: сырые аргументы и своя команда — только владельцу; от устройства игнорируются
             rawArgs: local && Array.isArray(m.args) && m.args.length <= 64 &&
@@ -1264,23 +1296,30 @@ wss.on('connection', (ws, req, who) => {
               if (ws.desired) resizePty(s, ws.desired.cols, ws.desired.rows);
             }
             const d = V.str(m.data, 65536);
-            if (d !== null) {
-              // ввод в PTY с любого клиента может ответить на диалог агента: запрос больше не
-              // актуален (D-15 п. 9); только для input — не для scroll и не для клавиш reply
+            // ввод в PTY с любого клиента может ответить на диалог агента: запрос больше не
+            // актуален (D-15 п. 9); только для input — не для scroll и не для клавиш reply.
+            // M-9: только если ввод действительно ушёл keeper'у — иначе диалог не отвечен
+            if (d !== null && keeperSend(s, { t: 'in', d })) {
               emitEvents(s, adapterCall(s, 'onInput', () => s.adapter.onInput(s, d), []));
-              keeperSend(s, { t: 'in', d });
             }
           }
           break;
         case 'reply': {
           // D-4: семантический ответ на запрос разрешения; мост проверяет, что запрос ещё ждёт
           const requestId = V.str(m.requestId, 128);
-          const decision = SE.DECISIONS.includes(m.decision) ? m.decision : null;
           const pend = s && s.alive && requestId ? s.pending.get(requestId) : null;
-          if (!pend || !decision || !pend.choices.some((ch) => ch.id === decision)) {
+          // M-4: запрос закрыт или на него уже отвечают (второй телефон / двойное нажатие) — stale
+          if (!pend || pend.replying) {
             wsSend(ws, { type: 'replyResult', id: sid, requestId, ok: false, error: 'stale' });
             break;
           }
+          // M-5: решение, которого не было в choices запроса, — ошибка клиента, запрос остаётся открытым
+          const decision = SE.DECISIONS.includes(m.decision) ? m.decision : null;
+          if (!decision || !pend.choices.some((ch) => ch.id === decision)) {
+            wsSend(ws, { type: 'replyResult', id: s.id, requestId, ok: false, error: 'failed' });
+            break;
+          }
+          pend.replying = true;
           Promise.resolve()
             .then(() => s.adapter.reply(s, pend, decision, { write: (data) => keeperWrite(s, data) }))
             .then((r) => {
@@ -1292,7 +1331,8 @@ wss.on('connection', (ws, req, who) => {
             .catch((e) => {
               console.error(`  Сессия ${s.id}: ответ на запрос ${requestId}: ${e && e.message}`);
               wsSend(ws, { type: 'replyResult', id: s.id, requestId, ok: false, error: 'failed' });
-            });
+            })
+            .finally(() => { pend.replying = false; }); // неудачный ответ можно повторить
           break;
         }
         case 'scroll':

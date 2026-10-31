@@ -267,3 +267,39 @@ test('M-5: resync sets the status when no known requests remain', () => {
   resync(60, [], undefined);
   assert.deepStrictEqual(statuses(), []);
 });
+
+test('M-3: spawnSpec failures carry a user-visible message without paths or passwords', async () => {
+  const userErr = async (a) => {
+    try { await a.spawnSpec({ cwd: 'C:\w', title: 'T', options: {}, rawArgs: [] }); } catch (e) { return e; }
+    throw new Error('spawnSpec did not fail');
+  };
+  const noLeak = (e, ...secrets) => {
+    assert.ok(typeof e.userMessage === 'string' && e.userMessage, 'userMessage present');
+    for (const x of secrets) assert.ok(!e.userMessage.includes(x), `"${x}" leaked: ${e.userMessage}`);
+  };
+  // сервис не отвечает (нет service.json)
+  const dir = tmp();
+  const missing = path.join(dir, 'nope', 'service.json');
+  const c1 = new OpencodeClient({ file: missing, ensureDeadlineMs: 150 });
+  const e1 = await userErr(oc.create('opencode', { command: process.execPath }, { opencodeClient: c1 }));
+  assert.match(e1.userMessage, /не отвечает/);
+  noLeak(e1, dir);
+  // service.json не на loopback
+  const f2 = path.join(tmp(), 'service.json');
+  fs.writeFileSync(f2, JSON.stringify({ url: 'http://10.1.2.3:4096', password: 'secret-pw-123' }));
+  const e2 = await userErr(oc.create('opencode', { command: process.execPath }, { opencodeClient: new OpencodeClient({ file: f2 }) }));
+  assert.match(e2.userMessage, /loopback/);
+  noLeak(e2, 'secret-pw-123', f2, '10.1.2.3');
+  // HTTP-статус при создании сессии
+  const { fake, a } = await setup();
+  fake.state.createStatus = 500;
+  const e3 = await userErr(a);
+  assert.match(e3.userMessage, /HTTP 500/);
+  noLeak(e3, fake.password, fake.url);
+  // прочие (сетевые) ошибки — общий текст без адреса
+  const stub = { ensure: async () => ({ url: 'http://127.0.0.1:1', password: 'pw-x' }),
+    createSession: async () => { throw new Error('connect ECONNREFUSED 127.0.0.1:1'); } };
+  const e4 = await userErr(oc.create('opencode', { command: process.execPath }, { opencodeClient: stub }));
+  assert.match(e4.userMessage, /opencode/);
+  noLeak(e4, '127.0.0.1', 'pw-x');
+});

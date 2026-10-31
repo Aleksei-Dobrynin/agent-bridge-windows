@@ -15,6 +15,13 @@ const NON_LOOPBACK = 'service.json указывает не на loopback — м�
 // M-4: общий предел ожидания сервиса при создании сессии (а не попытки × таймаут запроса)
 const ENSURE_DEADLINE_MS = 25000;
 
+/** Ошибка с текстом, который можно показать клиенту моста (M-3): без путей, адресов и паролей. */
+function userError(message) {
+  const e = new Error(message);
+  e.userMessage = message;
+  return e;
+}
+
 function serviceFilePath(env = process.env) {
   const base = env.XDG_STATE_HOME || path.join(env.USERPROFILE || os.homedir(), '.local', 'state');
   return path.join(base, 'opencode', 'service.json');
@@ -70,7 +77,7 @@ class OpencodeClient {
 
   request(method, pathname, body, info = this.info(), timeoutMs = this.timeoutMs) {
     return new Promise((resolve, reject) => {
-      if (!info) { reject(new Error('сервис opencode не найден (service.json)')); return; }
+      if (!info) { reject(userError('сервис opencode не найден (service.json)')); return; }
       const u = new URL(info.url + pathname);
       const mod = u.protocol === 'https:' ? https : http;
       const data = body == null ? null : Buffer.from(JSON.stringify(body));
@@ -113,7 +120,7 @@ class OpencodeClient {
     const left = () => Math.max(end - Date.now(), 1);
     const check = async () => {
       const st = parseServiceFile(this.file);
-      if (st.refused) throw new Error(st.refused);
+      if (st.refused) throw userError(st.refused);
       return st.info && await this.alive(st.info, Math.min(this.timeoutMs, left())) ? st.info : null;
     };
     let info = await check();
@@ -124,7 +131,7 @@ class OpencodeClient {
       info = await check();
       if (info) return info;
     }
-    throw new Error('сервис opencode не отвечает (opencode service start)');
+    throw userError('сервис opencode не отвечает (opencode service start)');
   }
 
   async createSession({ title, directory, permissions }) {
@@ -133,7 +140,7 @@ class OpencodeClient {
     const r = await this.request('POST', '/api/session', body);
     const id = r.json && r.json.data && r.json.data.id;
     if ((r.status !== 200 && r.status !== 201) || typeof id !== 'string' || !SESSION_ID.test(id)) {
-      throw new Error(`opencode: не удалось создать сессию (HTTP ${r.status})`);
+      throw userError(`opencode: не удалось создать сессию (HTTP ${r.status})`);
     }
     return id;
   }

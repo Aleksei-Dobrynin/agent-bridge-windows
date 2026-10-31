@@ -73,10 +73,20 @@ function create(id, cfg, opts = {}) {
     available: () => !!command && !!findOnPath(command),
 
     async spawnSpec({ cwd, title, options }) {
-      const info = await client.ensure();
-      const sid = await client.createSession({
-        title, directory: cwd, permissions: options && options.askShell ? ASK_SHELL : undefined,
-      });
+      let info;
+      let sid;
+      try {
+        info = await client.ensure();
+        sid = await client.createSession({
+          title, directory: cwd, permissions: options && options.askShell ? ASK_SHELL : undefined,
+        });
+      } catch (e) {
+        // M-3: клиент моста видит причину; свои тексты клиента сервиса безопасны (userMessage),
+        // прочие (сетевые: адрес сервиса и т.п.) — общим текстом, подробность — в лог моста
+        const err = new Error(e && e.message);
+        err.userMessage = (e && typeof e.userMessage === 'string' && e.userMessage) || 'сервис opencode недоступен';
+        throw err;
+      }
       return {
         command,
         args: [...prefixArgs, '--server', info.url, '--session', sid],

@@ -48,15 +48,17 @@ function tempHome(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
-/** Запустить мост; stderr копится в b.stderr, b.exited — промис кода выхода. */
+/** Запустить мост; stdout/stderr копятся в b.stdout/b.stderr, b.exited — промис кода выхода. */
 function startBridge(home, port, extraEnv = {}) {
   const env = {
     ...process.env, CLAUDE_BRIDGE_HOME: home, CLAUDE_BRIDGE_LISTEN_PORT: String(port),
     CLAUDE_BRIDGE_TEST: '1', ...extraEnv,
   };
   for (const k of Object.keys(env)) if (env[k] === undefined) delete env[k]; // extraEnv {X: undefined} — убрать X
-  const proc = spawn(process.execPath, [SERVER], { env, stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
-  const b = { proc, stderr: '' };
+  const proc = spawn(process.execPath, [SERVER], { env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+  const b = { proc, stdout: '', stderr: '' };
+  proc.stdout.setEncoding('utf8');
+  proc.stdout.on('data', (d) => { b.stdout += d; });
   proc.stderr.setEncoding('utf8');
   proc.stderr.on('data', (d) => { b.stderr += d; });
   b.exited = new Promise((r) => proc.on('exit', (code) => r(code)));
@@ -194,6 +196,7 @@ async function startTestBridge({ config = {}, devices = [], prefix = 'cb-it-' } 
   }));
   if (devices.length) fs.writeFileSync(path.join(home, 'pairings.json'), JSON.stringify({ devices }));
   let bridge = startBridge(home, port);
+  const all = [bridge]; // все экземпляры моста (restart) — для logs()
   const procs = [bridge.proc];
   const clients = [];
   let pin;
@@ -207,13 +210,18 @@ async function startTestBridge({ config = {}, devices = [], prefix = 'cb-it-' } 
   return {
     home, cwd, port, owner, pin,
     get bridge() { return bridge; },
-    /** Перезапуск моста без /T: keeper'ы (отсоединённые) переживают его, как в жизни. */
-    async restart() {
+    /** stdout + stderr всех экземпляров моста этого стенда. */
+    logs: () => all.map((x) => x.stdout + x.stderr).join(''),
+    /** Перезапуск моста без /T: keeper'ы (отсоединённые) переживают его, как в жизни.
+     *  beforeStart() — между остановкой и запуском (например, правка meta-файлов). */
+    async restart(beforeStart) {
       const old = bridge.proc;
       const exited = new Promise((r) => (old.exitCode !== null ? r() : old.once('exit', r)));
       old.kill();
       await exited;
+      if (beforeStart) await beforeStart();
       bridge = startBridge(home, port);
+      all.push(bridge);
       procs.push(bridge.proc);
     },
     async connect(token) {

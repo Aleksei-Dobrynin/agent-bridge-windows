@@ -89,3 +89,35 @@ test('normalizeOptions keeps only declared bool options, strictly true', () => {
   assert.deepStrictEqual(normalizeOptions(fake, null), { resume: false, skip: false });
   assert.deepStrictEqual(normalizeOptions(fake, ['resume']), { resume: false, skip: false });
 });
+
+test('M-8: diagnostics — unavailable defaultAgent, agents not an object, command in "not found"', () => {
+  let logged = [];
+  const log = (m) => logged.push(m);
+  const reg = loadAgents({ defaultAgent: 'gone', agents: {
+    gone: { type: 'generic', command: 'definitely-not-a-command-cb' },
+    a: { command: process.execPath },
+  } }, { log });
+  assert.strictEqual(reg.defaultId, 'a');
+  assert.match(logged.join('\n'), /«gone».*не найден.*definitely-not-a-command-cb/);
+  assert.match(logged.join('\n'), /по умолчанию «gone» недоступен.*«a»/);
+
+  logged = [];
+  loadAgents({ defaultAgent: 'zzz', agents: { a: { command: process.execPath } } }, { log });
+  assert.match(logged.join('\n'), /по умолчанию «zzz» недоступен.*«a»/);
+
+  logged = [];
+  const none = loadAgents({ defaultAgent: 'x', agents: { x: { command: 'definitely-not-a-command-cb' } } }, { log });
+  assert.strictEqual(none.defaultId, null);
+  assert.match(logged.join('\n'), /нет доступных агентов/);
+
+  for (const bad of [[], 'claude', 5, null]) {
+    logged = [];
+    loadAgents({ agents: bad }, { log });
+    assert.match(logged.join('\n'), /agents.*не объект/, JSON.stringify(bad));
+  }
+  logged = [];
+  loadAgents({ defaultAgent: 'a', agents: { a: { command: process.execPath } } }, { log });
+  assert.deepStrictEqual(logged, [], 'quiet when everything is fine');
+  loadAgents({}, { log });
+  assert.ok(!logged.some((m) => /не объект/.test(m)), 'absent agents key is the default, not an error');
+});

@@ -12,6 +12,7 @@ let b;
 test.before(async () => {
   b = await H.startTestBridge({ prefix: 'cb-agents-', devices: [DEVICE], config: {
     defaultAgent: 'echo',
+    claudeCommand: 'claude', // M-7: устаревший ключ — предупреждение при старте
     agents: {
       echo: { type: 'generic', name: 'Echo', command: process.execPath, args: [FAKE_AGENT] },
       claude: { command: process.execPath, prefixArgs: [FAKE_AGENT] },
@@ -95,4 +96,37 @@ test('unknown agent and missing owner command are refused (D-5)', async () => {
   const nocmd = await createAndAttach(o, { cwd: b.cwd, command: 'definitely-not-a-command-cb' });
   assert.strictEqual(nocmd.type, 'error');
   assert.match(nocmd.message, /команда не найдена/);
+});
+
+test('M-2: agent present but invalid is refused; absent -> default agent', { timeout: 60000 }, async () => {
+  const c = await b.connect(DEVICE.token);
+  const o = await b.connect(b.owner);
+  // предел 10 create в минуту на клиента — делим попытки между устройством и владельцем
+  for (const [cl, agent] of [[c, null], [c, 42], [c, { id: 'echo' }], [o, ['echo']], [o, ''], [o, 'x'.repeat(33)]]) {
+    const r = await createAndAttach(cl, { agent, cwd: b.cwd });
+    assert.strictEqual(r.type, 'error', JSON.stringify(agent));
+    assert.match(r.message, /неизвестный агент/, JSON.stringify(agent));
+  }
+  const r = await createAndAttach(c, { cwd: b.cwd });
+  assert.strictEqual(r.type, 'created');
+  assert.strictEqual((await listedSession(c, r.id)).agent, 'echo');
+});
+
+test('M-7: warning about the ignored claudeCommand/claudeArgs at startup', () => {
+  assert.match(b.logs(), /claudeCommand\/claudeArgs больше не используются/);
+});
+
+test('M-8: no available agents -> "нет доступных агентов"; diagnostics in the log', { timeout: 60000 }, async () => {
+  const nb = await H.startTestBridge({ prefix: 'cb-noagents-', devices: [DEVICE], config: {
+    defaultAgent: 'ghost', agents: { ghost: { type: 'generic', command: 'definitely-not-a-command-cb' } },
+  } });
+  try {
+    const c = await nb.connect(DEVICE.token);
+    const r = await createAndAttach(c, { cwd: nb.cwd });
+    assert.strictEqual(r.type, 'error');
+    assert.match(r.message, /нет доступных агентов/);
+    assert.match(nb.logs(), /«ghost».*не найден: definitely-not-a-command-cb/);
+    assert.match(nb.logs(), /по умолчанию «ghost» недоступен/);
+    assert.doesNotMatch(nb.logs(), /claudeCommand/, 'no M-7 warning without the old keys');
+  } finally { await nb.stop(); }
 });

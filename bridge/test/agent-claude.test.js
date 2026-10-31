@@ -339,3 +339,19 @@ test('M-5: missing runtime is created lazily; bad input never throws', async () 
   for (const d of [null, 5, {}, '']) assert.deepStrictEqual(a.onInput(sess(), d), []);
   assert.deepStrictEqual(await a.reply(sess(), null, 'once', okIo([])), { ok: false, stale: true, events: [] });
 });
+
+test('M-6: sawPermissionRequest is persisted in agentState and survives a bridge restart (fresh runtime)', () => {
+  const NP = { hook_event_name: 'Notification', notification_type: 'permission_prompt', message: 'Claude needs your permission' };
+  const a = mk();
+  const s = sess();
+  a.onHook(s, PR());
+  assert.strictEqual(s.agentState.sawPermissionRequest, true, 'flag in persisted adapter state');
+  a.onInput(s, '1');
+  // рестарт моста: agentState из meta, runtime пустой — уведомление не открывает запрос с кнопками
+  const restored = { ...sess(), agentState: JSON.parse(JSON.stringify(s.agentState)) };
+  assert.deepStrictEqual(mk().onHook(restored, NP), [{ kind: 'notify', message: 'Claude needs your permission' }]);
+  // без флага — запасной путь (запрос)
+  assert.deepStrictEqual(kinds(mk().onHook(sess(), NP)), ['request', 'status:waiting']);
+  // agentState отсутствует / не объект — не бросает
+  assert.doesNotThrow(() => mk().onHook({ id: 'z' }, PR()));
+});

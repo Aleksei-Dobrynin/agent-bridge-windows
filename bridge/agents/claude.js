@@ -84,9 +84,22 @@ function callKey(p) {
 function rt(session) {
   if (!session.runtime || typeof session.runtime !== 'object') session.runtime = {};
   if (!session.runtime.claude) {
-    session.runtime.claude = { open: null, queue: [], answered: [], sawPermissionRequest: false, lastActiveAt: -Infinity };
+    // M-6: признак «хук PermissionRequest зарегистрирован» — из сохранённого состояния адаптера
+    // (agentState в meta): после рестарта моста Notification не должен открывать запрос с кнопками
+    const st = session.agentState;
+    const saw = !!(st && typeof st === 'object' && st.sawPermissionRequest === true);
+    session.runtime.claude = { open: null, queue: [], answered: [], sawPermissionRequest: saw, lastActiveAt: -Infinity };
   }
   return session.runtime.claude;
+}
+
+/** M-6: запомнить в agentState (мост сохраняет его в meta, если он изменился после onHook). */
+function markSawPermissionRequest(session, r) {
+  r.sawPermissionRequest = true;
+  if (!session.agentState || typeof session.agentState !== 'object' || Array.isArray(session.agentState)) {
+    session.agentState = {};
+  }
+  session.agentState.sawPermissionRequest = true;
 }
 
 const status = (s) => ({ kind: 'status', status: s });
@@ -134,7 +147,7 @@ function create(id, cfg, opts = {}) {
     switch (p.hook_event_name) {
       case 'PermissionRequest': {
         // диалог показывается и для субагента — запрос открываем независимо от agent_id
-        r.sawPermissionRequest = true;
+        markSawPermissionRequest(session, r);
         if (!toolHasButtons(p.tool_name)) {
           return [{ kind: 'notify', message: 'Claude ждёт ответа в терминале — ' + describeTool(p) }];
         }

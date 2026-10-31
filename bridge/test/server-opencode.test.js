@@ -35,17 +35,36 @@ test.after(async () => {
   if (svcDir) fs.rmSync(svcDir, { recursive: true, force: true });
 });
 
+/** Файл целиком; занятый (EBUSY/EPERM) — несколько повторов, затем ошибка теста (I-2: непрочитанный
+ *  файл — не «чистый»). Исчезнувший между readdir и чтением (ENOENT: .tmp после rename) — null. */
+async function readForScan(p) {
+  for (let i = 0; ; i++) {
+    try { return fs.readFileSync(p); } catch (e) {
+      if (e.code === 'ENOENT') return null;
+      if (i >= 9) throw new Error(`не удалось прочитать ${p} для проверки: ${e.code || e.message}`);
+      await sleep(100);
+    }
+  }
+}
+
 /** Все файлы каталога данных моста (meta, логи keeper'ов, конфиг) — пароль сервиса не должен там оказаться. */
-function filesWith(dir, needle) {
+async function filesWith(dir, needle) {
   const hits = [];
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
     const p = path.join(dir, e.name);
-    if (e.isDirectory()) hits.push(...filesWith(p, needle));
+    if (e.isDirectory()) hits.push(...await filesWith(p, needle));
     else {
-      try { if (fs.readFileSync(p).includes(needle)) hits.push(p); } catch { /* занят keeper'ом */ }
+      const buf = await readForScan(p);
+      if (buf && buf.includes(needle)) hits.push(p);
     }
   }
   return hits;
+}
+
+/** I-2: пароль сервиса — ни в файлах каталога данных, ни в выводе моста (stdout/stderr). */
+async function assertPasswordNowhere() {
+  assert.deepStrictEqual(await filesWith(b.home, fake.password), []);
+  assert.ok(!b.logs().includes(fake.password), 'password in bridge stdout/stderr');
 }
 
 test('create: API session with ask-shell, TUI args and password env (D-12, D-14)', { timeout: 60000 }, async () => {
@@ -62,7 +81,7 @@ test('create: API session with ask-shell, TUI args and password env (D-12, D-14)
   const meta = JSON.parse(fs.readFileSync(path.join(b.home, 'sessions', sid + '.json'), 'utf8'));
   assert.deepStrictEqual(meta.agentState, { opencodeSessionId: 'ses_fake1' });
   assert.strictEqual(meta.env, undefined);
-  assert.deepStrictEqual(filesWith(b.home, fake.password), []);
+  await assertPasswordNowhere();
   const listed = (await c.wait((m) => m.type === 'sessions' && m.sessions.some((s) => s.id === sid))).sessions
     .find((s) => s.id === sid);
   assert.deepStrictEqual([listed.agent, listed.agentName, listed.scroll], ['opencode', 'opencode', 'wheel']);
@@ -124,6 +143,36 @@ test('execution events -> working / idle + done', { timeout: 30000 }, async () =
   await c.wait((m) => m.type === 'notify' && m.id === sid && m.event === 'done', 5000, at);
 });
 
+test('M-4: a second reply while the first is in flight -> immediate stale, one call to the service', { timeout: 30000 }, async () => {
+  await waitUntil(() => fake.state.sse.size >= 1);
+  const at = c.mark();
+  fake.ask('ses_fake1', { id: 'per_m4', action: 'shell', resources: ['x'] });
+  await c.wait((m) => m.type === 'notify' && m.requestId === 'per_m4', 5000, at);
+  fake.state.replyDelayMs = 1500;
+  try {
+    c.send({ type: 'reply', id: sid, requestId: 'per_m4', decision: 'once' });
+    await sleep(200);
+    c.send({ type: 'reply', id: sid, requestId: 'per_m4', decision: 'reject' });
+    const first = await c.wait((m) => m.type === 'replyResult' && m.requestId === 'per_m4', 5000, at);
+    assert.deepStrictEqual([first.ok, first.error], [false, 'stale'], 'the second reply is answered first');
+    const results = () => c.msgs.slice(at).filter((m) => m.type === 'replyResult' && m.requestId === 'per_m4');
+    await waitUntil(() => results().length === 2, 5000);
+    assert.strictEqual(results()[1].ok, true);
+  } finally { fake.state.replyDelayMs = 0; }
+  assert.deepStrictEqual(fake.state.replies.filter((r) => r.requestID === 'per_m4'),
+    [{ sessionID: 'ses_fake1', requestID: 'per_m4', decision: 'once' }]);
+});
+
+test('M-3: service failure on create is shown to the client (no password / address)', { timeout: 30000 }, async () => {
+  fake.state.createStatus = 500;
+  try {
+    const r = await createAndAttach(c, { agent: 'opencode', cwd: b.cwd });
+    assert.strictEqual(r.type, 'error');
+    assert.match(r.message, /Не удалось создать сессию: opencode: не удалось создать сессию \(HTTP 500\)/);
+    assert.ok(!r.message.includes(fake.password) && !r.message.includes(fake.url), r.message);
+  } finally { fake.state.createStatus = 200; }
+});
+
 test('bridge restart: the restored session subscribes again; pending request reaches the client (D-20)', { timeout: 90000 }, async () => {
   c.close();
   await b.restart();
@@ -147,7 +196,7 @@ test('bridge restart: the restored session subscribes again; pending request rea
     { sessionID: 'ses_fake1', requestID: 'per_2', decision: 'reject' },
     { sessionID: 'ses_fake1', requestID: 'per_3', decision: 'once' },
   ]);
-  assert.deepStrictEqual(filesWith(b.home, fake.password), []);
+  await assertPasswordNowhere();
 });
 
 test('kill: SSE subscription of the session is dropped', { timeout: 30000 }, async () => {

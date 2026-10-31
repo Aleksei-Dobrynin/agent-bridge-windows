@@ -5,7 +5,12 @@ const test = require('node:test');
 const assert = require('node:assert');
 const H = require('./helpers/bridge');
 
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
 const { FAKE_AGENT, DEVICE, createAndAttach, sleep } = H;
+const metaOf = (id) => JSON.parse(fs.readFileSync(path.join(b.home, 'sessions', id + '.json'), 'utf8'));
 let b;
 let c;
 let sid;
@@ -48,6 +53,8 @@ test('request -> notify{requestId, choices}; reply once -> key 1; repeat is stal
   await c.wait((m) => m.type === 'status' && m.id === sid && m.status === 'waiting', 5000, at0);
   const before = await listed(at0);
   assert.strictEqual(before.lastNotify.event, 'request');
+  // M-6: признак PermissionRequest сохранён в meta (переживает рестарт моста)
+  assert.strictEqual(metaOf(sid).agentState.sawPermissionRequest, true);
 
   let at = c.mark();
   c.send({ type: 'reply', id: sid, requestId: n.requestId, decision: 'once' });
@@ -77,7 +84,12 @@ test('reply validation: unknown request, foreign session, decision not offered',
   at = c.mark();
   c.send({ type: 'reply', id: sid, requestId: n.requestId, decision: 'always' });
   r = await c.wait((m) => m.type === 'replyResult' && m.requestId === n.requestId, 5000, at);
-  assert.strictEqual(r.ok, false, '«Всегда» не предлагалось');
+  // M-5: решение не из choices — ошибка клиента (failed), а не «запрос устарел»
+  assert.deepStrictEqual([r.ok, r.error], [false, 'failed'], '«Всегда» не предлагалось');
+  at = c.mark();
+  c.send({ type: 'reply', id: sid, requestId: n.requestId, decision: 'maybe' });
+  r = await c.wait((m) => m.type === 'replyResult' && m.requestId === n.requestId, 5000, at);
+  assert.deepStrictEqual([r.ok, r.error], [false, 'failed'], 'unknown decision');
   c.send({ type: 'reply', id: 's999-ffffff', requestId: n.requestId, decision: 'once' });
   c.send({ type: 'reply', id: sid, requestId: { x: 1 }, decision: 'once' });
   await sleep(500);
@@ -164,4 +176,33 @@ test('kill closes pending requests', { timeout: 30000 }, async () => {
   c.send({ type: 'kill', id: sid });
   await c.wait((m) => m.type === 'requestClosed' && m.requestId === n.requestId, 10000, at);
   await c.wait((m) => m.type === 'exit' && m.id === sid, 10000, at);
+});
+
+test('M-9: input that did not reach the keeper does not close the request', { timeout: 90000 }, async () => {
+  const r = await createAndAttach(c, { agent: 'claude', cwd: b.cwd });
+  assert.strictEqual(r.type, 'created');
+  const id = r.id;
+  const tok = (await c.waitOutput(id, /HOOKTOKEN:([0-9a-f]{64})/))[1];
+  c.close();
+  // мост перезапускается, а pipe в meta — чужой: keeper жив (pid в meta), канал не поднимается,
+  // мост ~30 с повторяет подключение — сессия жива, канала нет
+  await b.restart(() => {
+    const file = path.join(b.home, 'sessions', id + '.json');
+    const meta = JSON.parse(fs.readFileSync(file, 'utf8'));
+    meta.pipe = '\\\\.\\pipe\\claude-bridge-' + crypto.randomBytes(16).toString('hex');
+    fs.writeFileSync(file, JSON.stringify(meta));
+  });
+  const d = await b.connect(DEVICE.token);
+  await d.wait((m) => m.type === 'sessions' && m.sessions.some((x) => x.id === id && x.alive), 20000);
+  let at = d.mark();
+  assert.strictEqual(await b.postHook(id, tok, PR), 200);
+  const n = await d.wait((m) => m.type === 'notify' && m.id === id && m.event === 'request', 5000, at);
+  at = d.mark();
+  d.send({ type: 'input', id, data: 'x' });
+  await sleep(700);
+  assert.ok(!d.msgs.slice(at).some((m) => m.type === 'requestClosed'), 'undelivered input keeps the request open');
+  d.send({ type: 'reply', id, requestId: n.requestId, decision: 'once' });
+  const res = await d.wait((m) => m.type === 'replyResult' && m.requestId === n.requestId, 5000, at);
+  assert.deepStrictEqual([res.ok, res.error], [false, 'failed'], 'D-19 п. 6: key not delivered');
+  assert.ok(!d.msgs.slice(at).some((m) => m.type === 'requestClosed'));
 });

@@ -258,7 +258,7 @@
 | D-18 mDNS без hostname/чужих адресов, `--open`/`--device` только TTY, перевыбор LAN | ✅ | `55cc3e2` |
 | D-3/D-4/D-5/D-10/D-12/D-14/D-15, D-19, D-20 (подплан 2, задачи 1–13) | ✅ адаптеры claude/opencode/generic, реестр, SSE, `reply`/`replyResult`, P-3, конфликт resume, повтор запросов новым клиентам, правки клиента opencode | `4ecde27`…`601c5f3`, `e93bbaf`, `65c668c` |
 | D-13 подтверждения на телефоне, D-15.7 хэши токенов, `claude-mobile --agent` (задачи 14–16), D-22 | ✅ (D-22: `be642ab`, `689fa2f`, `bac42c3`; отмена при отключении тоже включает паузу, повреждённый `pairings.json` — отказ старта) | `b962bc0`, `8eb9f08`, `e164056`, `eb1b7cb`, `fc116fa` |
-| Задача 17 — сквозная проверка на реальных агентах | ⬜ | — |
+| Задача 17 — сквозная проверка на реальных агентах | ✅ проверка выполнена (`tools/hook-settings.js`, `tools/ws-watch.js`); ❌ найдены дефекты: Esc после `claude-mobile`, Ctrl+\, I-1 — см. «Сквозная проверка (задача 17)» | `00757e0` |
 | P-7 клиентская часть, M-4, L-10, D-15.12 | ⬜ подплан 3 `docs/superpowers/plans/2026-10-31-clients.md` | — |
 | P-8 распространение, README, ARCHITECTURE.md под Windows | ⬜ подплан 4 (не написан) | — |
 
@@ -434,3 +434,27 @@ module.exports = {
 | Запрос разрешения | `permission.asked`: `data.id` (`per_…`), `action` (`shell`, …), `resources[]`, `save[]`; текста для человека нет. Ответ — `POST …/permission/{id}/reply {"decision":"once"}` → 204; повтор → 404 `PermissionNotFoundError`. Закрытие — `permission.replied`. | Текст уведомления мост собирает из `action` + `resources`. 404 = запрос уже закрыт. |
 | Занята/свободна | Нет `session.idle`; есть `session.execution.started` и `session.execution.succeeded|failed|interrupted`. | Карта статусов адаптера. |
 | **Разрешения по умолчанию** | Агент `build` по умолчанию **разрешает всё** (`*:*:allow`, `ask` только для `*.env`). Запросы появляются, только если задать `permissions` при создании сессии (действие `shell`, …) или в конфиге opencode. | ❗ F-5 — нужно решение пользователя. |
+
+### Сквозная проверка (задача 17, 2026-10-31)
+
+Мост `00757e0` в изолированном каталоге данных (без `CLAUDE_BRIDGE_TEST`, `host:"127.0.0.2"`), «телефон» — WS-клиент с
+токеном устройства, сопряжённого через `pairinfo`/`/pair`; Claude Code 2.1.284 (haiku, пользовательские настройки,
+проектный `defaultMode:"default"`, хуки — проектный `settings.json` из `tools/hook-settings.js`); opencode v2.1.4 —
+фоновый сервис пользователя. Только факты; исправления — отдельным решением.
+
+| Что | Факт | Итог |
+|---|---|---|
+| Claude: запрос на телефон | `notify{request}` через 25–36 мс после старта хука `PermissionRequest` (8 случаев); диалог на экране — в пределах 0,1 с. Диалог при `defaultMode:"default"` — 3 пункта (`2` у `touch` = «always allow access to <каталог проекта>»). | ✅ |
+| Claude: once / always / reject | `replyResult ok`, `requestClosed` за 1–4 мс; once/always → `PostToolUse`, `Stop` → `idle` + `done`; reject → «Interrupted», после Esc ни одного хука, `idle`. | ✅ |
+| D-19.3 параллельные вызовы | Два `tool_use` в одном сообщении: Claude **сериализует** — `PreToolUse`/`PermissionRequest` второго вызова приходят после `PostToolUse` первого; на телефон — один запрос на диалог, ответ попадает в диалог на экране. Очередь FIFO вживую не наполняется. | ✅ |
+| D-19.1 / D-20 | Переподключившийся телефон сразу получил повтор `notify{request}`; `input` `\x1b[?1;2c`, `\x1b[12;1R`, `\x1b[I` запрос не закрыли. | ✅ |
+| Поздний `Notification` | `[permission_prompt]` — через 6,0–6,2 с после `PermissionRequest`; при открытом запросе и сразу после ответа уведомлений не порождает. `[idle_prompt]` через ~60 с после `Stop` → `notify info` «Claude is waiting for your input». | ✅ |
+| Субагент Claude (`agent_id`) | Фоновый субагент: основной `Stop` (`done`) пришёл раньше его `PermissionRequest`; запрос субагента — с кнопками, ответ once сработал; события с `agent_id` статус не меняли. | ✅ |
+| Рестарт моста при открытом диалоге Claude | Сессия восстановлена, но статус `idle`, запроса нет; поздний `Notification` → info без кнопок; ответ со старым `requestId` → `stale`; ответить можно только из терминала. | ⚠ |
+| Esc после `claude-mobile` | После того как в сессию попали win32-input-mode-последовательности (их шлёт `claude-mobile`: Claude выводит `\x1b[?9001h`, conhost кодирует клавиши), одиночный `\x1b` в ConPTY keeper'а теряется: reject с телефона даёт `ok`/`idle`, а диалог остаётся. Esc в win32-input-mode (`\x1b[27;1;27;1;0;1_…`) диалог закрывает. | ❌ дефект |
+| Ctrl+\ в `claude-mobile -a` (ConPTY) | По той же причине `attach.js` получает не `0x1c`, а `\x1b[220;43;28;1;8;1_`… и не отсоединяется (проверено в ConPTY через node-pty). | ❌ дефект |
+| opencode `askShell` | `permission.asked` → `notify` в ту же мс; `resources[]` — полная команда (`["mkdir oc-e2e-1"]`), `save:["mkdir *"]`, новое поле `source{type:"tool",messageID,id}`; once/reject через API; ответ в TUI → `requestClosed`; reject → `execution.interrupted {reason:"shutdown"}` → `idle`. | ✅ |
+| `GET /api/session/active` | Живой: `{"data":{}}`; во время ожидания разрешения — `{"ses_…":{"type":"running"}}`. | ✅ |
+| opencode: рестарт моста | Запрос, возникший без моста, открыт ресинхронизацией и повторён телефону при подключении. | ✅ |
+| I-1: дочерние сессии opencode (`task`) | Дочерняя сессия (`session.created` с `parentID`, те же `permissions`) спрашивает разрешение со своим `sessionID` → телефон ничего не получает, статус родителя `working`; список разрешений родителя пуст; ответ через путь родителя → 404 `PermissionNotFoundError`, через путь дочерней → 204. | ❌ подтверждено |
+| Колесо мыши | SGR `\x1b[<64;…M` в `scroll` листает историю opencode («Jump to latest») и Claude. | ✅ |

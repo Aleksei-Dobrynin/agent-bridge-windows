@@ -63,5 +63,20 @@
     return '✖ Отклонено на телефоне';
   }
 
-  return { filterPaste, scrollSequence, buildCreate, confirmPrompt, confirmStatusText };
+  /** D-19.1: пока xterm проигрывает буфер scrollback, его ответы на запросы терминала из буфера
+   *  (DA, CPR, DECRPM, OSC…) — не ввод человека и в PTY не отправляются. begin() — начало
+   *  проигрывания, возвращает функцию завершения (повторный вызов ничего не делает). */
+  function replayGate() {
+    let n = 0;
+    return {
+      begin() {
+        n++;
+        let done = false;
+        return () => { if (!done) { done = true; n--; } };
+      },
+      active: () => n > 0,
+    };
+  }
+
+  return { filterPaste, scrollSequence, buildCreate, confirmPrompt, confirmStatusText, replayGate };
 });

@@ -57,3 +57,16 @@ test('confirmStatusText: confirmResult incl. cooldown, confirmPending with code'
   assert.match(CB.confirmStatusText({ type: 'confirmRequired', action: 'pairinfo' }), /claude-mobile/);
   assert.strictEqual(CB.confirmStatusText({ type: 'output' }), null);
 });
+
+test('replayGate: active while any scrollback replay is in progress, end is idempotent (D-19.1)', () => {
+  const g = CB.replayGate();
+  assert.strictEqual(g.active(), false);
+  const end1 = g.begin();
+  const end2 = g.begin();
+  assert.strictEqual(g.active(), true);
+  end1();
+  end1(); // повторный вызов не снимает чужое проигрывание
+  assert.strictEqual(g.active(), true);
+  end2();
+  assert.strictEqual(g.active(), false);
+});

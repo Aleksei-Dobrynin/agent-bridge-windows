@@ -36,7 +36,12 @@ const term = new Terminal({
 });
 term.open($('#terminal'));
 
-term.onData((data) => send({ type: 'input', id: current, data }));
+// D-19.1: ответы xterm на запросы терминала из проигрываемого буфера — не ввод человека
+const replay = CB.replayGate();
+term.onData((data) => {
+  if (replay.active()) return;
+  send({ type: 'input', id: current, data });
+});
 
 // Локальный терминал зеркалит фактический размер PTY (сообщает сервер).
 // Свои размеры мы только "предлагаем" — сервер применит их, когда мы печатаем.
@@ -515,7 +520,12 @@ function connect() {
       case 'scrollback':
         term.reset();
         if (m.cols && m.rows) term.resize(m.cols, m.rows);
-        term.write(m.data);
+        {
+          // колбэк — после разбора всего буфера; таймер — страховка, чтобы ввод не заблокировался
+          const end = replay.begin();
+          setTimeout(end, 15000);
+          term.write(m.data, end);
+        }
         break;
       case 'resized':
         if (m.id === current) term.resize(m.cols, m.rows);

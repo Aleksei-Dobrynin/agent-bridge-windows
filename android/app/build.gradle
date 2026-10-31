@@ -10,13 +10,33 @@ android {
         applicationId "com.q.claudebridge"
         minSdk 26
         targetSdk 34
-        versionCode 1
-        versionName "0.1"
+        // D-25.2: первая сборка форка
+        versionCode 2
+        versionName "0.2.0"
+    }
+
+    // P-8: release подписывается ключом команды. Ключ и пароль — только вне репозитория:
+    // свойства Gradle cbReleaseStoreFile / cbReleaseKeyAlias / cbReleaseStorePassword /
+    // cbReleaseKeyPassword (tools/release.ps1 передаёт их через ORG_GRADLE_PROJECT_*).
+    // Без них release собирается неподписанным (app-release-unsigned.apk).
+    signingConfigs {
+        if (project.hasProperty('cbReleaseStoreFile')) {
+            release {
+                storeFile file(project.property('cbReleaseStoreFile'))
+                storePassword project.findProperty('cbReleaseStorePassword')
+                keyAlias project.findProperty('cbReleaseKeyAlias')
+                keyPassword project.findProperty('cbReleaseKeyPassword')
+            }
+        }
     }
 
     buildTypes {
         release {
             minifyEnabled false
+            debuggable false // M-5: явно, независимо от умолчаний AGP
+            if (project.hasProperty('cbReleaseStoreFile')) {
+                signingConfig signingConfigs.release
+            }
         }
     }
 

@@ -2,6 +2,7 @@
 android/gradlew text eol=lf
 *.sh text eol=lf
 *.bat text eol=crlf
+*.cmd text eol=crlf
 
 # Сторонние ассеты WebView копирует задача syncVendorAssets из node_modules (LF) —
 # без EOL-преобразований, иначе каждая сборка даёт «изменённые» файлы при core.autocrlf=true

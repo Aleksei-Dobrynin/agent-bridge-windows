@@ -23,6 +23,7 @@ const MDNS = require('./lib/mdns');
 const { loadAgents, normalizeOptions } = require('./agents');
 const generic = require('./agents/generic');
 const { findOnPath } = require('./lib/which');
+const SE = require('./lib/session-events');
 
 const TEST_MODE = !!process.env.CLAUDE_BRIDGE_TEST; // тесты: без mDNS, QR и файлового лога
 const DATA = ensureDataDirs();
@@ -271,9 +272,50 @@ function keeperSend(session, obj) {
   if (session.channel) session.channel.send(obj);
 }
 
+/** Ввод в PTY для адаптера (reply): false — канала к keeper'у нет, клавиша не дойдёт (D-19 п. 6). */
+function keeperWrite(session, data) {
+  const ch = session.channel;
+  if (!session.alive || !ch || !ch.socket || ch.socket.destroyed || !ch.socket.writable) return false;
+  ch.send({ t: 'in', d: data });
+  return true;
+}
+
+/** Вызов адаптера: исключение адаптера не роняет мост и не ломает сессию (контракт P-2). */
+function adapterCall(session, what, fn, fallback) {
+  try {
+    return fn();
+  } catch (e) {
+    console.error(`  Сессия ${session.id}: адаптер ${session.agent}.${what}: ${e && e.message}`);
+    return fallback;
+  }
+}
+
+/** События адаптера (P-2) -> состояние сессии и рассылка (D-4). */
+function emitEvents(session, events) {
+  if (sessions.get(session.id) !== session || !Array.isArray(events) || !events.length) return;
+  const r = SE.applyEvents(session, events);
+  for (const msg of r.messages) broadcast(msg);
+  if (r.sessionsChanged) broadcastSessions();
+}
+
+function startAgentEvents(session) {
+  if (session.adapter.events !== 'sse' || session.unsubscribe) return;
+  const unsubscribe = adapterCall(session, 'subscribe',
+    () => session.adapter.subscribe(session, (events) => emitEvents(session, events)), null);
+  session.unsubscribe = typeof unsubscribe === 'function' ? unsubscribe : null;
+}
+
+function stopAgentEvents(session) {
+  if (!session.unsubscribe) return;
+  try { session.unsubscribe(); } catch { /* уже отписаны */ }
+  session.unsubscribe = null;
+}
+
 function dropSession(session, exitCode) {
   if (!sessions.has(session.id)) return;
   session.alive = false;
+  stopAgentEvents(session);
+  for (const msg of SE.closeAllRequests(session)) broadcast(msg);
   broadcast({ type: 'exit', id: session.id, exitCode: exitCode == null ? -1 : exitCode });
   sessions.delete(session.id);
   broadcastSessions();
@@ -450,6 +492,7 @@ async function createSession({ cwd, agentId, options, rawArgs, command, title, l
   const session = makeSession(meta);
   sessions.set(id, session);
   connectKeeper(session, 20);
+  startAgentEvents(session);
   broadcastSessions();
   return session;
 }
@@ -469,6 +512,7 @@ function restoreSessions() {
       const session = makeSession(meta);
       sessions.set(meta.id, session);
       connectKeeper(session, 3);
+      startAgentEvents(session);
       restored++;
     } catch { /* битый meta — пропускаем */ }
   }
@@ -723,10 +767,6 @@ function setInternet(enabled) {
 
 // ---------------------------------------------------------------- http
 
-const HOOK_STATUS = new Map([
-  ['UserPromptSubmit', 'working'], ['PostToolUse', 'working'], ['Notification', 'waiting'], ['Stop', 'idle'],
-]);
-
 function httpHandler(req, res) {
   let url;
   try { url = new URL(req.url, 'http://x'); } catch { res.writeHead(400); res.end(); return; }
@@ -886,21 +926,11 @@ function httpHandler(req, res) {
       let payload = null;
       try { payload = JSON.parse(body || 'null'); } catch { /* невалидный JSON */ }
       if (!payload || typeof payload !== 'object' || Array.isArray(payload)) { res.writeHead(400); res.end(); return; }
-      const event = V.str(payload.hook_event_name, 64) || 'Notification';
-      const message = V.str(payload.message, 2000) || V.str(payload.notification, 2000) ||
-        (event === 'Stop' ? 'Claude завершил ответ' : 'Событие Claude Code');
-      // статус сессии для вкладок: работает / ждёт ответа / свободна.
-      // PostToolUse — ответ на запрос разрешения дан (в т.ч. на ПК): Claude снова работает.
-      const status = HOOK_STATUS.get(event); // Map: ключи прототипа ('__proto__' и т.п.) не находятся (M-3)
-      if (status && s.status !== status) {
-        broadcast({ type: 'status', id: sid, status });
-        s.status = status;
-        broadcastSessions();
-      }
-      // push-уведомления — только для событий, требующих внимания
-      if (event === 'Notification' || event === 'Stop') {
-        s.lastNotify = { event, message, at: Date.now() };
-        broadcast({ type: 'notify', id: sid, event, message, title: s.title, at: Date.now() });
+      // статус, запросы и уведомления — по правилам адаптера агента этой сессии. Событие
+      // применяется ДО ответа хуку (поправка 8): Claude Code ждёт окончания хука, поэтому
+      // PermissionRequest, пришедший следом за PreToolUse, не обгонит его.
+      if (s.adapter.events === 'hook' && sessions.get(s.id) === s) {
+        emitEvents(s, adapterCall(s, 'onHook', () => s.adapter.onHook(s, payload), []));
       }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end('{"ok":true}');
@@ -1215,9 +1245,37 @@ wss.on('connection', (ws, req, who) => {
               if (ws.desired) resizePty(s, ws.desired.cols, ws.desired.rows);
             }
             const d = V.str(m.data, 65536);
-            if (d !== null) keeperSend(s, { t: 'in', d });
+            if (d !== null) {
+              // ввод в PTY с любого клиента может ответить на диалог агента: запрос больше не
+              // актуален (D-15 п. 9); только для input — не для scroll и не для клавиш reply
+              emitEvents(s, adapterCall(s, 'onInput', () => s.adapter.onInput(s, d), []));
+              keeperSend(s, { t: 'in', d });
+            }
           }
           break;
+        case 'reply': {
+          // D-4: семантический ответ на запрос разрешения; мост проверяет, что запрос ещё ждёт
+          const requestId = V.str(m.requestId, 128);
+          const decision = SE.DECISIONS.includes(m.decision) ? m.decision : null;
+          const pend = s && s.alive && requestId ? s.pending.get(requestId) : null;
+          if (!pend || !decision || !pend.choices.some((ch) => ch.id === decision)) {
+            wsSend(ws, { type: 'replyResult', id: sid, requestId, ok: false, error: 'stale' });
+            break;
+          }
+          Promise.resolve()
+            .then(() => s.adapter.reply(s, pend, decision, { write: (data) => keeperWrite(s, data) }))
+            .then((r) => {
+              const res = r && typeof r === 'object' ? r : { ok: false };
+              emitEvents(s, res.events);
+              wsSend(ws, { type: 'replyResult', id: s.id, requestId, ok: res.ok === true,
+                ...(res.ok === true ? {} : { error: res.stale ? 'stale' : 'failed' }) });
+            })
+            .catch((e) => {
+              console.error(`  Сессия ${s.id}: ответ на запрос ${requestId}: ${e && e.message}`);
+              wsSend(ws, { type: 'replyResult', id: s.id, requestId, ok: false, error: 'failed' });
+            });
+          break;
+        }
         case 'scroll':
           // прокрутка — не набор текста: не трогаем «владельца размера» PTY
           if (s && s.alive) {

@@ -10,6 +10,16 @@ function cleanChoices(list) {
     .map((c) => ({ id: c.id, label: c.label.slice(0, 40) }));
 }
 
+/** Закрыт запрос, о котором говорит lastNotify: показать оставшийся открытый запрос или ничего —
+ *  иначе клиент, подключившийся позже, видит в списке «запрос» без кнопок. */
+function refreshRequestNotify(session) {
+  if (!session.lastNotify || session.lastNotify.event !== 'request') return false;
+  let latest = null;
+  for (const p of session.pending.values()) if (!latest || p.at >= latest.at) latest = p;
+  session.lastNotify = latest ? { event: 'request', message: latest.message, at: latest.at } : null;
+  return true;
+}
+
 function applyEvents(session, events, now = Date.now()) {
   if (!session.pending) session.pending = new Map();
   const messages = [];
@@ -33,6 +43,7 @@ function applyEvents(session, events, now = Date.now()) {
     } else if (ev.kind === 'requestClosed' && typeof ev.requestId === 'string') {
       if (session.pending.delete(ev.requestId)) {
         messages.push({ type: 'requestClosed', id: session.id, requestId: ev.requestId });
+        if (refreshRequestNotify(session)) sessionsChanged = true;
       }
     } else if (ev.kind === 'notify') {
       const message = String(ev.message || '').slice(0, 500);
@@ -50,6 +61,7 @@ function closeAllRequests(session) {
   if (!session.pending) return out;
   for (const requestId of session.pending.keys()) out.push({ type: 'requestClosed', id: session.id, requestId });
   session.pending.clear();
+  refreshRequestNotify(session);
   return out;
 }
 

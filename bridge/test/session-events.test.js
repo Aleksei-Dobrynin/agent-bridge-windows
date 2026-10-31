@@ -61,3 +61,25 @@ test('closeAllRequests', () => {
   assert.strictEqual(s.pending.size, 0);
   assert.deepStrictEqual(SE.closeAllRequests({ id: 'no-pending' }), []);
 });
+
+test('lastNotify does not stay a stale request after requests close', () => {
+  const s = mk();
+  SE.applyEvents(s, [{ kind: 'notify', message: 'fin', done: true }], 1);
+  SE.applyEvents(s, [{ kind: 'request', requestId: 'a', message: 'first', choices: [] }], 2);
+  SE.applyEvents(s, [{ kind: 'request', requestId: 'b', message: 'second', choices: [] }], 3);
+  // закрыт последний показанный — lastNotify указывает на оставшийся открытый
+  let r = SE.applyEvents(s, [{ kind: 'requestClosed', requestId: 'b' }], 4);
+  assert.strictEqual(r.sessionsChanged, true);
+  assert.deepStrictEqual(s.lastNotify, { event: 'request', message: 'first', at: 2 });
+  r = SE.applyEvents(s, [{ kind: 'requestClosed', requestId: 'a' }], 5);
+  assert.strictEqual(r.sessionsChanged, true);
+  assert.strictEqual(s.lastNotify, null, 'no open requests -> no request in lastNotify');
+  // lastNotify другого вида закрытие запроса не трогает
+  SE.applyEvents(s, [{ kind: 'request', requestId: 'c', message: 'c', choices: [] }, { kind: 'notify', message: 'hey' }], 6);
+  SE.applyEvents(s, [{ kind: 'requestClosed', requestId: 'c' }], 7);
+  assert.deepStrictEqual(s.lastNotify, { event: 'info', message: 'hey', at: 6 });
+  // closeAllRequests тоже убирает request из lastNotify
+  SE.applyEvents(s, [{ kind: 'request', requestId: 'd', message: 'd', choices: [] }], 8);
+  SE.closeAllRequests(s);
+  assert.strictEqual(s.lastNotify, null);
+});

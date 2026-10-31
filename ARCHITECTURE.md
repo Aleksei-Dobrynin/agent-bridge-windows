@@ -757,7 +757,7 @@ token, fp, internet (флаг разрешения p2p), nodeTicket (iroh-адр
 
 **Клиент → мост:** `create` (`cwd`, `agent`, `options`, `force`; владельцу также `args`,
 `command`, `title`), `attach` (id/cols/rows), `input`, `scroll` (не двигает владельца размера),
-`resize`, `kill`, `remove`, `list`, `reply` (`id`, `requestId`, `decision`: `once|always|reject`),
+`resize`, `kill`, `list`, `reply` (`id`, `requestId`, `decision`: `once|always|reject`),
 `internet`, `registerNode` (только устройство, свой NodeId), `confirm` (`confirmId`, `allow`;
 только сопряжённое устройство), только владелец: `devices`, `setInternet`, `pairinfo`
 (+`confirmed`), `revokeDevice`, `issueLoginToken`, `rotateOwnerToken`.

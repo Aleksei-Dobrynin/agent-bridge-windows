@@ -163,3 +163,17 @@ test('works without localStorage; bridge error without text shows a fallback (re
   app.recv({ type: 'error' });
   assert.strictEqual(byId.banner.textContent, '⚠ Ошибка моста');
 });
+
+test('long-press on a tab offers only to kill a live session; no remove path (m-3)', async () => {
+  const app = await started();
+  app.run("askKill(sessions[0])");
+  assert.deepStrictEqual(app.confirms.slice(-1), ['Завершить сессию «w · Claude Code»?']);
+  assert.deepStrictEqual(app.lastSent('kill'), { type: 'kill', id: 's_a' });
+  // завершённые сессии мост сразу убирает из списка — для них askKill ничего не делает
+  const n = app.sent.length;
+  const c = app.confirms.length;
+  app.run("askKill({ id: 's_x', title: 'gone', alive: false })");
+  assert.strictEqual(app.confirms.length, c, 'no confirm for a non-alive session');
+  assert.strictEqual(app.sent.length, n, 'nothing sent');
+  assert.strictEqual(app.lastSent('remove'), undefined);
+});

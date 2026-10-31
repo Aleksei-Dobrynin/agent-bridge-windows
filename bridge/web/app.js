@@ -634,8 +634,9 @@ function renderTabs() {
 }
 
 function askKill(s) {
-  const q = s.alive ? `Завершить сессию «${s.title}»?` : `Убрать «${s.title}» из списка?`;
-  if (window.confirm(q)) send({ type: s.alive ? 'kill' : 'remove', id: s.id });
+  // завершённые сессии мост сразу убирает из списка (dropSession) — предлагать нечего
+  if (!s.alive) return;
+  if (window.confirm(`Завершить сессию «${s.title}»?`)) send({ type: 'kill', id: s.id });
 }
 
 // ------------------------------------------------------------ notifications

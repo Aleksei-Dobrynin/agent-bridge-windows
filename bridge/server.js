@@ -1482,9 +1482,6 @@ wss.on('connection', (ws, req, who) => {
         case 'kill':
           if (s && s.alive) keeperSend(s, { t: 'kill' });
           break;
-        case 'remove':
-          if (s && !s.alive) { sessions.delete(s.id); broadcastSessions(); }
-          break;
         case 'list':
           ws.send(JSON.stringify(sessionsMsg()));
           break;

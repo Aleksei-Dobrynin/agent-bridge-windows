@@ -25,13 +25,13 @@ test('scrollSequence: SGR wheel or PageUp/PageDown, at most 10 steps', () => {
 });
 
 test('buildCreate: only agent id and ids of enabled options (P-3)', () => {
-  assert.deepStrictEqual(CB.buildCreate('claude', ['resume', '', 5], 'C:\w'),
-    { type: 'create', agent: 'claude', options: { resume: true }, cwd: 'C:\w' });
-  assert.deepStrictEqual(CB.buildCreate('opencode', [], 'C:\w'),
-    { type: 'create', agent: 'opencode', options: {}, cwd: 'C:\w' });
+  assert.deepStrictEqual(CB.buildCreate('claude', ['resume', '', 5], 'C:\\w'),
+    { type: 'create', agent: 'claude', options: { resume: true }, cwd: 'C:\\w' });
+  assert.deepStrictEqual(CB.buildCreate('opencode', [], 'C:\\w'),
+    { type: 'create', agent: 'opencode', options: {}, cwd: 'C:\\w' });
   // поправка 8 / D-22.4: агент не выбран -> null (агент по умолчанию на мосту)
-  assert.deepStrictEqual(CB.buildCreate('', null, 'C:\w'),
-    { type: 'create', agent: null, options: {}, cwd: 'C:\w' });
+  assert.deepStrictEqual(CB.buildCreate('', null, 'C:\\w'),
+    { type: 'create', agent: null, options: {}, cwd: 'C:\\w' });
 });
 
 test('confirmPrompt: message, warning and 4-digit check code (D-13, D-22.3)', () => {

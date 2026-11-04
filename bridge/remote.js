@@ -53,8 +53,10 @@ async function pair(rest) {
   try { r = await pairDevice({ ticket, name: os.hostname(), root: DATA.root }); } catch (e) { fail(e.message); }
   console.log(`Сопряжено с мостом ${r.host}:${r.port}.`);
   if (!r.ticket) {
-    console.log('Внимание: интернет-доступ на рабочем ПК выключен. Включите его и сопрягите заново — ' +
-      'иначе --remote не сможет поднять туннель.');
+    console.log('Внимание: интернет-доступ на рабочем ПК выключен. Правильный порядок: включить доступ ' +
+      '(claude-mobile --device → i), затем выпустить QR и сопрячь заново. Иначе --remote не сможет ' +
+      'поднять туннель, а повторный QR потребует подтверждения на телефоне (при потере телефона — ' +
+      'удалить pairings.json при остановленном мосте).');
   }
   try {
     await registerNode({
@@ -162,10 +164,15 @@ async function remote(rest) {
           break;
         }
         const want = rest[1];
-        const target = want ? list.find((s) => s.id === want) : list.filter((s) => s.alive).pop();
+        // явный id — только живая сессия: привязка к завершённой сразу закроет соединение
+        const target = want ? list.find((s) => s.id === want && s.alive) : list.filter((s) => s.alive).pop();
         if (!target) {
-          die(want ? `Нет сессии ${want}. Список: claude-mobile --remote -l`
-            : 'Живых сессий нет. Запустите сессию на рабочем ПК.', 1);
+          if (want) {
+            const known = list.find((s) => s.id === want);
+            die(known ? `Сессия ${want} завершена. Список: claude-mobile --remote -l`
+              : `Нет сессии ${want}. Список: claude-mobile --remote -l`, 1);
+          }
+          die('Живых сессий нет. Запустите сессию на рабочем ПК.', 1);
         } else attach(target.id);
         break;
       }

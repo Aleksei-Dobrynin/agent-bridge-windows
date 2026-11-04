@@ -1499,6 +1499,7 @@ wss.on('connection', (ws, req, who) => {
           // защищённый WS) — добавляем в allowlist туннеля этого устройства
           const nid = V.nodeId(m.nodeId) || '';
           if (nid && ws.deviceId && ws.deviceId !== 'local') {
+            // устройство могли отозвать, пока сообщение шло: тогда узла уже нет (гонка)
             const dev = pairings.devices.find((d) => d.id === ws.deviceId);
             if (dev && dev.nodeId !== nid) {
               dev.nodeId = nid;
@@ -1507,7 +1508,7 @@ wss.on('connection', (ws, req, who) => {
               console.log(`  Зарегистрирован p2p-узел устройства «${dev.name}»`);
             }
             // D-29: ПК-клиент сопрягается по LAN и должен знать, что узел принят
-            wsSend(ws, { type: 'nodeRegistered', nodeId: nid, ok: true });
+            wsSend(ws, { type: 'nodeRegistered', nodeId: nid, ok: Boolean(dev) });
           } else {
             wsSend(ws, { type: 'nodeRegistered', nodeId: nid, ok: false });
           }

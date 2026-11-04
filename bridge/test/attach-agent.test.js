@@ -146,7 +146,7 @@ test('--qr without paired devices: console confirmation (P-9), then QR', { timeo
 test('--qr сохраняет PNG для ПК-клиента (D-29)', { timeout: 90000 }, async () => {
   const nb = await H.startTestBridge({ prefix: 'cb-cm-png-', config: { host: TEST_LAN_HOST, ...AGENTS } });
   try {
-    const out = path.join(nb.home, 'qr-out', 'pairing-qr.png'); // вне DATA.root: проверяем --qr-out и mkdirSync
+    const out = path.join(nb.home, 'qr-out', 'pairing-qr.png'); // не дефолтный путь: проверяем --qr-out и mkdirSync
     const a = runTty(nb, ['--qr', '--qr-out', out]);
     await until(() => /Выпустить код сопряжения нового устройства\? \[y\/N\]/.test(a.out()), 20000, 'вопрос: ' + a.out());
     a.write('y\r');

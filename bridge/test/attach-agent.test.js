@@ -4,6 +4,7 @@
 // Интерактивная консоль — настоящий ConPTY (node-pty): --qr требует TTY (D-18 п. 2).
 const test = require('node:test');
 const assert = require('node:assert');
+const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 const pty = require('../node_modules/node-pty');
@@ -139,6 +140,23 @@ test('--qr without paired devices: console confirmation (P-9), then QR', { timeo
     assert.strictEqual(await a.done, 0, a.out());
     assert.match(a.out(), /Сопряжение нового устройства/);
     assert.doesNotMatch(a.out(), /ручного ввода/);
+  } finally { await nb.stop(); }
+});
+
+test('--qr сохраняет PNG для ПК-клиента (D-29)', { timeout: 90000 }, async () => {
+  const nb = await H.startTestBridge({ prefix: 'cb-cm-png-', config: { host: TEST_LAN_HOST, ...AGENTS } });
+  try {
+    const out = path.join(nb.home, 'pairing-qr.png');
+    const a = runTty(nb, ['--qr', '--qr-out', out]);
+    await until(() => /Выпустить код сопряжения нового устройства\? \[y\/N\]/.test(a.out()), 20000, 'вопрос: ' + a.out());
+    a.write('y\r');
+    assert.strictEqual(await a.done, 0, a.out());
+    assert.ok(fs.existsSync(out), 'PNG создан: ' + a.out());
+    const t = JSON.parse(require('../lib/qr-image').readQrPng(out));
+    assert.strictEqual(t.cb, 1);
+    assert.strictEqual(t.host, TEST_LAN_HOST);
+    assert.match(t.fp, /^[0-9a-f]{64}$/);
+    assert.match(a.out(), /QR сохранён в файл/);
   } finally { await nb.stop(); }
 });
 

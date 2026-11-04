@@ -260,6 +260,17 @@ function openLoginUrl(m) {
   setTimeout(() => process.exit(0), 300);
 }
 
+/** D-29: путь для PNG с QR — --qr-out <file> или <данные>\pairing-qr.png. */
+function qrOutPath() {
+  const i = args.indexOf('--qr-out');
+  if (i >= 0) {
+    const p = args[i + 1];
+    if (!p || p.startsWith('-')) fail('Укажите путь: claude-mobile --qr --qr-out <file.png>');
+    return path.resolve(p);
+  }
+  return path.join(DATA.root, 'pairing-qr.png');
+}
+
 ws.on('unexpected-response', (req, res) => {
   req.destroy();
   if (res.statusCode === 401) {
@@ -400,13 +411,25 @@ ws.on('message', (rawMsg) => {
     }
     case 'pairinfo': {
       const qrcode = require(path.join(__dirname, 'node_modules', 'qrcode-terminal'));
+      const ticket = JSON.stringify({ cb: 1, host: m.host, port: m.port, code: m.code, fp: m.fp });
+      const out = qrOutPath();
       console.log('\nСопряжение нового устройства с Claude Bridge');
       console.log(`Адрес моста: ${m.host}:${m.port}`);
       if (m.internet) console.log(`Доступ через интернет: ${fmtInet(m.internet)}`);
       // P-7: сопряжение только по QR — код для ручного ввода не печатаем
       console.log(`Отсканируйте QR в приложении (действует ${m.ttlMin || 10} минут)\n`);
-      qrcode.generate(JSON.stringify({ cb: 1, host: m.host, port: m.port, code: m.code, fp: m.fp }),
-        { small: true }, (q) => { console.log(q); process.exit(0); });
+      qrcode.generate(ticket, { small: true }, (q) => {
+        console.log(q);
+        try {
+          fs.mkdirSync(path.dirname(out), { recursive: true }); // --qr-out в новый каталог
+        } catch (e) {
+          fail('Не удалось создать каталог для QR: ' + e.message);
+          return;
+        }
+        require('./lib/qr-image').writeQrPng(ticket, out)
+          .then(() => { console.log('QR сохранён в файл: ' + out); process.exit(0); })
+          .catch((e) => fail('Не удалось сохранить QR: ' + e.message));
+      });
       break;
     }
   }

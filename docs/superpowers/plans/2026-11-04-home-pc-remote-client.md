@@ -716,23 +716,32 @@ function runAttachTty(home, args, env = {}) {
 /** TCP-прокси «вместо туннеля»: слушает 127.0.0.1:0 и переливает в targetPort. */
 function tcpProxy(targetPort) {
   const net = require('net');
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
+    const socks = new Set();
     const srv = net.createServer((c) => {
+      socks.add(c);
       const up = net.connect(targetPort, '127.0.0.1');
+      socks.add(up);
       c.pipe(up);
       up.pipe(c);
+      const drop = () => { socks.delete(c); socks.delete(up); };
+      c.on('close', drop);
+      up.on('close', drop);
       c.on('error', () => up.destroy());
       up.on('error', () => c.destroy());
     });
+    srv.on('error', reject);
     srv.listen(0, '127.0.0.1', () => resolve({
       port: srv.address().port,
-      close: () => new Promise((r) => srv.close(r)),
+      close: () => new Promise((r) => { for (const s of socks) s.destroy(); srv.close(() => r()); }),
     }));
   });
 }
 ```
 
 В `module.exports` добавить `runAttach, runAttachTty, tcpProxy`.
+
+`close()` рвёт все открытые соединения перед `srv.close()` — иначе сервер ждёт их и тест висит.
 
 - [ ] **Step 2: Написать падающий тест**
 
@@ -825,7 +834,7 @@ const { ensureDataDirs } = require('./lib/datadir');
 const { pinnedTlsOptions } = require('./lib/cert');
 const { readQrPng } = require('./lib/qr-image');
 const { pairDevice, loadProfile, registerNode } = require('./lib/pair-client');
-const { startTunnel, readNodeId } = require('./lib/remote-tunnel');
+const { startTunnel, readNodeId, defaultExe } = require('./lib/remote-tunnel');
 const W32 = require('./lib/win32-input');
 
 const USAGE = `claude-mobile — удалённый ПК-клиент (домашний ПК)
@@ -851,14 +860,19 @@ async function pair(rest) {
   const png = rest[0];
   if (!png || png.startsWith('-')) fail('Укажите файл QR: claude-mobile --pair <qr.png>');
   if (!fs.existsSync(png)) fail('Нет файла QR: ' + png);
-  // без бинаря туннеля сопряжение бессмысленно (NodeId не получить) — проверяем ДО /pair,
-  // чтобы не оставить на мосте «осиротевшее» устройство
-  if (!process.env.CLAUDE_BRIDGE_TUNNEL && !fs.existsSync(path.join(__dirname, 'bin', 'claude-tunnel.exe'))) {
-    fail('Нет bridge\\bin\\claude-tunnel.exe — без него --remote не работает. Установите мост целиком.');
-  }
   const DATA = ensureDataDirs();
   let ticket;
   try { ticket = readQrPng(png); } catch (e) { fail('Не удалось прочитать QR: ' + e.message); }
+  // NodeId получаем ДО /pair: без рабочего туннеля сопряжение бессмысленно, а устройство
+  // на мосте осталось бы «осиротевшим» (D-29).
+  const secret = path.join(DATA.root, 'remote', 'iroh.key');
+  fs.mkdirSync(path.dirname(secret), { recursive: true });
+  const exe = defaultExe();
+  if (!fs.existsSync(exe)) {
+    fail(`Нет ${exe} — без него --remote не работает. Установите мост целиком.`);
+  }
+  let nodeId;
+  try { nodeId = readNodeId({ secretFile: secret }); } catch (e) { fail(e.message); }
   let r;
   try { r = await pairDevice({ ticket, name: os.hostname(), root: DATA.root }); } catch (e) { fail(e.message); }
   console.log(`Сопряжено с мостом ${r.host}:${r.port}.`);
@@ -866,8 +880,6 @@ async function pair(rest) {
     console.log('Внимание: интернет-доступ на рабочем ПК выключен. Включите его и сопрягите заново — ' +
       'иначе --remote не сможет поднять туннель.');
   }
-  let nodeId;
-  try { nodeId = readNodeId({ secretFile: r.paths.secret }); } catch (e) { fail(e.message); }
   try {
     await registerNode({
       host: r.host, port: r.port, token: r.token, nodeId,
@@ -973,9 +985,12 @@ async function remote(rest) {
           die('', 0);
           break;
         }
-        const target = rest[1] ? list.find((s) => s.id === rest[1]) : list.filter((s) => s.alive).pop();
-        if (!target) die('Живых сессий нет. Запустите сессию на рабочем ПК.', 1);
-        else attach(target.id);
+        const want = rest[1];
+        const target = want ? list.find((s) => s.id === want) : list.filter((s) => s.alive).pop();
+        if (!target) {
+          die(want ? `Нет сессии ${want}. Список: claude-mobile --remote -l`
+            : 'Живых сессий нет. Запустите сессию на рабочем ПК.', 1);
+        } else attach(target.id);
         break;
       }
       case 'scrollback':

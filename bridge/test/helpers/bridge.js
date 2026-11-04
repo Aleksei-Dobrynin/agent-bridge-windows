@@ -294,17 +294,24 @@ function runAttachTty(home, args, env = {}) {
 /** TCP-прокси «вместо туннеля»: слушает 127.0.0.1:0 и переливает в targetPort. */
 function tcpProxy(targetPort) {
   const net = require('net');
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
+    const socks = new Set();
     const srv = net.createServer((c) => {
+      socks.add(c);
       const up = net.connect(targetPort, '127.0.0.1');
+      socks.add(up);
       c.pipe(up);
       up.pipe(c);
+      const drop = () => { socks.delete(c); socks.delete(up); };
+      c.on('close', drop);
+      up.on('close', drop);
       c.on('error', () => up.destroy());
       up.on('error', () => c.destroy());
     });
+    srv.on('error', reject);
     srv.listen(0, '127.0.0.1', () => resolve({
       port: srv.address().port,
-      close: () => new Promise((r) => srv.close(r)),
+      close: () => new Promise((r) => { for (const s of socks) s.destroy(); srv.close(() => r()); }),
     }));
   });
 }

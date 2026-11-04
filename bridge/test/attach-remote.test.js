@@ -62,3 +62,69 @@ test('--pair без аргумента — понятная ошибка', async
     assert.match(r.err(), /--pair <qr\.png>/);
   } finally { fs.rmSync(lap, { recursive: true, force: true }); }
 });
+
+/** Подменить ticket на фиктивный: настоящий iroh в тестах не поднимаем. */
+function fakeTicket(lap) {
+  const f = path.join(lap, 'remote', 'profile.json');
+  const prof = JSON.parse(fs.readFileSync(f, 'utf8'));
+  prof.ticket = 'fake-ticket';
+  fs.writeFileSync(f, JSON.stringify(prof, null, 2));
+}
+
+test('--remote -l: список сессий рабочего ПК через туннель', { timeout: 90000 }, async () => {
+  const { lap } = await pairLaptop();
+  const proxy = await H.tcpProxy(b.port);
+  try {
+    fakeTicket(lap);
+    const o = await b.connect(b.owner);
+    const created = await H.createAndAttach(o, { cwd: b.cwd, agent: 'echo' });
+    assert.strictEqual(created.type, 'created', JSON.stringify(created));
+
+    const r = H.runAttach(lap, ['--remote', '-l'], {
+      CLAUDE_BRIDGE_TUNNEL: FAKE, CB_FAKE_TUNNEL_PORT: String(proxy.port),
+    });
+    assert.strictEqual(await r.done, 0, r.out() + r.err());
+    assert.ok(r.out().includes(created.id), 'в списке есть сессия: ' + r.out());
+    assert.match(r.out(), /жива/);
+    // lap общий на файл (pairLaptop мемоизирован) — каталог удаляет test.after, не этот тест
+  } finally { await proxy.close(); }
+});
+
+test('--remote -a: ввод и вывод сессии через туннель', { timeout: 90000 }, async () => {
+  const { lap } = await pairLaptop();
+  const proxy = await H.tcpProxy(b.port);
+  try {
+    fakeTicket(lap);
+    const o = await b.connect(b.owner);
+    const created = await H.createAndAttach(o, { cwd: b.cwd, agent: 'echo' });
+    assert.strictEqual(created.type, 'created');
+    const r = H.runAttachTty(lap, ['--remote', '-a', created.id], {
+      CLAUDE_BRIDGE_TUNNEL: FAKE, CB_FAKE_TUNNEL_PORT: String(proxy.port),
+    });
+    await H.waitFor(async () => /ARGV:/.test(r.out()), 20000);
+    r.write('hi\r');
+    await H.waitFor(async () => /ECHO:"hi\\r"/.test(r.out()), 10000);
+    assert.match(r.out(), /ECHO:/);
+    r.term.kill();
+    await r.done;
+    // lap общий на файл — каталог удаляет test.after
+  } finally { await proxy.close(); }
+});
+
+test('--remote без профиля — понятная ошибка', async () => {
+  const lap = H.tempHome('cb-lap-');
+  try {
+    const r = H.runAttach(lap, ['--remote', '-l']);
+    assert.strictEqual(await r.done, 1);
+    assert.match(r.err(), /Нет профиля сопряжения/);
+  } finally { fs.rmSync(lap, { recursive: true, force: true }); }
+});
+
+test('--remote: создание сессии удалённо запрещено', async () => {
+  const { lap } = await pairLaptop();
+  try {
+    const r = H.runAttach(lap, ['--remote', '--agent', 'echo']);
+    assert.strictEqual(await r.done, 1);
+    assert.match(r.err(), /только -l и -a/);
+  } finally { fs.rmSync(lap, { recursive: true, force: true }); }
+});

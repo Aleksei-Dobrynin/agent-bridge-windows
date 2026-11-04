@@ -258,7 +258,59 @@ async function startTestBridge({ config = {}, devices = [], rawPairings = null, 
   };
 }
 
+/** claude-mobile без консоли (stdin — закрытый pipe). env — поверх process.env. */
+function runAttach(home, args, env = {}) {
+  const p = spawn(process.execPath, [path.join(__dirname, '..', '..', 'attach.js'), ...args], {
+    env: { ...process.env, CLAUDE_BRIDGE_HOME: home, ...env },
+    cwd: home, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  p.stdin.end();
+  let out = '';
+  let err = '';
+  p.stdout.setEncoding('utf8');
+  p.stderr.setEncoding('utf8');
+  p.stdout.on('data', (d) => { out += d; });
+  p.stderr.on('data', (d) => { err += d; });
+  const done = new Promise((r) => p.on('exit', (code) => r(code)));
+  const t = setTimeout(() => killTree(p.pid), 30000);
+  done.then(() => clearTimeout(t));
+  return { p, done, out: () => stripAnsi(out), err: () => err };
+}
+
+/** claude-mobile в интерактивной консоли (ConPTY). */
+function runAttachTty(home, args, env = {}) {
+  const pty = require('../../node_modules/node-pty');
+  const term = pty.spawn(process.execPath, [path.join(__dirname, '..', '..', 'attach.js'), ...args], {
+    name: 'xterm', cols: 200, rows: 50, cwd: home, env: { ...process.env, CLAUDE_BRIDGE_HOME: home, ...env },
+  });
+  let out = '';
+  term.onData((d) => { out += d; });
+  const done = new Promise((r) => term.onExit(({ exitCode }) => r(exitCode)));
+  const t = setTimeout(() => { try { term.kill(); } catch { /* вышел */ } }, 40000);
+  done.then(() => clearTimeout(t));
+  return { term, done, out: () => stripAnsi(out), write: (s) => term.write(s) };
+}
+
+/** TCP-прокси «вместо туннеля»: слушает 127.0.0.1:0 и переливает в targetPort. */
+function tcpProxy(targetPort) {
+  const net = require('net');
+  return new Promise((resolve) => {
+    const srv = net.createServer((c) => {
+      const up = net.connect(targetPort, '127.0.0.1');
+      c.pipe(up);
+      up.pipe(c);
+      c.on('error', () => up.destroy());
+      up.on('error', () => c.destroy());
+    });
+    srv.listen(0, '127.0.0.1', () => resolve({
+      port: srv.address().port,
+      close: () => new Promise((r) => srv.close(r)),
+    }));
+  });
+}
+
 module.exports = {
   sleep, waitFor, pickPort, tempHome, startBridge, ownerAndPin, request, wsConnect, keeperPids, killTree, cleanup,
   FAKE_AGENT, DEVICE, TEST_LAN_HOST, pairingRecord, sha256, stripAnsi, connectClient, createAndAttach, startTestBridge,
+  runAttach, runAttachTty, tcpProxy,
 };

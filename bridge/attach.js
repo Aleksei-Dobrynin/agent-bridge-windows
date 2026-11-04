@@ -1,5 +1,10 @@
 #!/usr/bin/env node
 'use strict';
+// D-29: удалённый ПК-клиент — отдельный режим: owner.token и локальный сертификат не нужны.
+if (process.argv[2] === '--remote' || process.argv[2] === '--pair') {
+  require('./remote').main(process.argv.slice(2));
+  return; // CommonJS: дальше локальный код этого файла не выполняется
+}
 // claude-mobile: запустить агента (Claude Code, opencode, …) через мост и зеркалировать
 // сессию в этом терминале. Телефон видит ту же сессию и может вмешиваться.
 //
@@ -48,6 +53,8 @@ const USAGE = `claude-mobile — агент через мост (зеркало 
   claude-mobile --qr                 QR-код сопряжения нового устройства
   claude-mobile --open               открыть веб-интерфейс моста в браузере (одноразовая ссылка)
   claude-mobile --rotate-token       перевыпустить токен владельца
+  claude-mobile --pair <qr.png>      сопрячься с мостом рабочего ПК (разово, в LAN)
+  claude-mobile --remote [-l|-a [id]] работа с сессиями рабочего ПК через туннель
   claude-mobile -h                   эта справка
 
 Если уже есть сопряжённый телефон, выпуск кода и включение интернет-доступа

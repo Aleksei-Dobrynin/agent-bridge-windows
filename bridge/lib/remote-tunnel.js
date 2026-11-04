@@ -20,6 +20,9 @@ function startTunnel({ ticket, secretFile, exePath = defaultExe(), timeoutMs = 3
   spawnFn = spawn, env = process.env }) {
   return new Promise((resolve, reject) => {
     if (!ticket) { reject(new Error('нет ticket туннеля — включите интернет-доступ на рабочем ПК')); return; }
+    if (typeof secretFile !== 'string' || !secretFile.trim()) {
+      reject(new Error('не указан файл ключа туннеля')); return;
+    }
     const { cmd, pre } = command(exePath);
     const child = spawnFn(cmd, [...pre, 'connect', `--ticket=${ticket}`,
       '--listen', '127.0.0.1:0', '--secret-file', secretFile],
@@ -36,6 +39,18 @@ function startTunnel({ ticket, secretFile, exePath = defaultExe(), timeoutMs = 3
       stop();
       reject(e);
     };
+    const handleLine = (line) => {
+      let m;
+      try { m = JSON.parse(line); } catch { return; }
+      if (m.event === 'ready' && Number.isInteger(m.port)) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ port: m.port, child, stop });
+      } else if (m.event === 'error') {
+        fail(new Error('туннель: ' + (m.message || 'ошибка')));
+      }
+    };
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (d) => {
       acc += d;
@@ -43,23 +58,18 @@ function startTunnel({ ticket, secretFile, exePath = defaultExe(), timeoutMs = 3
       while ((i = acc.indexOf('\n')) >= 0) {
         const line = acc.slice(0, i);
         acc = acc.slice(i + 1);
-        let m;
-        try { m = JSON.parse(line); } catch { continue; }
-        if (m.event === 'ready' && Number.isInteger(m.port)) {
-          if (settled) continue;
-          settled = true;
-          clearTimeout(timer);
-          resolve({ port: m.port, child, stop });
-        } else if (m.event === 'error') {
-          fail(new Error('туннель: ' + (m.message || 'ошибка')));
-        }
+        handleLine(line);
       }
     });
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (d) => { stderr = (stderr + d).slice(-4000); });
     child.on('error', (e) => fail(new Error('не удалось запустить туннель: ' + e.message)));
-    child.on('exit', (code) => fail(new Error('туннель завершился (код ' + code + ')' +
-      (stderr.trim() ? ': ' + stderr.trim() : ''))));
+    // close, а не exit: к этому моменту stdout дочитан и последняя строка (ready/error) разобрана.
+    child.on('close', (code) => {
+      if (acc.trim()) { handleLine(acc); acc = ''; }
+      fail(new Error('туннель завершился (код ' + code + ')' +
+        (stderr.trim() ? ': ' + stderr.trim() : '')));
+    });
   });
 }
 

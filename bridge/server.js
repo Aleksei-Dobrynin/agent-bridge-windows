@@ -1506,6 +1506,10 @@ wss.on('connection', (ws, req, who) => {
               writeAllowFile();
               console.log(`  Зарегистрирован p2p-узел устройства «${dev.name}»`);
             }
+            // D-29: ПК-клиент сопрягается по LAN и должен знать, что узел принят
+            wsSend(ws, { type: 'nodeRegistered', nodeId: nid, ok: true });
+          } else {
+            wsSend(ws, { type: 'nodeRegistered', nodeId: nid, ok: false });
           }
           break;
         }

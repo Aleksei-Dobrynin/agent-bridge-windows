@@ -70,3 +70,18 @@ test('after a bridge restart the paired device still logs in (hash read from fil
   const d = await b.connect(token);
   await d.wait((m) => m.type === 'sessions');
 });
+
+test('registerNode: устройство получает подтверждение, NodeId в allowlist (D-29)', { timeout: 60000 }, async () => {
+  const d = await b.connect(token);
+  await d.wait((m) => m.type === 'sessions');
+  const at = d.mark();
+  const nodeId = 'a'.repeat(64);
+  d.send({ type: 'registerNode', nodeId });
+  const ack = await d.wait((m) => m.type === 'nodeRegistered', 5000, at);
+  assert.strictEqual(ack.ok, true);
+  assert.strictEqual(ack.nodeId, nodeId);
+  const raw = JSON.parse(fs.readFileSync(path.join(b.home, 'pairings.json'), 'utf8'));
+  assert.strictEqual(raw.devices[0].nodeId, nodeId);
+  const allow = fs.readFileSync(path.join(b.home, 'certs', 'tunnel-allow.txt'), 'utf8');
+  assert.ok(allow.includes(nodeId), 'NodeId попал в allowlist туннеля');
+});

@@ -69,10 +69,12 @@ function remotePaths(root) {
   };
 }
 
-function saveProfile(root, { der, host, port, fingerprint, ticket, name }) {
+function saveProfile(root, { der, host, port, fingerprint, ticket, name, token }) {
   const p = remotePaths(root);
   fs.mkdirSync(p.dir, { recursive: true });
   fs.writeFileSync(p.cert, der);
+  // токен — до профиля: валидный профиль без токена бесполезен и вводит в заблуждение
+  fs.writeFileSync(p.token, token, { mode: 0o600 });
   fs.writeFileSync(p.profile, JSON.stringify({
     host, port, fingerprint, ticket: ticket || null, name, pairedAt: new Date().toISOString(),
   }, null, 2));
@@ -98,9 +100,8 @@ async function pairDevice({ ticket, name, root, timeoutMs }) {
     throw new Error('мост вернул некорректный токен устройства');
   }
   const paths = saveProfile(root, {
-    der, host: t.host, port: t.port, fingerprint: fp, ticket: r.nodeTicket, name,
+    der, host: t.host, port: t.port, fingerprint: fp, ticket: r.nodeTicket, name, token: r.token,
   });
-  fs.writeFileSync(paths.token, r.token, { mode: 0o600 });
   return { token: r.token, fingerprint: fp, host: t.host, port: t.port, ticket: r.nodeTicket || null, paths };
 }
 
@@ -119,19 +120,27 @@ function registerNode({ host, port, pin, token, nodeId, timeoutMs = 10000 }) {
     const ws = new WebSocket(`wss://${host}:${port}/ws`, {
       ...pin, headers: { Authorization: 'Bearer ' + token },
     });
-    const timer = setTimeout(() => {
+    let settled = false;
+    let timer = null;
+    const done = (fn, v) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
       try { ws.close(); } catch { /* закрыт */ }
-      reject(new Error('мост не подтвердил регистрацию p2p-узла'));
-    }, timeoutMs);
-    const done = (fn, v) => { clearTimeout(timer); try { ws.close(); } catch { /* закрыт */ } fn(v); };
+      fn(v);
+    };
+    timer = setTimeout(() => done(reject, new Error('мост не подтвердил регистрацию p2p-узла')), timeoutMs);
     ws.on('message', (d) => {
       let m; try { m = JSON.parse(d); } catch { return; }
-      if (m.type === 'nodeRegistered') {
+      if (m.type === 'error') {
+        done(reject, new Error(typeof m.message === 'string' && m.message ? m.message : 'мост вернул ошибку'));
+      } else if (m.type === 'nodeRegistered') {
         if (m.ok === true) done(resolve, m.nodeId);
         else done(reject, new Error('мост не принял NodeId устройства'));
       }
     });
     ws.on('error', (e) => done(reject, e));
+    ws.on('close', () => done(reject, new Error('мост закрыл соединение до подтверждения регистрации p2p-узла')));
     ws.on('open', () => ws.send(JSON.stringify({ type: 'registerNode', nodeId })));
   });
 }

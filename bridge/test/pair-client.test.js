@@ -28,8 +28,14 @@ async function ticket() {
 // ВАЖНО: успешное сопряжение ставит phoneRequired — после него pairinfo требует телефон.
 // Поэтому все проверки отказов идут ДО успешного сопряжения.
 test('мусор в QR — понятная ошибка', async () => {
-  await assert.rejects(pairDevice({ ticket: '{"cb":1}', name: 'x', root: H.tempHome('cb-lap-') }), /QR/);
-  await assert.rejects(pairDevice({ ticket: 'not json', name: 'x', root: H.tempHome('cb-lap-') }), /JSON/);
+  const root1 = H.tempHome('cb-lap-');
+  try {
+    await assert.rejects(pairDevice({ ticket: '{"cb":1}', name: 'x', root: root1 }), /QR/);
+  } finally { fs.rmSync(root1, { recursive: true, force: true }); }
+  const root2 = H.tempHome('cb-lap-');
+  try {
+    await assert.rejects(pairDevice({ ticket: 'not json', name: 'x', root: root2 }), /JSON/);
+  } finally { fs.rmSync(root2, { recursive: true, force: true }); }
 });
 
 test('неверный отпечаток в QR — отказ до /pair, ничего не сохранено', async () => {

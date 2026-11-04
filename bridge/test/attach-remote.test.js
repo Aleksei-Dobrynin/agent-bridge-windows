@@ -63,11 +63,16 @@ test('--pair без аргумента — понятная ошибка', async
   } finally { fs.rmSync(lap, { recursive: true, force: true }); }
 });
 
-/** Подменить ticket на фиктивный: настоящий iroh в тестах не поднимаем. */
+/** Подменить ticket на фиктивный: настоящий iroh в тестах не поднимаем.
+ *  Заодно обнуляем прямой адрес моста: без этого тест мог бы пройти по LAN-пути и не заметить,
+ *  что туннель не задействован. На подключение это не влияет — клиент всегда идёт на
+ *  127.0.0.1:<порт туннеля>, — но прямой путь к мосту становится невозможен. */
 function fakeTicket(lap) {
   const f = path.join(lap, 'remote', 'profile.json');
   const prof = JSON.parse(fs.readFileSync(f, 'utf8'));
   prof.ticket = 'fake-ticket';
+  prof.host = '127.0.0.1';
+  prof.port = 1;
   fs.writeFileSync(f, JSON.stringify(prof, null, 2));
 }
 
@@ -101,12 +106,16 @@ test('--remote -a: ввод и вывод сессии через туннель
     const r = H.runAttachTty(lap, ['--remote', '-a', created.id], {
       CLAUDE_BRIDGE_TUNNEL: FAKE, CB_FAKE_TUNNEL_PORT: String(proxy.port),
     });
-    await H.waitFor(async () => /ARGV:/.test(r.out()), 20000);
-    r.write('hi\r');
-    await H.waitFor(async () => /ECHO:"hi\\r"/.test(r.out()), 10000);
-    assert.match(r.out(), /ECHO:/);
-    r.term.kill();
-    await r.done;
+    try {
+      assert.ok(await H.waitFor(async () => /ARGV:/.test(r.out()), 20000), 'сессия прислала ARGV: ' + r.out());
+      r.write('hi\r');
+      // ConPTY может разбить чанк — ждём начало эха, а не строку целиком
+      assert.ok(await H.waitFor(async () => /ECHO:"hi/.test(r.out()), 10000), 'эхо ввода: ' + r.out());
+    } finally {
+      // pty закрываем при любом исходе: иначе упавший ассерт подвесит node --test
+      try { r.term.kill(); } catch { /* уже вышел */ }
+      await r.done;
+    }
     // lap общий на файл — каталог удаляет test.after
   } finally { await proxy.close(); }
 });
@@ -122,9 +131,8 @@ test('--remote без профиля — понятная ошибка', async (
 
 test('--remote: создание сессии удалённо запрещено', async () => {
   const { lap } = await pairLaptop();
-  try {
-    const r = H.runAttach(lap, ['--remote', '--agent', 'echo']);
-    assert.strictEqual(await r.done, 1);
-    assert.match(r.err(), /только -l и -a/);
-  } finally { fs.rmSync(lap, { recursive: true, force: true }); }
+  const r = H.runAttach(lap, ['--remote', '--agent', 'echo']);
+  assert.strictEqual(await r.done, 1);
+  assert.match(r.err(), /только -l и -a/);
+  // lap общий на файл — каталог удаляет test.after (иначе сломает любой следующий тест)
 });

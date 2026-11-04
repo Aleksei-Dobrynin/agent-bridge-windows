@@ -51,6 +51,7 @@ const USAGE = `claude-mobile — агент через мост (зеркало 
   claude-mobile -a [id]              подключиться к сессии (без id — к последней живой)
   claude-mobile --device             доверенные устройства и интернет-доступ
   claude-mobile --qr                 QR-код сопряжения нового устройства
+  claude-mobile --qr-out <file>      сохранить QR в PNG-файл (с --qr)
   claude-mobile --open               открыть веб-интерфейс моста в браузере (одноразовая ссылка)
   claude-mobile --rotate-token       перевыпустить токен владельца
   claude-mobile --pair <qr.png>      сопрячься с мостом рабочего ПК (разово, в LAN)
@@ -188,6 +189,11 @@ function send(obj) { ws.send(JSON.stringify(obj)); }
 let lastSensitive = null;
 function sendSensitive(obj) { lastSensitive = obj; send(obj); }
 
+// D-29: путь для PNG с QR, вычисленный ДО подтверждения (в ветке --qr): иначе при
+// «--qr --qr-out» без значения человек сначала подтверждает (или телефон получает запрос),
+// код сопряжения уже перевыпущен — и только потом выясняется, что путь не указан.
+let pairQrOut = null;
+
 function attach(id) {
   sid = id;
   send({
@@ -311,6 +317,9 @@ ws.on('message', (rawMsg) => {
         // подтверждение — закрытие соединения мостом с кодом 4401 (обработчик 'close')
         setTimeout(() => die('Мост не подтвердил перевыпуск токена владельца.', 1), 5000);
       } else if (args[0] === '--qr') {
+        // D-29: путь проверяем ДО запроса подтверждения — иначе код сопряжения уже
+        // перевыпущен, а ошибка в --qr-out всплывает только после подтверждения
+        pairQrOut = qrOutPath();
         // D-13: подтверждение — на сопряжённом телефоне (confirmPending) или, если телефонов
         // нет, здесь в консоли (confirmRequired -> повтор с confirmed:true)
         sendSensitive({ type: 'pairinfo' });
@@ -412,7 +421,7 @@ ws.on('message', (rawMsg) => {
     case 'pairinfo': {
       const qrcode = require(path.join(__dirname, 'node_modules', 'qrcode-terminal'));
       const ticket = JSON.stringify({ cb: 1, host: m.host, port: m.port, code: m.code, fp: m.fp });
-      const out = qrOutPath();
+      const out = pairQrOut || qrOutPath(); // путь уже проверен до подтверждения (D-29)
       console.log('\nСопряжение нового устройства с Claude Bridge');
       console.log(`Адрес моста: ${m.host}:${m.port}`);
       if (m.internet) console.log(`Доступ через интернет: ${fmtInet(m.internet)}`);

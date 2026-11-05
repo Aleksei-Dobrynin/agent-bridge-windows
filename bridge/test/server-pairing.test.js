@@ -11,6 +11,8 @@ const H = require('./helpers/bridge');
 const LEGACY = 'e'.repeat(48);
 let b;
 let token; // токен нового устройства — есть только у «телефона» (ответ /pair)
+let homeToken = null; // токен ПК-клиента из предыдущего теста — для проверки перевыпуска
+let homeNodeId = null;
 test.before(async () => {
   // явный host на loopback-адресе, отличном от 127.0.0.1: pairinfo выдаёт код без реальной LAN
   b = await H.startTestBridge({ prefix: 'cb-pair-', config: { host: H.TEST_LAN_HOST }, rawPairings: { devices: [
@@ -109,4 +111,36 @@ test('/pair с nodeId: allowlist сразу, без registerNode (D-30)', { time
   assert.strictEqual(dev.name, 'home laptop');
   const allow = fs.readFileSync(path.join(b.home, 'certs', 'tunnel-allow.txt'), 'utf8');
   assert.ok(allow.includes(nodeId), 'NodeId в allowlist без отдельного registerNode');
+  homeToken = JSON.parse(res.body).token;
+  homeNodeId = nodeId;
+});
+
+test('/pair с тем же nodeId: токен перевыпущен, дубликата нет, старый не работает (D-30)', { timeout: 60000 }, async () => {
+  const o = await b.connect(b.owner);
+  const at = o.mark();
+  o.send({ type: 'pairinfo' });
+  const d = await b.connect(token);
+  const dat = d.mark();
+  await d.wait((m) => m.type === 'sessions', 10000, dat);
+  const req = await d.wait((m) => m.type === 'confirmRequest', 5000, dat);
+  d.send({ type: 'confirm', confirmId: req.confirmId, allow: true });
+  const p = await o.wait((m) => m.type === 'pairinfo', 5000, at);
+  const res = await H.request(b.port, b.pin, { path: '/pair', method: 'POST', headers: { 'Content-Type': 'application/json' } },
+    JSON.stringify({ code: p.code, name: 'home laptop', nodeId: homeNodeId }));
+  assert.strictEqual(res.statusCode, 200, res.body);
+  const fresh = JSON.parse(res.body).token;
+  assert.notStrictEqual(fresh, homeToken, 'токен перевыпущен');
+
+  const devs = JSON.parse(fs.readFileSync(path.join(b.home, 'pairings.json'), 'utf8')).devices;
+  assert.strictEqual(devs.filter((x) => x.nodeId === homeNodeId).length, 1, 'дубликата нет');
+  assert.strictEqual(devs.length, 2, 'телефон + ноутбук');
+
+  assert.strictEqual(await H.wsConnect(b.port, b.pin, { Authorization: 'Bearer ' + homeToken }), null,
+    'старый токен больше не принимается');
+  const ok = await b.connect(fresh);
+  await ok.wait((m) => m.type === 'sessions');
+
+  const lines = fs.readFileSync(path.join(b.home, 'certs', 'tunnel-allow.txt'), 'utf8')
+    .split('\n').filter((x) => x.trim() === homeNodeId);
+  assert.strictEqual(lines.length, 1, 'nodeId в allowlist ровно один раз');
 });

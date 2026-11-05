@@ -64,9 +64,8 @@ test('--pair без аргумента — понятная ошибка', async
 });
 
 /** Подменить ticket на фиктивный: настоящий iroh в тестах не поднимаем.
- *  Заодно обнуляем прямой адрес моста: без этого тест мог бы пройти по LAN-пути и не заметить,
- *  что туннель не задействован. На подключение это не влияет — клиент всегда идёт на
- *  127.0.0.1:<порт туннеля>, — но прямой путь к мосту становится невозможен. */
+ *  Заодно обнуляем прямой адрес моста (D-30): host/port в профиле указывают на мёртвый адрес,
+ *  поэтому клиент обязан идти через туннель, а прямой LAN-путь недоступен. */
 function fakeTicket(lap) {
   const f = path.join(lap, 'remote', 'profile.json');
   const prof = JSON.parse(fs.readFileSync(f, 'utf8'));
@@ -158,4 +157,19 @@ test('--remote -l: в LAN идёт напрямую, туннель не зап�
   assert.strictEqual(await r.done, 0, r.out() + r.err());
   assert.match(r.out(), /жива/);
   assert.ok(!fs.existsSync(mark), 'туннель не запускался: путь LAN приоритетен');
+});
+
+test('--remote без ticket — отказ, а не бесконечный ретрай (D-30)', { timeout: 60000 }, async () => {
+  const { lap } = await pairLaptop();
+  const dir = H.tempHome('cb-lap-noticket-');
+  try {
+    fs.cpSync(path.join(lap, 'remote'), path.join(dir, 'remote'), { recursive: true });
+    const file = path.join(dir, 'remote', 'profile.json');
+    const p = JSON.parse(fs.readFileSync(file, 'utf8'));
+    p.host = '127.0.0.1'; p.port = 1; p.ticket = null; p.lastVia = 'lan';
+    fs.writeFileSync(file, JSON.stringify(p, null, 2));
+    const r = H.runAttach(dir, ['--remote', '-a'], { CLAUDE_BRIDGE_TUNNEL: FAKE, CB_FAKE_TUNNEL_MODE: 'error' });
+    assert.strictEqual(await r.done, 1, r.out() + r.err());
+    assert.match(r.err(), /ticket/i);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

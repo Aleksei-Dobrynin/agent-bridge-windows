@@ -218,10 +218,12 @@ async function remote(rest) {
     handle(ws);
     if (sid) {
       // переподключение: чистим экран и просим хвост буфера заново
-      process.stdout.write('\x1b[2J\x1b[H');
+      if (process.stdout.isTTY) process.stdout.write('\x1b[2J\x1b[H');
       attach(ws, sid);
     }
     await new Promise((r) => ws.once('close', r));
+    // WS мёртв: ввод/resize во время backoff не должны уходить в закрытый сокет.
+    if (current === ws) current = null;
     if (stopping) break;
     const delay = Math.min(RECONNECT_MIN_MS * 2 ** attempt, RECONNECT_MAX_MS);
     attempt++;

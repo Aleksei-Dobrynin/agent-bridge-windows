@@ -191,8 +191,10 @@ function createSession({ profile, token, pin, startTunnel, saveProfile, probe = 
           return { ws, via };
         } catch (e) {
           if (e.revoked) { stopTunnel(); throw e; }
+          // Нет ticket — не временный сбой: ретрай бессмысленен (D-30), отдаём отказ наверх.
+          if (e.noTicket) { stopTunnel(); throw e; }
           stopTunnel();
-          errors.push((step === 'lan' ? 'LAN' : 'туннель') + ': ' + e.message);
+          errors.push((step === 'lan' ? 'LAN' : 'туннель') + ': ' + String(e.message).replace(/^туннель:\s*/i, ''));
         }
       }
       throw new Error('Мост недоступен (' + errors.join('; ') + ')');

@@ -12,6 +12,8 @@
 
 **Обязательные правила проекта:** `Specs/` — первым (L0→L3); арх-решения — только с «да» оператора; реальную систему пользователя не трогать; коммиты — только релевантные пути, push — только по просьбе; секреты не коммитить. Гейт: `cd bridge; npm test` → `fail 0`.
 
+**Статус: ✅ реализовано 2026-11-05** (задачи 1–8, коммиты `fbe5b9c`…`e227ac7`; гейт 354 теста, 353 pass / 0 fail / 1 skip, `check-specs` PASS). Осталось — «Проверка на реальных ПК» ниже (за оператором). Долги: P1 — ticket не обновляется при рестарте туннеля; P2 — сбой `registerNode` после `/pair` без отката; у `install.ps1` нет режима `-Client`.
+
 ---
 
 ## Структура файлов
@@ -51,7 +53,7 @@
 - Create: `bridge/lib/qr-image.js`
 - Test: `bridge/test/qr-image.test.js`
 
-- [ ] **Step 1: Добавить зависимости**
+- [x] **Step 1: Добавить зависимости**
 
 В `bridge/package.json` в `"dependencies"` (алфавитный порядок сохранить):
 
@@ -61,12 +63,12 @@
     "qrcode": "^1.5.4",
 ```
 
-- [ ] **Step 2: Установить и зафиксировать lock-файл**
+- [x] **Step 2: Установить и зафиксировать lock-файл**
 
 Run: `cd bridge; npm install --save-exact=false jsqr@^1.4.0 pngjs@^7.0.0 qrcode@^1.5.4`
 Expected: `added N packages`, обновлены `package.json` и `package-lock.json`, `found 0 vulnerabilities`.
 
-- [ ] **Step 3: Написать падающий тест**
+- [x] **Step 3: Написать падающий тест**
 
 Создать `bridge/test/qr-image.test.js`:
 
@@ -106,12 +108,12 @@ test('не PNG — отказ', () => {
 });
 ```
 
-- [ ] **Step 4: Запустить тест — должен упасть**
+- [x] **Step 4: Запустить тест — должен упасть**
 
 Run: `cd bridge; node --test --test-concurrency=1 test/qr-image.test.js`
 Expected: FAIL `Cannot find module '../lib/qr-image'`.
 
-- [ ] **Step 5: Реализовать `bridge/lib/qr-image.js`**
+- [x] **Step 5: Реализовать `bridge/lib/qr-image.js`**
 
 ```js
 'use strict';
@@ -139,12 +141,12 @@ function readQrPng(file) {
 module.exports = { writeQrPng, readQrPng };
 ```
 
-- [ ] **Step 6: Тест должен пройти**
+- [x] **Step 6: Тест должен пройти**
 
 Run: `cd bridge; node --test --test-concurrency=1 test/qr-image.test.js`
 Expected: `pass 3`, `fail 0`.
 
-- [ ] **Step 7: Коммит**
+- [x] **Step 7: Коммит**
 
 ```bash
 git add bridge/package.json bridge/package-lock.json bridge/lib/qr-image.js bridge/test/qr-image.test.js
@@ -159,7 +161,7 @@ git commit -m "feat(bridge): QR PNG для сопряжения ПК-клиен�
 - Create: `bridge/lib/pair-client.js`
 - Test: `bridge/test/pair-client.test.js`
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 Создать `bridge/test/pair-client.test.js`:
 
@@ -240,12 +242,12 @@ test('pairDevice: профиль, сертификат и токен на дис
 });
 ```
 
-- [ ] **Step 2: Запустить — упасть**
+- [x] **Step 2: Запустить — упасть**
 
 Run: `cd bridge; node --test --test-concurrency=1 test/pair-client.test.js`
 Expected: FAIL `Cannot find module '../lib/pair-client'`.
 
-- [ ] **Step 3: Реализовать `bridge/lib/pair-client.js`**
+- [x] **Step 3: Реализовать `bridge/lib/pair-client.js`**
 
 ```js
 'use strict';
@@ -389,12 +391,12 @@ function registerNode({ host, port, pin, token, nodeId, timeoutMs = 10000 }) {
 module.exports = { parseTicket, pairDevice, loadProfile, registerNode, remotePaths };
 ```
 
-- [ ] **Step 4: Тест должен пройти**
+- [x] **Step 4: Тест должен пройти**
 
 Run: `cd bridge; node --test --test-concurrency=1 test/pair-client.test.js`
 Expected: `pass 4`, `fail 0` (тест `registerNode` появится в Task 3 и будет падать до неё — поэтому здесь его нет).
 
-- [ ] **Step 5: Коммит**
+- [x] **Step 5: Коммит**
 
 ```bash
 git add bridge/lib/pair-client.js bridge/test/pair-client.test.js
@@ -410,7 +412,7 @@ git commit -m "feat(bridge): сопряжение ПК-клиента по QR с
 - Modify: `bridge/test/server-pairing.test.js`
 - Modify: `Specs/shared/PROTOCOL.md:109,117-133`
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 Добавить в конец `bridge/test/server-pairing.test.js`:
 
@@ -431,12 +433,12 @@ test('registerNode: устройство получает подтвержден
 });
 ```
 
-- [ ] **Step 2: Запустить — упасть**
+- [x] **Step 2: Запустить — упасть**
 
 Run: `cd bridge; node --test --test-concurrency=1 test/server-pairing.test.js`
 Expected: FAIL — `не дождались сообщения` (мост не отвечает `nodeRegistered`).
 
-- [ ] **Step 3: Добавить подтверждение**
+- [x] **Step 3: Добавить подтверждение**
 
 В `bridge/server.js`, case `registerNode` — после блока записи (после `}` закрытия `if (dev && dev.nodeId !== nid)`):
 
@@ -462,19 +464,19 @@ Expected: FAIL — `не дождались сообщения` (мост не �
         }
 ```
 
-- [ ] **Step 4: Тест должен пройти**
+- [x] **Step 4: Тест должен пройти**
 
 Run: `cd bridge; node --test --test-concurrency=1 test/server-pairing.test.js`
 Expected: `pass 4`, `fail 0`.
 
-- [ ] **Step 5: Обновить протокол**
+- [x] **Step 5: Обновить протокол**
 
 В `Specs/shared/PROTOCOL.md`:
 - строка `registerNode` (таблица 1.4) → `| registerNode | nodeId (64 hex) — в allowlist туннеля; ответ — nodeRegistered | устройство (телефон, ПК-клиент D-29) | bridge/server.js:1497 |`
 - в таблицу 1.5 после строки `error` добавить:
   `| nodeRegistered | nodeId, ok — ответ на registerNode (D-29) | bridge/server.js:1509 |`
 
-- [ ] **Step 6: Линтер спеков и коммит**
+- [x] **Step 6: Линтер спеков и коммит**
 
 Run: `node tools/check-specs.mjs`
 Expected: без ошибок.
@@ -495,7 +497,7 @@ git commit -m "feat(bridge): подтверждение registerNode для ПК
 - Create: `bridge/test/fixtures/fake-tunnel.js`
 - Test: `bridge/test/remote-tunnel.test.js`
 
-- [ ] **Step 1: Написать фикстуру**
+- [x] **Step 1: Написать фикстуру**
 
 Создать `bridge/test/fixtures/fake-tunnel.js`:
 
@@ -522,7 +524,7 @@ if (mode === 'hang') {
 }
 ```
 
-- [ ] **Step 2: Написать падающий тест**
+- [x] **Step 2: Написать падающий тест**
 
 Создать `bridge/test/remote-tunnel.test.js`:
 
@@ -562,12 +564,12 @@ test('readNodeId: разбор id', () => {
 });
 ```
 
-- [ ] **Step 3: Запустить — упасть**
+- [x] **Step 3: Запустить — упасть**
 
 Run: `cd bridge; node --test --test-concurrency=1 test/remote-tunnel.test.js`
 Expected: FAIL `Cannot find module '../lib/remote-tunnel'`.
 
-- [ ] **Step 4: Реализовать `bridge/lib/remote-tunnel.js`**
+- [x] **Step 4: Реализовать `bridge/lib/remote-tunnel.js`**
 
 ```js
 'use strict';
@@ -653,12 +655,12 @@ function readNodeId({ exePath = defaultExe(), secretFile, env = process.env } = 
 module.exports = { startTunnel, readNodeId, defaultExe };
 ```
 
-- [ ] **Step 5: Тест должен пройти**
+- [x] **Step 5: Тест должен пройти**
 
 Run: `cd bridge; node --test --test-concurrency=1 test/remote-tunnel.test.js`
 Expected: `pass 4`, `fail 0`.
 
-- [ ] **Step 6: Коммит**
+- [x] **Step 6: Коммит**
 
 ```bash
 git add bridge/lib/remote-tunnel.js bridge/test/fixtures/fake-tunnel.js bridge/test/remote-tunnel.test.js
@@ -675,7 +677,7 @@ git commit -m "feat(bridge): запуск claude-tunnel connect из ПК-кли
 - Modify: `bridge/test/helpers/bridge.js` (обёртки `runAttach`, `runAttachTty`, `tcpProxy`)
 - Test: `bridge/test/attach-remote.test.js`
 
-- [ ] **Step 1: Добавить обёртки в тестовые помощники**
+- [x] **Step 1: Добавить обёртки в тестовые помощники**
 
 В `bridge/test/helpers/bridge.js` перед `module.exports` добавить:
 
@@ -743,7 +745,7 @@ function tcpProxy(targetPort) {
 
 `close()` рвёт все открытые соединения перед `srv.close()` — иначе сервер ждёт их и тест висит.
 
-- [ ] **Step 2: Написать падающий тест**
+- [x] **Step 2: Написать падающий тест**
 
 Создать `bridge/test/attach-remote.test.js`:
 
@@ -814,12 +816,12 @@ test('--pair без аргумента — понятная ошибка', async
 });
 ```
 
-- [ ] **Step 3: Запустить — упасть**
+- [x] **Step 3: Запустить — упасть**
 
 Run: `cd bridge; node --test --test-concurrency=1 test/attach-remote.test.js`
 Expected: FAIL — `--pair` не распознан, выводится справка `claude-mobile`.
 
-- [ ] **Step 4: Создать `bridge/remote.js`**
+- [x] **Step 4: Создать `bridge/remote.js`**
 
 ```js
 'use strict';
@@ -1014,7 +1016,7 @@ async function remote(rest) {
 module.exports = { main, USAGE };
 ```
 
-- [ ] **Step 5: Подключить диспатч в `bridge/attach.js`**
+- [x] **Step 5: Подключить диспатч в `bridge/attach.js`**
 
 Сразу после `'use strict';` (до `const path = require(...)`) вставить:
 
@@ -1033,7 +1035,7 @@ if (process.argv[2] === '--remote' || process.argv[2] === '--pair') {
   claude-mobile --remote [-l|-a [id]] работа с сессиями рабочего ПК через туннель
 ```
 
-- [ ] **Step 6: Тесты пройти**
+- [x] **Step 6: Тесты пройти**
 
 Run: `cd bridge; node --test --test-concurrency=1 test/attach-remote.test.js`
 Expected: `pass 2`, `fail 0`.
@@ -1041,7 +1043,7 @@ Expected: `pass 2`, `fail 0`.
 Run: `cd bridge; node --test --test-concurrency=1 test/attach-agent.test.js test/attach.test.js`
 Expected: `fail 0` (локальный режим не сломан).
 
-- [ ] **Step 7: Коммит**
+- [x] **Step 7: Коммит**
 
 ```bash
 git add bridge/remote.js bridge/attach.js bridge/test/attach-remote.test.js bridge/test/helpers/bridge.js
@@ -1056,7 +1058,7 @@ git commit -m "feat(bridge): claude-mobile --pair для ПК-клиента (D-
 - Modify: `bridge/test/attach-remote.test.js`
 - (реализация уже в `bridge/remote.js` из Task 5 — здесь проверяется поведение)
 
-- [ ] **Step 1: Добавить тесты**
+- [x] **Step 1: Добавить тесты**
 
 Дописать в `bridge/test/attach-remote.test.js`:
 
@@ -1126,14 +1128,14 @@ test('--remote: создание сессии удалённо запрещен�
 });
 ```
 
-- [ ] **Step 2: Запустить — проверить**
+- [x] **Step 2: Запустить — проверить**
 
 Run: `cd bridge; node --test --test-concurrency=1 test/attach-remote.test.js`
 Expected: `pass 6`, `fail 0`.
 
 Если `--remote -l` не выводит список — проверить, что `remote.js` печатает `sessions` до `die('', 0)`, а `die` вызывает `tunnel.stop()` (иначе процесс висит до таймаута теста).
 
-- [ ] **Step 3: Коммит**
+- [x] **Step 3: Коммит**
 
 ```bash
 git add bridge/test/attach-remote.test.js
@@ -1148,7 +1150,7 @@ git commit -m "test(bridge): --remote через туннель — список
 - Modify: `bridge/attach.js` (case `pairinfo`, разбор `--qr-out`)
 - Modify: `bridge/test/attach-agent.test.js`
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 В `bridge/test/attach-agent.test.js` после теста `--qr without paired devices…` добавить:
 
@@ -1173,12 +1175,12 @@ test('--qr сохраняет PNG для ПК-клиента (D-29)', { timeout:
 
 В начало `attach-agent.test.js` добавить `const fs = require('fs');` (если его нет).
 
-- [ ] **Step 2: Запустить — упасть**
+- [x] **Step 2: Запустить — упасть**
 
 Run: `cd bridge; node --test --test-concurrency=1 test/attach-agent.test.js`
 Expected: FAIL — файла нет / нет строки «QR сохранён в файл».
 
-- [ ] **Step 3: Реализовать**
+- [x] **Step 3: Реализовать**
 
 В `bridge/attach.js` перед `case 'pairinfo'` (внутри обработчика сообщений недоступно — вынести функцию рядом с `openLoginUrl`):
 
@@ -1217,12 +1219,12 @@ function qrOutPath() {
     }
 ```
 
-- [ ] **Step 4: Тест должен пройти**
+- [x] **Step 4: Тест должен пройти**
 
 Run: `cd bridge; node --test --test-concurrency=1 test/attach-agent.test.js`
 Expected: `fail 0`.
 
-- [ ] **Step 5: Коммит**
+- [x] **Step 5: Коммит**
 
 ```bash
 git add bridge/attach.js bridge/test/attach-agent.test.js
@@ -1238,7 +1240,7 @@ git commit -m "feat(bridge): --qr сохраняет QR в PNG для ПК-кл�
 - Modify: `Specs/tunnel/TUNNEL.md`
 - Modify: `docs/specs/2026-10-31-windows-opencode-adaptation-inventory.md`
 
-- [ ] **Step 1: Норма сопряжения ПК-клиента**
+- [x] **Step 1: Норма сопряжения ПК-клиента**
 
 В `Specs/bridge/modules/AUTH_PAIRING.md` в таблицу «Правила (сопряжение)» добавить строку 10:
 
@@ -1252,7 +1254,7 @@ git commit -m "feat(bridge): --qr сохраняет QR в PNG для ПК-кл�
 - ПК-клиент (D-29): web-UI с домашнего ПК не поддерживается (нужен новый `Origin`); удалённо доступны только `-l`/`-a`; ticket туннеля берётся из ответа `/pair` и не обновляется, если мост перезапустил туннель с новым ticket — тогда нужно сопряжение заново в LAN.
 ```
 
-- [ ] **Step 2: Норма туннеля на стороне клиента**
+- [x] **Step 2: Норма туннеля на стороне клиента**
 
 В `Specs/tunnel/TUNNEL.md` в таблицу §4 добавить строку:
 
@@ -1270,7 +1272,7 @@ git commit -m "feat(bridge): --qr сохраняет QR в PNG для ПК-кл�
 > ✅ `startTunnel()` ждёт `ready{port}` — ❌ `--listen 127.0.0.1:8780`.
 ```
 
-- [ ] **Step 3: Строка статуса в inventory**
+- [x] **Step 3: Строка статуса в inventory**
 
 В `docs/specs/2026-10-31-windows-opencode-adaptation-inventory.md`, таблица «Статус реализации» — добавить строку:
 
@@ -1278,17 +1280,17 @@ git commit -m "feat(bridge): --qr сохраняет QR в PNG для ПК-кл�
 | D-29 ПК-клиент через туннель (`--pair`, `--remote`, QR-PNG, `nodeRegistered`) | ✅ реализовано, тесты; проверка на реальном ноутбуке через iroh — за оператором | `<хеши коммитов задач 1–7>` |
 ```
 
-- [ ] **Step 4: Линтер спеков**
+- [x] **Step 4: Линтер спеков**
 
 Run: `node tools/check-specs.mjs`
 Expected: без ошибок (если линтер ругается на формат — править по `Specs/_meta/spec-authoring-guide.md`).
 
-- [ ] **Step 5: Полный гейт**
+- [x] **Step 5: Полный гейт**
 
 Run: `cd bridge; npm test`
 Expected: `# fail 0` (число `pass` — прежние 334 + новые тесты; `1 skipped` — живой opencode).
 
-- [ ] **Step 6: Коммит**
+- [x] **Step 6: Коммит**
 
 ```bash
 git add docs/specs/2026-10-31-windows-opencode-adaptation-inventory.md

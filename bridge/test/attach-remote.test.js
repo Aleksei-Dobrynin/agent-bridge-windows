@@ -136,3 +136,26 @@ test('--remote: создание сессии удалённо запрещен�
   assert.match(r.err(), /только -l и -a/);
   // lap общий на файл — каталог удаляет test.after (иначе сломает любой следующий тест)
 });
+
+/** Вернуть профиль на реальный адрес тестового моста (после fakeTicket). */
+function realHost(lap) {
+  const file = path.join(lap, 'remote', 'profile.json');
+  const p = JSON.parse(fs.readFileSync(file, 'utf8'));
+  p.host = H.TEST_LAN_HOST;
+  p.port = b.port;
+  p.lastVia = 'lan'; // проверяем именно приоритет LAN
+  fs.writeFileSync(file, JSON.stringify(p, null, 2));
+}
+
+test('--remote -l: в LAN идёт напрямую, туннель не запускается (D-30)', { timeout: 60000 }, async () => {
+  const { lap } = await pairLaptop();
+  realHost(lap);
+  const mark = path.join(lap, 'tunnel-was-started');
+  // фикстура пишет маркер при старте: если клиент полезет в туннель — маркер появится
+  const r = H.runAttach(lap, ['--remote', '-l'], {
+    CLAUDE_BRIDGE_TUNNEL: FAKE, CB_FAKE_TUNNEL_MODE: 'error', CB_FAKE_TUNNEL_MARK: mark,
+  });
+  assert.strictEqual(await r.done, 0, r.out() + r.err());
+  assert.match(r.out(), /жива/);
+  assert.ok(!fs.existsSync(mark), 'туннель не запускался: путь LAN приоритетен');
+});

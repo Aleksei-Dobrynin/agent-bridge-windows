@@ -1,4 +1,8 @@
 'use strict';
+const fs = require('fs');
+if (process.env.CB_FAKE_TUNNEL_MARK) {
+  try { fs.writeFileSync(process.env.CB_FAKE_TUNNEL_MARK, '1'); } catch { /* тест сам проверит */ }
+}
 // Фикстурный claude-tunnel: `id` печатает node_id и выходит; `connect` печатает ready{port}
 // (порт задаёт тест) и живёт до kill. Режимы ошибок — CB_FAKE_TUNNEL_MODE=error|hang.
 const mode = process.env.CB_FAKE_TUNNEL_MODE || 'ready';

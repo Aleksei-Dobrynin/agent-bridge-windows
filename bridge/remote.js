@@ -1,29 +1,36 @@
 'use strict';
-// D-29: удалённый режим claude-mobile для домашнего ПК. Owner-токен и локальный
+// D-29/D-30: удалённый режим claude-mobile для домашнего ПК. Owner-токен и локальный
 // сертификат не используются: профиль сопряжения лежит в <данные>/remote.
+// D-30: путь выбирает lib/client-session (LAN приоритетен, туннель — запасной),
+// ticket обновляется по LAN и сохраняется, обрыв переживается переподключением.
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const WebSocket = require(path.join(__dirname, 'node_modules', 'ws'));
 const { ensureDataDirs } = require('./lib/datadir');
 const { pinnedTlsOptions } = require('./lib/cert');
 const { readQrPng } = require('./lib/qr-image');
 const { pairDevice, loadProfile } = require('./lib/pair-client');
 const { startTunnel, readNodeId, defaultExe } = require('./lib/remote-tunnel');
+const { createSession, updateProfile } = require('./lib/client-session');
 const W32 = require('./lib/win32-input');
 
 const USAGE = `claude-mobile — удалённый ПК-клиент (домашний ПК)
 
   claude-mobile --pair <qr.png>   сопрячься с мостом рабочего ПК по QR (разово, в LAN)
-  claude-mobile --remote -l       список сессий рабочего ПК через туннель
+  claude-mobile --remote -l       список сессий рабочего ПК (LAN или туннель)
   claude-mobile --remote -a [id]  подключиться к сессии (без id — к последней живой)
   claude-mobile --remote -h       эта справка
 
+Путь выбирается сам: в офисе — напрямую по LAN, вне её — через p2p-туннель.
 Сессии создаются на рабочем ПК: удалённо доступны только список и подключение.
 Ctrl+\\ — отсоединиться (сессия продолжает работать на рабочем ПК).`;
 
+const RECONNECT_MIN_MS = 2000;
+const RECONNECT_MAX_MS = 30000;
+
 function fail(msg) { console.error(msg); process.exit(1); }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function main(argv) {
   const cmd = argv[0];
@@ -39,8 +46,7 @@ async function pair(rest) {
   const DATA = ensureDataDirs();
   let ticket;
   try { ticket = readQrPng(png); } catch (e) { fail('Не удалось прочитать QR: ' + e.message); }
-  // NodeId получаем ДО /pair: без рабочего туннеля сопряжение бессмысленно, а устройство
-  // на мосте осталось бы «осиротевшим» (D-29).
+  // NodeId получаем ДО /pair: без рабочего туннеля сопряжение бессмысленно.
   const secret = path.join(DATA.root, 'remote', 'iroh.key');
   fs.mkdirSync(path.dirname(secret), { recursive: true });
   const exe = defaultExe();
@@ -71,7 +77,6 @@ async function remote(rest) {
   if (mode && !['-l', '--list', '-a', '--attach'].includes(mode)) {
     fail('Удалённо доступны только -l и -a: сессии создаются на рабочем ПК.');
   }
-  if (!prof.ticket) fail('Мост не сообщил ticket туннеля. Включите интернет-доступ на рабочем ПК и сопрягите заново.');
   let der;
   let token;
   try {
@@ -82,12 +87,17 @@ async function remote(rest) {
   if (fp !== prof.fingerprint) fail('Сертификат моста не совпадает с сохранённым — сопрягите заново (--pair).');
   const pin = pinnedTlsOptions(new crypto.X509Certificate(der).toString(), fp);
 
-  let tunnel;
-  try { tunnel = await startTunnel({ ticket: prof.ticket, secretFile: prof.paths.secret }); }
-  catch (e) { fail(e.message); }
+  const session = createSession({
+    profile: prof, token, pin,
+    startTunnel: (o) => startTunnel(o),
+    saveProfile: (patch) => updateProfile(prof.paths.profile, patch),
+  });
 
   let raw = false;
   let sid = null;
+  let current = null; // WS текущего соединения: ввод и resize всегда идут в него
+  let stopping = false;
+
   function cleanup() {
     if (raw && process.stdin.isTTY) {
       raw = false;
@@ -96,21 +106,19 @@ async function remote(rest) {
     }
   }
   function die(msg, code) {
+    stopping = true;
     cleanup();
-    try { tunnel.stop(); } catch { /* уже остановлен */ }
+    session.stop();
     if (msg) console.error(msg);
     process.exit(code || 0);
   }
-  process.on('exit', () => { cleanup(); try { tunnel.stop(); } catch { /* уже */ } });
+  process.on('exit', () => { cleanup(); session.stop(); });
+  process.on('SIGINT', () => die('\r\n[отсоединился — сессия продолжает работать; вернуться: claude-mobile --remote -a]\r'));
+  process.on('SIGTERM', () => die('', 1));
 
-  const ws = new WebSocket(`wss://127.0.0.1:${tunnel.port}/ws`, {
-    ...pin, headers: { Authorization: 'Bearer ' + token },
-  });
-  const send = (o) => ws.send(JSON.stringify(o));
-
-  function attach(id) {
+  function attach(ws, id) {
     sid = id;
-    send({ type: 'attach', id, cols: process.stdout.columns || 100, rows: process.stdout.rows || 30 });
+    ws.send(JSON.stringify({ type: 'attach', id, cols: process.stdout.columns || 100, rows: process.stdout.rows || 30 }));
   }
 
   function enterRaw() {
@@ -124,68 +132,102 @@ async function remote(rest) {
         die('\r\n[отсоединился — сессия продолжает работать; вернуться: claude-mobile --remote -a]\r');
         return;
       }
-      send({ type: 'input', id: sid, data: s });
+      if (current) current.send(JSON.stringify({ type: 'input', id: sid, data: s }));
     });
     process.stdout.on('resize', () => {
-      send({ type: 'resize', id: sid, cols: process.stdout.columns, rows: process.stdout.rows });
+      if (current) current.send(JSON.stringify({ type: 'resize', id: sid, cols: process.stdout.columns, rows: process.stdout.rows }));
     });
   }
 
-  ws.on('unexpected-response', (req, res) => {
-    req.destroy();
-    if (res.statusCode === 401) die('Мост отклонил токен устройства — оно отозвано? Сопрягите заново (--pair).', 1);
-    else die('Мост ответил HTTP ' + res.statusCode + ' вместо WebSocket.', 1);
-  });
-  ws.on('error', (e) => die('Мост недоступен через туннель (' + e.message + ').', 1));
-  ws.on('close', (code) => {
-    if (code === 4401) die('\r\n[Устройство отозвано — мост закрыл соединение.]', 1);
-    die('\r\n[Соединение с мостом закрыто' + (code && code !== 1005 ? ` (код ${code})` : '') + '. Продолжить: claude-mobile --remote -a]', 1);
-  });
-
-  ws.on('message', (data) => {
-    let m;
-    try { m = JSON.parse(data); } catch { return; }
-    if (!m || typeof m !== 'object') return;
-    switch (m.type) {
-      case 'sessions': {
-        const list = Array.isArray(m.sessions) ? m.sessions : [];
-        if (mode === '-l' || mode === '--list') {
-          if (!list.length) console.log('Сессий нет.');
-          for (const s of list) {
-            console.log(`${s.id}\t${s.alive ? 'жива' : 'завершена'}\t${s.agentName || s.agent || '-'}\t${s.title}\t${s.cwd}`);
+  function handle(ws) {
+    ws.on('unexpected-response', (req, res) => {
+      req.destroy();
+      if (res.statusCode === 401) die('Мост отклонил токен устройства — оно отозвано? Сопрягите заново (--pair).', 1);
+      die('Мост ответил HTTP ' + res.statusCode + ' вместо WebSocket.', 1);
+    });
+    ws.on('error', () => { /* решение — по close */ });
+    ws.on('close', (code) => {
+      if (stopping) return;
+      if (code === 4401) die('\r\n[Устройство отозвано — мост закрыл соединение.]', 1);
+    });
+    ws.on('message', (data) => {
+      let m;
+      try { m = JSON.parse(data); } catch { return; }
+      if (!m || typeof m !== 'object') return;
+      switch (m.type) {
+        case 'sessions': {
+          if (sid) break; // переподключение: уже привязаны к сессии
+          const list = Array.isArray(m.sessions) ? m.sessions : [];
+          if (mode === '-l' || mode === '--list') {
+            if (!list.length) console.log('Сессий нет.');
+            for (const s of list) {
+              console.log(`${s.id}\t${s.alive ? 'жива' : 'завершена'}\t${s.agentName || s.agent || '-'}\t${s.title}\t${s.cwd}`);
+            }
+            die('', 0);
+            break;
           }
-          die('', 0);
+          const want = rest[1];
+          const target = want ? list.find((s) => s.id === want && s.alive) : list.filter((s) => s.alive).pop();
+          if (!target) {
+            if (want) {
+              const known = list.find((s) => s.id === want);
+              die(known ? `Сессия ${want} завершена. Список: claude-mobile --remote -l`
+                : `Нет сессии ${want}. Список: claude-mobile --remote -l`, 1);
+            }
+            die('Живых сессий нет. Запустите сессию на рабочем ПК.', 1);
+          } else attach(ws, target.id);
           break;
         }
-        const want = rest[1];
-        // явный id — только живая сессия: привязка к завершённой сразу закроет соединение
-        const target = want ? list.find((s) => s.id === want && s.alive) : list.filter((s) => s.alive).pop();
-        if (!target) {
-          if (want) {
-            const known = list.find((s) => s.id === want);
-            die(known ? `Сессия ${want} завершена. Список: claude-mobile --remote -l`
-              : `Нет сессии ${want}. Список: claude-mobile --remote -l`, 1);
-          }
-          die('Живых сессий нет. Запустите сессию на рабочем ПК.', 1);
-        } else attach(target.id);
-        break;
+        case 'scrollback':
+          enterRaw();
+          process.stdout.write(m.data);
+          break;
+        case 'output':
+          if (m.id === sid) process.stdout.write(m.data);
+          break;
+        case 'exit':
+          if (m.id === sid) die(`\r\n[сессия завершена, код ${m.exitCode}]`, m.exitCode === 0 ? 0 : 1);
+          break;
+        case 'error':
+          if (!sid) die('Мост: ' + (typeof m.message === 'string' ? m.message : 'ошибка'), 1);
+          else process.stderr.write('\r\n[Мост: ' + m.message + ']\r\n');
+          break;
       }
-      case 'scrollback':
-        enterRaw();
-        process.stdout.write(m.data);
-        break;
-      case 'output':
-        if (m.id === sid) process.stdout.write(m.data);
-        break;
-      case 'exit':
-        if (m.id === sid) die(`\r\n[сессия завершена, код ${m.exitCode}]`, m.exitCode === 0 ? 0 : 1);
-        break;
-      case 'error':
-        if (!sid) die('Мост: ' + (typeof m.message === 'string' ? m.message : 'ошибка'), 1);
-        else process.stderr.write('\r\n[Мост: ' + m.message + ']\r\n');
-        break;
+    });
+  }
+
+  let attempt = 0;
+  let connectedOnce = false;
+  for (;;) {
+    let conn;
+    try { conn = await session.connect(); }
+    catch (e) {
+      if (e.revoked) die('Мост отклонил токен устройства — оно отозвано? Сопрягите заново (--pair).', 1);
+      if (e.noTicket) die('Мост не сообщил ticket туннеля. Включите интернет-доступ на рабочем ПК и сопрягите заново.', 1);
+      if (!connectedOnce && (mode === '-l' || mode === '--list')) die(e.message, 1); // список не ждёт
+      const delay = Math.min(RECONNECT_MIN_MS * 2 ** attempt, RECONNECT_MAX_MS);
+      attempt++;
+      process.stderr.write(`\r\n[${e.message}] Повтор через ${Math.round(delay / 1000)} с…\r\n`);
+      await sleep(delay);
+      continue;
     }
-  });
+    attempt = 0;
+    connectedOnce = true;
+    const ws = conn.ws;
+    current = ws;
+    handle(ws);
+    if (sid) {
+      // переподключение: чистим экран и просим хвост буфера заново
+      process.stdout.write('\x1b[2J\x1b[H');
+      attach(ws, sid);
+    }
+    await new Promise((r) => ws.once('close', r));
+    if (stopping) break;
+    const delay = Math.min(RECONNECT_MIN_MS * 2 ** attempt, RECONNECT_MAX_MS);
+    attempt++;
+    process.stderr.write(`\r\n[соединение потеряно — переподключаюсь через ${Math.round(delay / 1000)} с]\r\n`);
+    await sleep(delay);
+  }
 }
 
 module.exports = { main, USAGE };

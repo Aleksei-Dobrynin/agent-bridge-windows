@@ -9,7 +9,7 @@ const WebSocket = require(path.join(__dirname, 'node_modules', 'ws'));
 const { ensureDataDirs } = require('./lib/datadir');
 const { pinnedTlsOptions } = require('./lib/cert');
 const { readQrPng } = require('./lib/qr-image');
-const { pairDevice, loadProfile, registerNode } = require('./lib/pair-client');
+const { pairDevice, loadProfile } = require('./lib/pair-client');
 const { startTunnel, readNodeId, defaultExe } = require('./lib/remote-tunnel');
 const W32 = require('./lib/win32-input');
 
@@ -50,7 +50,7 @@ async function pair(rest) {
   let nodeId;
   try { nodeId = readNodeId({ secretFile: secret }); } catch (e) { fail(e.message); }
   let r;
-  try { r = await pairDevice({ ticket, name: os.hostname(), root: DATA.root }); } catch (e) { fail(e.message); }
+  try { r = await pairDevice({ ticket, name: os.hostname(), root: DATA.root, nodeId }); } catch (e) { fail(e.message); }
   console.log(`Сопряжено с мостом ${r.host}:${r.port}.`);
   if (!r.ticket) {
     console.log('Внимание: интернет-доступ на рабочем ПК выключен. Правильный порядок: включить доступ ' +
@@ -58,12 +58,6 @@ async function pair(rest) {
       'поднять туннель, а повторный QR потребует подтверждения на телефоне (при потере телефона — ' +
       'удалить pairings.json при остановленном мосте).');
   }
-  try {
-    await registerNode({
-      host: r.host, port: r.port, token: r.token, nodeId,
-      pin: pinnedTlsOptions(new crypto.X509Certificate(fs.readFileSync(r.paths.cert)).toString(), r.fingerprint),
-    });
-  } catch (e) { fail('Не удалось зарегистрировать p2p-узел: ' + e.message); }
   console.log('p2p-узел зарегистрирован. Дальше: claude-mobile --remote -l');
   process.exit(0);
 }

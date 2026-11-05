@@ -5,7 +5,6 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const crypto = require('crypto');
-const WebSocket = require(path.join(__dirname, '..', 'node_modules', 'ws'));
 const { pinnedTlsOptions } = require('./cert');
 
 const CODE_RE = /^[0-9a-f]{10}$/i;
@@ -82,13 +81,16 @@ function saveProfile(root, { der, host, port, fingerprint, ticket, name, token }
 }
 
 /** Полный цикл сопряжения. Возвращает {token, fingerprint, host, port, ticket, paths}. */
-async function pairDevice({ ticket, name, root, timeoutMs }) {
+async function pairDevice({ ticket, name, root, nodeId, timeoutMs }) {
   const t = parseTicket(typeof ticket === 'string' ? ticket : JSON.stringify(ticket));
   const der = await fetchPeerCert(t.host, t.port, timeoutMs);
   const fp = crypto.createHash('sha256').update(der).digest('hex');
   if (fp !== t.fp) throw new Error('отпечаток сертификата не совпал с QR — сопряжение отменено');
   const pin = pinnedTlsOptions(new crypto.X509Certificate(der).toString(), fp);
-  const res = await postPair(t.host, t.port, pin, { code: t.code, name }, timeoutMs);
+  // D-30: NodeId уходит вместе с кодом — мост сразу пишет allowlist (P2: без «осиротевших» устройств)
+  const body = { code: t.code, name };
+  if (nodeId) body.nodeId = nodeId;
+  const res = await postPair(t.host, t.port, pin, body, timeoutMs);
   if (res.status !== 200) {
     let why = '';
     try { why = JSON.parse(res.body || '{}').error || ''; } catch { /* не JSON */ }
@@ -114,35 +116,4 @@ function loadProfile(root) {
   return { ...prof, paths: p };
 }
 
-/** Сообщить мосту NodeId этого ПК (LAN, токен устройства). Ждёт nodeRegistered. */
-function registerNode({ host, port, pin, token, nodeId, timeoutMs = 10000 }) {
-  return new Promise((resolve, reject) => {
-    const ws = new WebSocket(`wss://${host}:${port}/ws`, {
-      ...pin, headers: { Authorization: 'Bearer ' + token },
-    });
-    let settled = false;
-    let timer = null;
-    const done = (fn, v) => {
-      if (settled) return;
-      settled = true;
-      if (timer) clearTimeout(timer);
-      try { ws.close(); } catch { /* закрыт */ }
-      fn(v);
-    };
-    timer = setTimeout(() => done(reject, new Error('мост не подтвердил регистрацию p2p-узла')), timeoutMs);
-    ws.on('message', (d) => {
-      let m; try { m = JSON.parse(d); } catch { return; }
-      if (m.type === 'error') {
-        done(reject, new Error(typeof m.message === 'string' && m.message ? m.message : 'мост вернул ошибку'));
-      } else if (m.type === 'nodeRegistered') {
-        if (m.ok === true) done(resolve, m.nodeId);
-        else done(reject, new Error('мост не принял NodeId устройства'));
-      }
-    });
-    ws.on('error', (e) => done(reject, e));
-    ws.on('close', () => done(reject, new Error('мост закрыл соединение до подтверждения регистрации p2p-узла')));
-    ws.on('open', () => ws.send(JSON.stringify({ type: 'registerNode', nodeId })));
-  });
-}
-
-module.exports = { parseTicket, pairDevice, loadProfile, registerNode, remotePaths };
+module.exports = { parseTicket, pairDevice, loadProfile, remotePaths };

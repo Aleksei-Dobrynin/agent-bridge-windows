@@ -85,3 +85,25 @@ test('registerNode: устройство получает подтвержден
   const allow = fs.readFileSync(path.join(b.home, 'certs', 'tunnel-allow.txt'), 'utf8');
   assert.ok(allow.includes(nodeId), 'NodeId попал в allowlist туннеля');
 });
+
+test('/pair с nodeId: allowlist сразу, без registerNode (D-30)', { timeout: 60000 }, async () => {
+  const o = await b.connect(b.owner);
+  const at = o.mark();
+  o.send({ type: 'pairinfo' });
+  // устройства уже есть → нужен подтверждающий телефон; в этом файле это `token`
+  const d = await b.connect(token);
+  await d.wait((m) => m.type === 'sessions');
+  const req = await d.wait((m) => m.type === 'confirmRequest', 5000, at);
+  d.send({ type: 'confirm', confirmId: req.confirmId, allow: true });
+  const p = await o.wait((m) => m.type === 'pairinfo', 5000, at);
+  const nodeId = 'b'.repeat(64);
+  const res = await H.request(b.port, b.pin, { path: '/pair', method: 'POST', headers: { 'Content-Type': 'application/json' } },
+    JSON.stringify({ code: p.code, name: 'home laptop', nodeId }));
+  assert.strictEqual(res.statusCode, 200, res.body);
+  const dev = JSON.parse(fs.readFileSync(path.join(b.home, 'pairings.json'), 'utf8')).devices
+    .find((x) => x.nodeId === nodeId);
+  assert.ok(dev, 'устройство сохранено с NodeId');
+  assert.strictEqual(dev.name, 'home laptop');
+  const allow = fs.readFileSync(path.join(b.home, 'certs', 'tunnel-allow.txt'), 'utf8');
+  assert.ok(allow.includes(nodeId), 'NodeId в allowlist без отдельного registerNode');
+});

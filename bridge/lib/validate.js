@@ -26,7 +26,10 @@ function cleanTitle(v, max = 120) {
 }
 function pairBody(p) {
   if (!p || typeof p !== 'object' || typeof p.code !== 'string' || p.code.length > 64) return null;
-  return { code: p.code.toUpperCase(), name: cleanTitle(p.name, 64) || '' };
+  const out = { code: p.code.toUpperCase(), name: cleanTitle(p.name, 64) || '' };
+  const nid = nodeId(p.nodeId); // D-30: ПК-клиент сообщает свой NodeId сразу при /pair
+  if (nid) out.nodeId = nid;
+  return out;
 }
 function cookieToken(v) {
   return typeof v === 'string' && /^[0-9a-f]{48}$|^[0-9a-f]{64}$/.test(v) ? v : null;

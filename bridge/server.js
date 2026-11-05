@@ -12,6 +12,7 @@ const { WebSocketServer } = require('ws');
 
 const { ensureDataDirs } = require('./lib/datadir');
 const P = require('./lib/paths');
+const PAIR = require('./lib/pairings');
 const T = require('./lib/tokens');
 const V = require('./lib/validate');
 const { originAllowed } = require('./lib/origin');
@@ -924,18 +925,20 @@ function httpHandler(req, res) {
       // Имя устройства уже очищено V.pairBody: управляющие, bidi и zero-width
       // символы вырезаны, длина <= 64 (F13, M-6). Одно значение — для хранения и лога.
       const safeName = p.name || 'устройство';
-      pairings.devices.push({
-        id: tokenHash.slice(0, 12),
-        tokenHash,
-        name: safeName,
-        addedAt: new Date().toISOString(),
+      const nid = p.nodeId || null;
+      // D-30: повторное сопряжение того же узла перевыпускает токен, а не добавляет дубликат;
+      // P2: NodeId пишется в allowlist сразу, второго шага (registerNode) для ПК-клиента нет.
+      const { replaced } = PAIR.upsertDevice(pairings.devices, {
+        tokenHash, name: safeName, nodeId: nid, at: new Date().toISOString(),
       });
       pairings.phoneRequired = true; // D-22.2: дальше — только подтверждение на телефоне
       savePairings();
-      console.log(`\n  Сопряжено новое устройство: ${safeName}`);
+      if (nid) writeAllowFile();
+      console.log(`\n  Сопряжено ${replaced ? 'заново' : 'новое'} устройство: ${safeName}`);
       // уже сопряжённые устройства узнают о новом (D-15 п. 6); формат notify — D-15 п. 1
       broadcast({
-        type: 'notify', id: '', event: 'info', message: `Сопряжено новое устройство: ${safeName}`,
+        type: 'notify', id: '', event: 'info',
+        message: `${replaced ? 'Устройство сопряжено заново' : 'Сопряжено новое устройство'}: ${safeName}`,
         title: 'Claude Bridge', at: Date.now(),
       });
       res.writeHead(200, { 'Content-Type': 'application/json' });

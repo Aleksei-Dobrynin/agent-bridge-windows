@@ -92,16 +92,19 @@ test('/pair с nodeId: allowlist сразу, без registerNode (D-30)', { time
   o.send({ type: 'pairinfo' });
   // устройства уже есть → нужен подтверждающий телефон; в этом файле это `token`
   const d = await b.connect(token);
-  await d.wait((m) => m.type === 'sessions');
-  const req = await d.wait((m) => m.type === 'confirmRequest', 5000, at);
+  // позиция в msgs самого `d`, а не владельца `o`: индексы у клиентов свои
+  const dat = d.mark();
+  await d.wait((m) => m.type === 'sessions', 10000, dat);
+  const req = await d.wait((m) => m.type === 'confirmRequest', 5000, dat);
   d.send({ type: 'confirm', confirmId: req.confirmId, allow: true });
   const p = await o.wait((m) => m.type === 'pairinfo', 5000, at);
   const nodeId = 'b'.repeat(64);
   const res = await H.request(b.port, b.pin, { path: '/pair', method: 'POST', headers: { 'Content-Type': 'application/json' } },
     JSON.stringify({ code: p.code, name: 'home laptop', nodeId }));
   assert.strictEqual(res.statusCode, 200, res.body);
-  const dev = JSON.parse(fs.readFileSync(path.join(b.home, 'pairings.json'), 'utf8')).devices
-    .find((x) => x.nodeId === nodeId);
+  const devs = JSON.parse(fs.readFileSync(path.join(b.home, 'pairings.json'), 'utf8')).devices;
+  assert.strictEqual(devs.filter((x) => x.nodeId === nodeId).length, 1, 'дубликата устройства нет');
+  const dev = devs.find((x) => x.nodeId === nodeId);
   assert.ok(dev, 'устройство сохранено с NodeId');
   assert.strictEqual(dev.name, 'home laptop');
   const allow = fs.readFileSync(path.join(b.home, 'certs', 'tunnel-allow.txt'), 'utf8');

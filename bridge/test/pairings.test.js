@@ -19,9 +19,13 @@ test('новое устройство добавляется', () => {
 test('тот же nodeId — перевыпуск токена без дубликата', () => {
   const devices = [];
   const nid = 'b'.repeat(64);
-  upsertDevice(devices, { tokenHash: hash('a'), name: 'home laptop', nodeId: nid, at });
+  const first = upsertDevice(devices, { tokenHash: hash('a'), name: 'home laptop', nodeId: nid, at });
+  const firstId = first.device.id; // объект записи переиспользуется, id меняется на месте
   const r = upsertDevice(devices, { tokenHash: hash('c'), name: 'home laptop', nodeId: nid, at });
   assert.strictEqual(r.replaced, true);
+  // previousId — прежний id записи: по нему мост закрывает соединения со старым токеном
+  assert.strictEqual(r.previousId, firstId);
+  assert.notStrictEqual(r.device.id, r.previousId);
   assert.strictEqual(devices.length, 1);
   assert.strictEqual(devices[0].tokenHash, hash('c'));
   assert.strictEqual(devices[0].nodeId, nid);

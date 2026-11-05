@@ -35,6 +35,14 @@ test('pairBody', () => {
   assert.deepStrictEqual(V.pairBody({ code: 'ab12', name: 'Phone' }), { code: 'AB12', name: 'Phone' });
 });
 
+test('pairBody: nodeId — только валидные 64 hex, с нормализацией (D-30)', () => {
+  const nid = 'AB'.repeat(32);
+  assert.deepStrictEqual(V.pairBody({ code: 'abcdef0123', name: 'lap', nodeId: nid }).nodeId, nid.toLowerCase());
+  assert.strictEqual(V.pairBody({ code: 'abcdef0123', nodeId: 'g'.repeat(64) }).nodeId, undefined);
+  assert.strictEqual(V.pairBody({ code: 'abcdef0123', nodeId: 'a'.repeat(63) }).nodeId, undefined);
+  assert.strictEqual('nodeId' in V.pairBody({ code: 'abcdef0123' }), false);
+});
+
 test('cookieToken accepts only 64/48 hex', () => {
   assert.strictEqual(V.cookieToken('x;Domain=evil'), null);
   assert.strictEqual(V.cookieToken('a'.repeat(48)), 'a'.repeat(48));

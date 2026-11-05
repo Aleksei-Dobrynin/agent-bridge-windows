@@ -6,8 +6,10 @@ function upsertDevice(devices, { tokenHash, name, nodeId, at }) {
   const id = tokenHash.slice(0, 12);
   const same = nodeId ? devices.find((d) => d.nodeId === nodeId) : null;
   if (same) {
+    // previousId — id записи до перевыпуска: по нему мост рвёт соединения, державшие старый токен.
+    const previousId = same.id;
     Object.assign(same, { id, tokenHash, name, addedAt: at });
-    return { device: same, replaced: true };
+    return { device: same, replaced: true, previousId };
   }
   const device = { id, tokenHash, name, addedAt: at };
   if (nodeId) device.nodeId = nodeId;

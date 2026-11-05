@@ -928,12 +928,18 @@ function httpHandler(req, res) {
       const nid = p.nodeId || null;
       // D-30: повторное сопряжение того же узла перевыпускает токен, а не добавляет дубликат;
       // P2: NodeId пишется в allowlist сразу, второго шага (registerNode) для ПК-клиента нет.
-      const { replaced } = PAIR.upsertDevice(pairings.devices, {
+      const { replaced, previousId } = PAIR.upsertDevice(pairings.devices, {
         tokenHash, name: safeName, nodeId: nid, at: new Date().toISOString(),
       });
       pairings.phoneRequired = true; // D-22.2: дальше — только подтверждение на телефоне
       savePairings();
       if (nid) writeAllowFile();
+      if (replaced && previousId) {
+        // старое соединение того же ПК держало прежний токен: он больше не действителен
+        for (const c of allClients) {
+          if (c.deviceId === previousId && c.readyState === 1) { try { c.close(4401, 'revoked'); } catch { /* закрыт */ } }
+        }
+      }
       console.log(`\n  Сопряжено ${replaced ? 'заново' : 'новое'} устройство: ${safeName}`);
       // уже сопряжённые устройства узнают о новом (D-15 п. 6); формат notify — D-15 п. 1
       broadcast({

@@ -111,6 +111,44 @@ test('адрес сменился: мост найден маяком, новы�
   assert.ok(saved.some((p) => p.host === '10.0.0.9'), 'новый адрес сохранён');
 });
 
+test('отзыв на новом адресе после маяка не уходит в туннель', async () => {
+  let tunnelCalls = 0;
+  const probed = [];
+  const s = createSession({
+    profile: profile(), token: TOKEN, pin: PIN,
+    startTunnel: async () => { tunnelCalls++; return { port: 1, stop() { } }; },
+    probe: async ({ host }) => {
+      probed.push(host);
+      return host === '10.0.0.9'
+        ? { ok: false, revoked: true, reason: 'HTTP 401' }
+        : { ok: false, reason: 'timeout' };
+    },
+    discover: async () => ({ host: '10.0.0.9', port: 8790 }),
+    openWs: async () => fakeWs(),
+  });
+  await assert.rejects(s.connect(), (e) => e.revoked === true);
+  assert.deepStrictEqual(probed, ['10.0.0.5', '10.0.0.9'], 'оба адреса проверены probe');
+  assert.strictEqual(tunnelCalls, 0, 'отозванный токен не уходит в туннель');
+});
+
+test('повторный connect останавливает прежний туннель', async () => {
+  let stops = 0;
+  let created = 0;
+  const s = createSession({
+    profile: profile({ lastVia: 'tunnel' }), token: TOKEN, pin: PIN,
+    startTunnel: async () => { created++; return { port: 5555, stop() { stops++; } }; },
+    probe: async () => ({ ok: false, reason: 'timeout' }),
+    discover: async () => null,
+    openWs: async () => fakeWs(),
+  });
+  await s.connect();
+  assert.strictEqual(stops, 0, 'первый connect нечего останавливать');
+  await s.connect();
+  assert.strictEqual(stops, 1, 'прежний туннель остановлен');
+  assert.strictEqual(created, 2, 'новый туннель создан');
+  s.stop();
+});
+
 test('updateProfile: точечное обновление и атомарная запись', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cb-prof-'));
   const file = path.join(dir, 'profile.json');

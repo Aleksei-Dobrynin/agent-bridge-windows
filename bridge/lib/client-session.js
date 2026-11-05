@@ -34,6 +34,7 @@ function discoverBridge({ fingerprint, port, timeoutMs = BEACON_TIMEOUT_MS, targ
     const want = String(fingerprint).toLowerCase();
     const sock = dgram.createSocket({ type: 'udp4' });
     let done = false;
+    let timer = null;
     const finish = (v) => {
       if (done) return;
       done = true;
@@ -41,7 +42,7 @@ function discoverBridge({ fingerprint, port, timeoutMs = BEACON_TIMEOUT_MS, targ
       try { sock.close(); } catch { /* закрыт */ }
       resolve(v);
     };
-    const timer = setTimeout(() => finish(null), timeoutMs);
+    timer = setTimeout(() => finish(null), timeoutMs);
     sock.on('message', (msg, rinfo) => {
       let m;
       try { m = JSON.parse(msg.toString('utf8')); } catch { return; }
@@ -50,11 +51,15 @@ function discoverBridge({ fingerprint, port, timeoutMs = BEACON_TIMEOUT_MS, targ
       if (!Number.isInteger(m.port) || m.port < 1 || m.port > 65533) return;
       finish({ host: rinfo.address, port: m.port });
     });
-    sock.on('error', () => finish(null));
+    // Ошибка одного адреса (VPN, нет маршрута до 255.255.255.255) не отменяет поиск:
+    // направленные broadcast на интерфейсы могут ответить. Поиск гасит только таймаут.
+    sock.on('error', () => { /* не гасим поиск: ошибка одного адреса не отменяет остальные */ });
     sock.bind(() => {
       try { sock.setBroadcast(true); } catch { /* не критично */ }
       for (const t of targets || broadcastTargets()) {
-        try { sock.send(BEACON_QUERY, port + 1, t); } catch { /* адрес недоступен */ }
+        try {
+          sock.send(BEACON_QUERY, port + 1, t, () => { /* ошибка адреса не критична */ });
+        } catch { /* адрес недоступен */ }
       }
     });
   });
@@ -144,6 +149,11 @@ function createSession({ profile, token, pin, startTunnel, saveProfile, probe = 
     const found = await discover({ fingerprint: profile.fingerprint, port });
     if (!found || (found.host === host && found.port === port)) return null;
     p = await probe({ host: found.host, port: found.port, pin, token });
+    if (p.revoked) {
+      const e = new Error('мост отклонил токен устройства — оно отозвано?');
+      e.revoked = true;
+      throw e;
+    }
     if (!p.ok) return null;
     return { host: found.host, port: found.port, ticket: p.ticket };
   }
@@ -151,6 +161,9 @@ function createSession({ profile, token, pin, startTunnel, saveProfile, probe = 
   return {
     get via() { return via; },
     async connect() {
+      // Вызывающий зовёт connect() только после закрытия прежнего WS: старый туннель
+      // останавливаем здесь, иначе в цикле переподключения копятся процессы iroh.
+      stopTunnel();
       const order = via === 'lan' ? ['lan', 'tunnel'] : ['tunnel', 'lan'];
       const errors = [];
       for (const step of order) {
